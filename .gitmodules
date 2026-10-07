@@ -1,0 +1,12 @@
+[submodule "MotGUI"]
+	path = MotGUI
+	url = https://github.com/aiaimimi0920/MotGUI.git
+[submodule "MotCore"]
+	path = MotCore
+	url = https://github.com/aiaimimi0920/MotCore.git
+[submodule "G2A"]
+	path = G2A
+	url = https://github.com/aiaimimi0920/G2A.git
+[submodule "MotPlugin"]
+	path = MotPlugin
+	url = https://github.com/aiaimimi0920/MotPlugin.git

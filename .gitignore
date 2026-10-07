@@ -45,7 +45,3 @@ __pycache__/
 !.env.example
 
 !*.dll
-addons/ffmpeg/win64/~libgdffmpeg.windows.template_debug.x86_64.dll
-addons/aria2/win64/~libgdaria2.windows.template_debug.x86_64.dll
-addons/godot_tts/bin/~libgodot_tts.windows.template_debug.dev.x86_64.dll
-addons/godot_tts/bin/~libgodot_tts.windows.template_release.x86_64.dll
