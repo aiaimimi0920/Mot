@@ -6,7 +6,7 @@ Mot 的集成主仓库：提供项目总入口、跨项目边界和各子项目�
 | --- | --- | --- |
 | [MotGUI](https://github.com/aiaimimi0920/MotGUI) | 桌面客户端与图形交互 | 已迁入旧 Godot 客户端，插件已拆出，运行路径待适配 |
 | [MotCore](https://github.com/aiaimimi0920/MotCore) | 智能核心、记忆、模型与工具编排 | 设计阶段，尚无运行时实现 |
-| [G2A](https://github.com/aiaimimi0920/G2A) | 独立的游戏与伙伴 Agent 交互规范 | 已有实验规范、Python/JavaScript 参考实现、跨语言 HTTP 与来源记忆示例；完整协议仍在开发 |
+| [G2A](https://github.com/aiaimimi0920/G2A) | 独立的游戏与伙伴 Agent 交互规范 | 已有实验规范、Python/JavaScript 参考实现、最小 Godot 游戏适配与来源记忆示例；完整协议仍在开发 |
 | [MotPlugin](https://github.com/aiaimimi0920/MotPlugin) | 具体插件、适配层及外部服务 | 已承接旧插件源码，尚未恢复独立运行与装配 |
 
 每个子项目的文档保存在自己的 `docs/`，本仓库只保留跨项目架构与集成说明。子项目使用 Git submodule 引用确定提交，可以分别检出、开发与发布。
