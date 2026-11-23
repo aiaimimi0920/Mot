@@ -45,3 +45,9 @@ __pycache__/
 !.env.example
 
 !*.dll
+interaction-origin/**/[Bb]in/
+interaction-origin/**/[Oo]bj/
+intelligent-hub/bin/
+computation-core/*.db
+computation-core/*.db-wal
+computation-core/*.db-shm

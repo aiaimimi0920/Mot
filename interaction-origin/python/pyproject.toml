@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "g2a-interaction-origin"
+version = "0.0.1"
+description = "G2A V0.0.1 Interaction Origin SDK and host simulator (Python)"
+readme = "../README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+g2a-origin-demo = "g2a_origin.demo_host:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

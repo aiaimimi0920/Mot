@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>G2A.InteractionOrigin</RootNamespace>
+    <AssemblyName>G2A.InteractionOrigin</AssemblyName>
+    <Version>0.0.1</Version>
+    <Description>G2A V0.0.1 Interaction Origin SDK for C# / Unity / .NET hosts</Description>
+  </PropertyGroup>
+</Project>
