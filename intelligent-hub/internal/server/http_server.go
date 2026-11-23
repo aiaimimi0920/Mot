@@ -541,6 +541,22 @@ func NewTrustedConsentHandler(engine *hub.Engine, auth AuthRegistry) http.Handle
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
 
+	mux.HandleFunc("/trusted/revoke-auto-scope", func(w http.ResponseWriter, r *http.Request) {
+		if !checkTrustedAuth(r) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var body struct {
+			ScopeDigest           string `json:"scope_digest"`
+			CloseMatchingSessions bool   `json:"close_matching_sessions"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		setSecurityHeaders(w)
+		engine.RevokeAutoJoinScope(body.ScopeDigest, body.CloseMatchingSessions)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
+
 	return mux
 }
 

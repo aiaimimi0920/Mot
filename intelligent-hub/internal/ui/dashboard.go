@@ -62,12 +62,13 @@ const dashboardTemplate = `<!DOCTYPE html>
 
   <div class="grid-2">
     <section class="card">
-      <h2>🎮 已注册游戏槽位（交互源点）</h2>
+      <h2>🎮 已注册游戏槽位与方法三态策略矩阵</h2>
       <div id="slots-list" class="empty">尚无游戏接入。</div>
     </section>
     <section class="card">
-      <h2>🧠 活跃智能体会话（演算中枢）</h2>
+      <h2>🧠 活跃智能体会话（含正交多模态开关）与自动加入规则</h2>
       <div id="sessions-list" class="empty">尚无活跃会话。</div>
+      <div id="auto-scopes-list" style="margin-top:12px"></div>
     </section>
   </div>
 
@@ -134,13 +135,26 @@ async function refresh() {
   }
   document.getElementById("pending-list").innerHTML = pHtml || '<span class="empty">当前无挂起的审批请求。</span>';
 
+  const overrides = st.policy_overrides || {};
   const slots = st.slots || [];
   if (!slots.length) {
     document.getElementById("slots-list").innerHTML = '<div class="empty">尚无游戏接入。</div>';
   } else {
-    let sRows = '<table><tr><th>槽位</th><th>角色/计费</th><th>在线/修订</th><th>控制</th></tr>';
+    let sRows = '<table><tr><th>槽位 / 原语策略</th><th>角色/计费</th><th>在线/修订</th><th>控制</th></tr>';
     for (const sl of slots) {
-      sRows += '<tr><td><code>' + esc(sl.slot_id) + '</code></td><td>' + esc(sl.role_kind) + ' / ' + esc(sl.billing_mode) + '</td>' +
+      let capHtml = (sl.capability_items || []).map(c => {
+        const isMoney = (c.risk_flags || []).includes("real_money");
+        return (c.permitted_actors || []).map(act => {
+          const pk = sl.slot_id + "|" + c.method_id + "|" + act;
+          const cur = overrides[pk] || c.default_policy || "allow";
+          const sel = '<select onchange="apiPost(\'/trusted/policy-override\',{slot_id:\'' + esc(sl.slot_id) + '\',method_id:\'' + esc(c.method_id) + '\',actor:\'' + esc(act) + '\',policy:this.value})">' +
+            (isMoney ? '' : '<option value="allow"' + (cur==='allow'?' selected':'') + '>allow</option>') +
+            '<option value="confirm"' + (cur==='confirm'?' selected':'') + '>confirm</option>' +
+            '<option value="prohibit"' + (cur==='prohibit'?' selected':'') + '>prohibit</option></select>';
+          return '<div style="margin-top:4px;font-size:12px"><code>' + esc(c.method_id) + ' ' + esc(c.name) + '</code> [' + esc(act) + ']: ' + sel + '</div>';
+        }).join("");
+      }).join("");
+      sRows += '<tr><td><code>' + esc(sl.slot_id) + '</code>' + capHtml + '</td><td>' + esc(sl.role_kind) + ' / ' + esc(sl.billing_mode) + '</td>' +
         '<td>' + (sl.player_online ? '<span class="badge ok">在线</span>' : '<span class="badge danger">离线</span>') + ' epoch=' + sl.epoch + ' rev=' + sl.rev + '</td>' +
         '<td><button class="decline" onclick="apiPost(\'/trusted/emergency-stop\',{slot_id:\'' + esc(sl.slot_id) + '\'})">紧急叫停</button></td></tr>';
     }
@@ -151,14 +165,25 @@ async function refresh() {
   if (!sessions.length) {
     document.getElementById("sessions-list").innerHTML = '<div class="empty">尚无活跃会话。</div>';
   } else {
-    let cRows = '<table><tr><th>会话 ID</th><th>中枢 / 槽位</th><th>状态 / 配额</th><th>操作</th></tr>';
+    let cRows = '<table><tr><th>会话 ID</th><th>中枢 / 槽位</th><th>状态 / 多模态隐私</th><th>操作</th></tr>';
     for (const se of sessions) {
+      const modHtml = se.state !== 'closed' ? (
+        '<div style="margin-top:4px;font-size:12px">' +
+        '<label><input type="checkbox" ' + (se.allow_visual?'checked':'') + ' onchange="apiPost(\'/trusted/toggle-modality\',{session_id:\'' + esc(se.session_id) + '\',allow_visual:this.checked,allow_audio:' + Boolean(se.allow_audio) + '})"> 画面(visual)</label> ' +
+        '<label><input type="checkbox" ' + (se.allow_audio?'checked':'') + ' onchange="apiPost(\'/trusted/toggle-modality\',{session_id:\'' + esc(se.session_id) + '\',allow_visual:' + Boolean(se.allow_visual) + ',allow_audio:this.checked})"> 音频(audio)</label></div>'
+      ) : '';
       cRows += '<tr><td><code>' + esc(se.session_id) + '</code></td><td><code>' + esc(se.core_id) + '</code> → <code>' + esc(se.slot_id) + '</code></td>' +
-        '<td><code>' + esc(se.state) + '</code> · 已执行 ' + se.consumption_used + (se.consumption_cap ? '/' + se.consumption_cap : '') + ' 步</td>' +
+        '<td><code>' + esc(se.state) + '</code> · 已执行 ' + se.consumption_used + (se.consumption_cap ? '/' + se.consumption_cap : '') + ' 步' + modHtml + '</td>' +
         '<td>' + (se.state !== 'closed' ? '<button class="decline" onclick="apiPost(\'/trusted/revoke-session\',{session_id:\'' + esc(se.session_id) + '\'})">撤权断开</button>' : '-') + '</td></tr>';
     }
     document.getElementById("sessions-list").innerHTML = cRows + '</table>';
   }
+
+  const autoScopes = st.auto_join_scopes || [];
+  document.getElementById("auto-scopes-list").innerHTML = autoScopes.length
+    ? '<div style="font-size:12px;color:var(--muted);margin-bottom:4px">已保存自动加入 Scope 规则：</div>' +
+      autoScopes.map(sd => '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><code>' + esc(sd.slice(0,26)) + '...</code><button class="decline" onclick="apiPost(\'/trusted/revoke-auto-scope\',{scope_digest:\'' + esc(sd) + '\',close_matching_sessions:true})">撤销自动加入</button></div>').join("")
+    : '';
 
   const dir = st.core_directory || {};
   document.getElementById("directory-box").innerHTML =

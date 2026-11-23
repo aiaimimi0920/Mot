@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"flag"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/aiaimimi0920/g2a-intelligent-hub/internal/discovery"
 	"github.com/aiaimimi0920/g2a-intelligent-hub/internal/hub"
+	"github.com/aiaimimi0920/g2a-intelligent-hub/internal/relay"
 	"github.com/aiaimimi0920/g2a-intelligent-hub/internal/server"
 	"github.com/aiaimimi0920/g2a-intelligent-hub/internal/store"
 )
@@ -37,6 +39,9 @@ func main() {
 	runtimeFile := flag.String("runtime-file", discovery.DefaultRuntimeFilePath(), "Local Hub discovery manifest path (set empty to disable)")
 	noRuntimeFile := flag.Bool("no-runtime-file", false, "Disable writing local Hub discovery manifest")
 	openDashboard := flag.Bool("open-dashboard", false, "Open Trusted Player Security Dashboard in default browser on startup")
+	outboundRelay := flag.String("outbound-relay", "", "Optional Cloud Relay URL for NAT-traversal outbound tunnel (zero inbound router ports)")
+	hubRelayID := flag.String("hub-id", "hub-local", "Hub identifier presented to Cloud Relay when -outbound-relay is set")
+	relayToken := flag.String("relay-token", "", "Bearer token authenticating this Hub to -outbound-relay")
 	printPortsJSON := flag.Bool("print-ports-json", false, "Print bound addresses as single-line JSON on startup")
 	flag.Parse()
 
@@ -86,10 +91,11 @@ func main() {
 		CoreAddr:     coreLn.Addr().String(),
 	}
 
+	coreHandler := server.NewCoreHandler(engine, auth)
 	go func() { _ = http.Serve(originLn, server.NewOriginHandler(engine, auth)) }()
 	go func() {
 		coreSrv := &http.Server{
-			Handler:   server.NewCoreHandler(engine, auth),
+			Handler:   coreHandler,
 			TLSConfig: &tls.Config{MinVersion: tls.VersionTLS13},
 		}
 		if *tlsCert != "" && *tlsKey != "" {
@@ -99,6 +105,13 @@ func main() {
 		}
 	}()
 	go func() { _ = http.Serve(consentLn, server.NewTrustedConsentHandler(engine, auth)) }()
+
+	tunnelCtx, cancelTunnel := context.WithCancel(context.Background())
+	defer cancelTunnel()
+	if *outboundRelay != "" {
+		tunnel := relay.NewOutboundCloudTunnel(*outboundRelay, *hubRelayID, *relayToken, coreHandler, engine)
+		tunnel.Start(tunnelCtx)
+	}
 
 	manifestPath := *runtimeFile
 	if *noRuntimeFile {

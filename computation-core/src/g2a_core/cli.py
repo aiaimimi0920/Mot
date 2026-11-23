@@ -220,6 +220,17 @@ def main() -> None:
         default="all",
     )
 
+    relay_p = sub.add_parser("serve-relay", help="Run Cloud NAT Outbound Relay accepting home Intelligent Hub tunnels")
+    relay_p.add_argument("--host", default="127.0.0.1")
+    relay_p.add_argument("--port", type=int, default=19280)
+    relay_p.add_argument("--relay-token", default="")
+
+    memsrv_p = sub.add_parser("serve-memory", help="Run Companion Memory Portability HTTP Service")
+    memsrv_p.add_argument("--db", default="companion_memory.db")
+    memsrv_p.add_argument("--ceiling", default="same_game_companion")
+    memsrv_p.add_argument("--host", default="127.0.0.1")
+    memsrv_p.add_argument("--port", type=int, default=19290)
+
     args = parser.parse_args()
     if args.subcmd == "run":
         _cmd_run(args)
@@ -235,6 +246,30 @@ def main() -> None:
 
         out = run_three_tier_demo_workbench(args.genre)
         print(json.dumps({"g2a_version": "0.0.1", "demo_results": out}, ensure_ascii=False, indent=2))
+    elif args.subcmd == "serve-relay":
+        from .relay_server import CloudRelayServer
+
+        srv = CloudRelayServer(host=args.host, port=args.port, relay_token=args.relay_token)
+        url = srv.start()
+        print(f"[G2A Cloud Relay V0.0.1] Listening on {url}")
+        try:
+            while True:
+                time.sleep(1.0)
+        except KeyboardInterrupt:
+            srv.stop()
+    elif args.subcmd == "serve-memory":
+        from .memory_server import MemoryHTTPServer
+
+        store = SQLiteCompanionStore(args.db)
+        srv = MemoryHTTPServer(store=store, platform_ceiling=args.ceiling, host=args.host, port=args.port)
+        url = srv.start()
+        print(f"[G2A Memory HTTP Server V0.0.1] Listening on {url}")
+        try:
+            while True:
+                time.sleep(1.0)
+        except KeyboardInterrupt:
+            srv.stop()
+            store.close()
     else:
         parser.print_help()
 

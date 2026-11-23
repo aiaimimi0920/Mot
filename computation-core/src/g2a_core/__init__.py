@@ -26,6 +26,8 @@ from .memory import (
 )
 from .sqlite_memory import SQLiteCompanionStore
 from .llm_planner import OpenAICompatibleLLMPlanner
+from .relay_server import CloudRelayServer
+from .memory_server import MemoryHTTPServer
 from .core_sdk import CognitivePlannerPort, CoreSDK
 
 __all__ = [

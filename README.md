@@ -10,12 +10,22 @@ Mot 面向游戏与 AI 伙伴之间的交互，目标是形成开放、可独立
 
 本仓库提供标准方向、跨项目边界和固定版本入口。当前协议设计、机器契约、参考实现及符合性验证保存在 G2A 子仓库中；保留既有 `G2A` 名称、包名、路径和 wire 版本，不以定位调整冒充协议升级。
 
-| 子仓库 | 在 Mot 中的角色 | 当前状态 |
+| 目录 / 子仓库 | 在 Mot 中的角色 | 当前状态 |
 | --- | --- | --- |
-| [G2A](G2A/README.md) | 游戏交互协议、实验 SDK、验证工具及接入示例 | `0.1.0-dev` 参考实现与下一版设计分开维护；设计模型通过不等于 SDK 已实现该设计 |
+| [G2A/docs/standard](G2A/docs/standard/README.md) | **G2A `V0.0.1` 正式协议规范与双语伪代码实现规范** | `V0.0.1` 基线锁定（含中英主规范与中英伪代码 API 蓝图） |
+| [interaction-origin](interaction-origin/README.md) | **第一层：交互源点多引擎 SDK 套件**（Python / C# / Godot 4 GDScript / C++17 / TypeScript） | `V0.0.1` 独立源码目录（支持信号快照、空间脏差分、无入站端口出站流与五大品类示例） |
+| [intelligent-hub](intelligent-hub/README.md) | **第二层：智能枢纽独立守护进程**（Go 零依赖单文件 + 玩家安全审批 Web 中心 + NAT 出站隧道） | `V0.0.1` 独立源码目录（含持久化去重账本、整队单次确认门禁、三态策略矩阵与 TLS 1.3） |
+| [computation-core](computation-core/README.md) | **第三层：演算中枢 SDK 与独立运行体**（Python + Ollama/OpenAI 防注入规划器 + SQLite 记忆服 + 云端中继服） | `V0.0.1` 独立源码目录（含 14 项标准错误码在线符合性套件与 `g2a-core demo` 一键演练台） |
+| [G2A](G2A/README.md) | 协议演进仓库、机器契约与早期实验验证归档 | 承载 `docs/standard/` `V0.0.1` 标准文档及早期研究历史 |
 | [MotGUI](MotGUI/README.md) | 可选伙伴应用的桌面呈现与用户入口 | 保留旧 Godot 客户端；拆仓后的运行路径仍待适配 |
-| [MotCore](MotCore/README.md) | 可选伙伴应用的智能运行时、记忆和模型编排 | 设计阶段，尚无运行时实现；不是协议核心的名称或必需依赖 |
+| [MotCore](MotCore/README.md) | 可选伙伴应用的智能运行时设计归档 | 设计文档归档；不作为协议必需依赖 |
 | [MotPlugin](MotPlugin/README.md) | 可选伙伴应用的功能插件及服务适配 | 保留旧插件源码，尚未恢复完整装配 |
+
+一键编译并验证全部四语言（Go / C++17 / C# / Python）`V0.0.1` 实现与跨进程全链路测试：
+
+```sh
+python scripts/verify_v0_0_1_all.py
+```
 
 游戏及第三方伙伴可以独立实现协议，无需安装 MotGUI、MotCore 或 MotPlugin，也不依赖 Mot 账号、服务器、模型或记忆存储。桌面形象、窗口、资源传输和跨设备恢复属于可选能力，不能成为所有游戏的隐含接入门槛。
 

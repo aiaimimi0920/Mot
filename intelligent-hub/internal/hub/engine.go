@@ -1712,13 +1712,14 @@ func (e *Engine) SnapshotDashboardStatus() map[string]any {
 				ep, rev = v.Epoch, v.Rev
 			}
 			slotsOut = append(slotsOut, map[string]any{
-				"slot_id":       sl.SlotID,
-				"role_kind":     sl.RoleKind,
-				"billing_mode":  sl.BillingMode,
-				"player_online": sl.PlayerOnline,
-				"epoch":         ep,
-				"rev":           rev,
-				"capabilities":  len(sl.Capabilities),
+				"slot_id":          sl.SlotID,
+				"role_kind":        sl.RoleKind,
+				"billing_mode":     sl.BillingMode,
+				"player_online":    sl.PlayerOnline,
+				"epoch":            ep,
+				"rev":              rev,
+				"capabilities":     len(sl.Capabilities),
+				"capability_items": sl.Capabilities,
 			})
 		}
 		sessOut := make([]map[string]any, 0, len(d.Sessions))
@@ -1728,6 +1729,8 @@ func (e *Engine) SnapshotDashboardStatus() map[string]any {
 				"core_id":          se.CallerCoreID,
 				"slot_id":          se.Scope.SlotID,
 				"state":            se.State,
+				"allow_visual":     se.Scope.AllowVisual,
+				"allow_audio":      se.Scope.AllowAudio,
 				"consumption_used": se.ConsumptionUsed,
 				"consumption_cap":  se.ConsumptionCap,
 			})
