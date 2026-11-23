@@ -20,6 +20,8 @@ public sealed class OriginSdk
     private readonly string _slotId;
     private readonly string _roleKind;
     private readonly string _billingMode;
+    private readonly string _roomId;
+    private readonly string _factionId;
     private readonly IHubTransportClientPort _transport;
     private readonly IEngineDispatcherPort _dispatcher;
     private readonly Action<string, string, bool>? _chatUiHandler;
@@ -44,11 +46,15 @@ public sealed class OriginSdk
         string roleKind = "companion",
         string billingMode = "player_metered",
         IEngineDispatcherPort? dispatcher = null,
-        Action<string, string, bool>? chatUiHandler = null)
+        Action<string, string, bool>? chatUiHandler = null,
+        string roomId = "",
+        string factionId = "")
     {
         _slotId = slotId;
         _roleKind = roleKind;
         _billingMode = billingMode;
+        _roomId = roomId;
+        _factionId = factionId;
         _transport = transport;
         _dispatcher = dispatcher ?? new LockingDispatcher();
         _chatUiHandler = chatUiHandler;
@@ -86,7 +92,7 @@ public sealed class OriginSdk
             .Select(c => c.Def)
             .ToList();
         string capDigest = JcsDigest.ComputeSha256("g2a.cap.v1", sortedDefs);
-        _transport.PostToHub("origin.capabilities", new Dictionary<string, object?>
+        var capPayload = new Dictionary<string, object?>
         {
             ["slot_id"] = _slotId,
             ["role_kind"] = _roleKind,
@@ -94,7 +100,10 @@ public sealed class OriginSdk
             ["origin_execute_url"] = originExecuteUrl,
             ["capability_table_digest"] = capDigest,
             ["capabilities"] = sortedDefs
-        });
+        };
+        if (!string.IsNullOrEmpty(_roomId)) capPayload["room_id"] = _roomId;
+        if (!string.IsNullOrEmpty(_factionId)) capPayload["faction_id"] = _factionId;
+        _transport.PostToHub("origin.capabilities", capPayload);
         FlushFullSync();
     }
 

@@ -42,9 +42,14 @@ def run_three_tier_demo_workbench(genre: str = "all") -> Dict[str, str]:
     from g2a_origin.origin_sdk import discover_local_hub_origin_url
     from .cli import HeuristicReferencePlanner
 
-    hub_bin = os.path.join(root_dir, "intelligent-hub", "bin", "intelligent-hub.exe")
+    exe_name = "intelligent-hub.exe" if os.name == "nt" else "intelligent-hub"
+    hub_bin = os.path.join(root_dir, "intelligent-hub", "bin", exe_name)
     if not os.path.exists(hub_bin):
-        raise FileNotFoundError(f"Intelligent Hub binary not found at {hub_bin}")
+        alt = os.path.join(root_dir, "intelligent-hub", "bin", "intelligent-hub.exe")
+        if os.path.exists(alt):
+            hub_bin = alt
+        else:
+            raise FileNotFoundError(f"Intelligent Hub binary not found at {hub_bin}")
 
     genres: List[str] = (
         ["spatial", "strategy_card", "workshop", "deduction", "tactical_arena"]

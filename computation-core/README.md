@@ -16,8 +16,11 @@ Implements Tier 3 of [G2A_SPECIFICATION.zh-CN.md](../G2A/docs/standard/G2A_SPECI
 ```sh
 python -m unittest discover -s tests -v
 
-# One-command 3-tier full-stack demo across all 5 canonical game genres via zero-config auto-discovery
+# One-command 3-tier full-stack CLI demo across all 5 canonical game genres via zero-config auto-discovery
 PYTHONPATH=src python -m g2a_core.cli demo --genre all
+
+# Launch live 3-application visual browser playground (HTML5 Game + Go Hub Dashboard + Core Console)
+PYTHONPATH=src python -m g2a_core.cli playground
 
 # Verify all 14 normative G2A V0.0.1 error codes against a running Intelligent Hub
 PYTHONPATH=src python -m g2a_core.cli conformance

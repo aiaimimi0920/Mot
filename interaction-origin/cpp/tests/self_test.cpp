@@ -1,4 +1,6 @@
 #include <cassert>
+#include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <vector>
 
@@ -78,6 +80,30 @@ int main() {
     assert(r2.state == "executing");
     auto rc = sdk.handle_origin_execute({"slot-cpp", 1, "cancel", "exec-cpp-2", std::nullopt, std::nullopt, {}});
     assert(cancelled && rc.state == "cancelled");
+
+    // 4. Verify local Hub runtime manifest discovery & multiplayer room/faction capability tags
+    const std::string tmp_manifest = "tmp_hub_runtime_test.json";
+    {
+        std::ofstream ofs(tmp_manifest);
+        ofs << R"({"g2a_version":"0.0.1","origin_url":"http://127.0.0.1:29210","core_url":"http://127.0.0.1:29220"})";
+    }
+    std::string discovered_url = OriginSdk::discover_local_hub_origin_url(tmp_manifest);
+    std::remove(tmp_manifest.c_str());
+    assert(discovered_url == "http://127.0.0.1:29210");
+
+    JsonObject last_cap_payload;
+    OriginSdk mp_sdk(
+        "slot-mp-red",
+        [&](const std::string& op, const JsonValue& p) {
+            if (op == "origin.capabilities") last_cap_payload = std::get<JsonObject>(p.data);
+        },
+        "companion",
+        "player_metered",
+        "room-arena-1",
+        "faction-red");
+    mp_sdk.publish_capabilities_and_baseline("pull://origin.execute");
+    assert(std::get<std::string>(last_cap_payload.at("room_id").data) == "room-arena-1");
+    assert(std::get<std::string>(last_cap_payload.at("faction_id").data) == "faction-red");
 
     std::cout << "C++17 G2A OriginSdk SelfTest PASSED | JCS=" << digest << "\n";
     return 0;

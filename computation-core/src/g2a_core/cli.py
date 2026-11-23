@@ -220,6 +220,10 @@ def main() -> None:
         default="all",
     )
 
+    play_p = sub.add_parser("playground", help="Launch live 3-application visual playground (HTML5 Game + Go Hub + Core Console)")
+    play_p.add_argument("--no-browser", action="store_true", help="Do not automatically open the system browser")
+    play_p.add_argument("--planner", choices=["heuristic", "llm"], default="heuristic")
+
     relay_p = sub.add_parser("serve-relay", help="Run Cloud NAT Outbound Relay accepting home Intelligent Hub tunnels")
     relay_p.add_argument("--host", default="127.0.0.1")
     relay_p.add_argument("--port", type=int, default=19280)
@@ -246,6 +250,10 @@ def main() -> None:
 
         out = run_three_tier_demo_workbench(args.genre)
         print(json.dumps({"g2a_version": "0.0.1", "demo_results": out}, ensure_ascii=False, indent=2))
+    elif args.subcmd == "playground":
+        from .playground import run_interactive_playground
+
+        run_interactive_playground(open_browser=not args.no_browser, planner_kind=args.planner)
     elif args.subcmd == "serve-relay":
         from .relay_server import CloudRelayServer
 

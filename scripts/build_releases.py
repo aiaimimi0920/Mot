@@ -90,6 +90,16 @@ def build_sdk_archives() -> list[Path]:
                 zf.write(core_dir / "README.md", "README.md")
                 zf.write(core_dir / "LICENSE", "LICENSE")
         created.append(zip_path)
+
+    # Standalone Unity Package Manager (UPM) archive bundling Core C# SDK + Unity MonoBehaviours
+    upm_zip = OUT_DIR / "g2a-origin-unity-upm-v0.0.1.zip"
+    upm_src = origin_dir / "csharp" / "UnityPackage" / "com.g2a.interaction-origin"
+    cs_core_src = origin_dir / "csharp" / "G2A.InteractionOrigin"
+    with zipfile.ZipFile(upm_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        add_tree_to_zip(zf, upm_src, "com.g2a.interaction-origin")
+        for cs_file in sorted(cs_core_src.glob("*.cs")):
+            zf.write(cs_file, f"com.g2a.interaction-origin/Runtime/Core/{cs_file.name}")
+    created.append(upm_zip)
     return created
 
 

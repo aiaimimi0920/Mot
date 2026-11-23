@@ -231,7 +231,7 @@ export class CoreSDK {
 
   private openWebSocketStream(base: string, authToken: string): void {
     if (typeof WebSocket === "undefined" || !this.sessionId) return;
-    const wsUrl = base.replace(/^http/, "ws") + `/g2a/v1/core/ws?session_id=${encodeURIComponent(this.sessionId)}`;
+    const wsUrl = base.replace(/^http/, "ws") + `/g2a/v1/core/ws?session_id=${encodeURIComponent(this.sessionId)}&access_token=${encodeURIComponent(authToken)}`;
     this.ws = new WebSocket(wsUrl);
     this.ws.onmessage = async (ev: MessageEvent) => {
       const env = JSON.parse(String(ev.data));

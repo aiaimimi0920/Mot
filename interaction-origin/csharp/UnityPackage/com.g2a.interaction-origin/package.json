@@ -1,0 +1,19 @@
+{
+  "name": "com.g2a.interaction-origin",
+  "version": "0.0.1",
+  "displayName": "G2A Interaction Origin SDK (V0.0.1)",
+  "description": "G2A V0.0.1 Tier 1 Interaction Origin SDK for Unity: zero-config Hub discovery, main-thread dispatcher, spatial sensor with anti-spoiler redaction, and zero-inbound-port outbound execute streaming.",
+  "unity": "2021.3",
+  "author": {
+    "name": "Mot / G2A Project",
+    "url": "https://github.com/aiaimimi0920/Mot"
+  },
+  "keywords": [
+    "g2a",
+    "ai",
+    "companion",
+    "npc",
+    "interaction-origin"
+  ],
+  "license": "MIT"
+}

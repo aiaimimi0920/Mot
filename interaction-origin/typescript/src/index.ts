@@ -87,7 +87,10 @@ export class OriginSDK {
     public readonly hubOriginBaseUrl: string = "http://127.0.0.1:19210",
     public readonly roleKind: "companion" | "independent_npc" = "companion",
     public readonly billingMode: "player_metered" | "developer_sponsored" = "player_metered",
-    private readonly onChatDelivered?: (audience: string, text: string) => void
+    private readonly onChatDelivered?: (audience: string, text: string) => void,
+    public readonly originToken: string = "",
+    public readonly roomId: string = "",
+    public readonly factionId: string = ""
   ) {}
 
   registerCapability(def: CapabilityEntry, handler: DomainEffectHandler): void {
@@ -124,27 +127,33 @@ export class OriginSDK {
       .sort((a, b) => (a.def.method_id < b.def.method_id ? -1 : 1))
       .map((c) => c.def);
     const capDigest = await jcsSha256("g2a.cap.v1", sortedDefs);
-    await this.postToHub("origin.capabilities", {
+    const capPayload: Record<string, unknown> = {
       slot_id: this.slotId,
       role_kind: this.roleKind,
       billing_mode: this.billingMode,
       origin_execute_url: "pull://origin.execute",
       capability_table_digest: capDigest,
       capabilities: sortedDefs,
-    });
+    };
+    if (this.roomId) capPayload.room_id = this.roomId;
+    if (this.factionId) capPayload.faction_id = this.factionId;
+    await this.postToHub("origin.capabilities", capPayload);
     await this.flushFullSync();
   }
 
   startOutboundExecuteStream(): void {
     if (typeof EventSource === "undefined" || this.eventSource) return;
-    const url = `${this.hubOriginBaseUrl.replace(/\/$/, "")}/g2a/v1/origin/execute-stream?slot_id=${encodeURIComponent(this.slotId)}`;
+    const tokenParam = this.originToken ? `&access_token=${encodeURIComponent(this.originToken)}` : "";
+    const url = `${this.hubOriginBaseUrl.replace(/\/$/, "")}/g2a/v1/origin/execute-stream?slot_id=${encodeURIComponent(this.slotId)}${tokenParam}`;
     this.eventSource = new EventSource(url);
     this.eventSource.addEventListener("origin.execute", async (ev: MessageEvent) => {
       const env = JSON.parse(ev.data);
       const reply = await this.handleOriginExecute(env.payload as OriginExecuteRequest);
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (this.originToken) headers.Authorization = `Bearer ${this.originToken}`;
       await fetch(`${this.hubOriginBaseUrl.replace(/\/$/, "")}/g2a/v1/origin/execute-reply`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({
           g2a_version: G2A_WIRE_VERSION,
           request_id: env.request_id,
@@ -280,6 +289,45 @@ export class OriginSDK {
     return this.ledger.get(executionId) ?? { execution_id: executionId, state: "cancelled" };
   }
 
+  async reportPlayerCommand(text: string): Promise<void> {
+    await this.flushDirtySync(true);
+    await this.postToHub("origin.player_event", {
+      slot_id: this.slotId,
+      kind: "player_command",
+      text,
+    });
+  }
+
+  async reportPresenceChanged(online: boolean, remainingOnlineHumans = 0): Promise<void> {
+    this.syncEnabled = online || remainingOnlineHumans > 0;
+    await this.postToHub("origin.player_event", {
+      slot_id: this.slotId,
+      kind: "presence_changed",
+      online,
+      remaining_online_humans: remainingOnlineHumans,
+    });
+  }
+
+  async reportEmergencyStop(): Promise<void> {
+    for (const execId of [...this.inFlight.keys()]) {
+      await this.cancelInFlightStep(execId);
+    }
+    await this.postToHub("origin.player_event", {
+      slot_id: this.slotId,
+      kind: "emergency_stop",
+    });
+  }
+
+  async reportQueueApproval(queueId: string, confirmDigest: string, approved: boolean): Promise<void> {
+    await this.postToHub("origin.player_event", {
+      slot_id: this.slotId,
+      kind: "queue_approval",
+      queue_id: queueId,
+      confirm_digest: confirmDigest,
+      approved,
+    });
+  }
+
   private collectView(): { brief: Record<string, unknown>; grants: Map<string, ActiveMethodGrant> } {
     const brief: Record<string, unknown> = {};
     const grants = new Map<string, ActiveMethodGrant>();
@@ -296,9 +344,11 @@ export class OriginSDK {
   }
 
   private async postToHub(operation: string, payload: unknown): Promise<void> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.originToken) headers.Authorization = `Bearer ${this.originToken}`;
     await fetch(`${this.hubOriginBaseUrl.replace(/\/$/, "")}/g2a/v1/origin`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({
         g2a_version: G2A_WIRE_VERSION,
         request_id: `ts-${crypto.randomUUID()}`,

@@ -1,10 +1,13 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -128,8 +131,42 @@ class OriginSdk {
 public:
     static constexpr const char* kWireVersion = "0.0.1";
 
-    OriginSdk(std::string slot_id, TransportPostFn transport, std::string role_kind = "companion", std::string billing_mode = "player_metered")
-        : slot_id_(std::move(slot_id)), role_kind_(std::move(role_kind)), billing_mode_(std::move(billing_mode)), transport_(std::move(transport)) {}
+    OriginSdk(
+        std::string slot_id,
+        TransportPostFn transport,
+        std::string role_kind = "companion",
+        std::string billing_mode = "player_metered",
+        std::string room_id = "",
+        std::string faction_id = "")
+        : slot_id_(std::move(slot_id)),
+          role_kind_(std::move(role_kind)),
+          billing_mode_(std::move(billing_mode)),
+          room_id_(std::move(room_id)),
+          faction_id_(std::move(faction_id)),
+          transport_(std::move(transport)) {}
+
+    static std::string discover_local_hub_origin_url(const std::string& explicit_manifest_path = "") {
+        std::string path = explicit_manifest_path;
+        if (path.empty()) {
+            if (const char* env = std::getenv("G2A_HUB_RUNTIME_FILE"); env && *env) {
+                path = env;
+            } else if (const char* local_app = std::getenv("LOCALAPPDATA"); local_app && *local_app) {
+                path = std::string(local_app) + "\\G2A\\hub.runtime.json";
+            } else if (const char* home = std::getenv("HOME"); home && *home) {
+                path = std::string(home) + "/.g2a/hub.runtime.json";
+            }
+        }
+        std::ifstream ifs(path);
+        if (!ifs) throw std::runtime_error("Local Hub runtime manifest not found: " + path);
+        std::ostringstream ss;
+        ss << ifs.rdbuf();
+        JsonValue root = jcs::parse_strict_json(ss.str());
+        const auto* obj = std::get_if<JsonObject>(&root.data);
+        if (!obj || obj->find("origin_url") == obj->end()) {
+            throw std::runtime_error("Missing origin_url in Hub runtime manifest");
+        }
+        return std::get<std::string>(obj->at("origin_url").data);
+    }
 
     void register_capability(CapabilityEntry def, DomainEffectFn handler) {
         std::lock_guard<std::recursive_mutex> lk(mu_);
@@ -162,14 +199,17 @@ public:
             defs.push_back(reg.def.to_json());
         }
         std::string cap_digest = jcs::digest_sha256("g2a.cap.v1", defs);
-        transport_("origin.capabilities", JsonObject{
+        JsonObject cap_payload{
             {"slot_id", slot_id_},
             {"role_kind", role_kind_},
             {"billing_mode", billing_mode_},
             {"origin_execute_url", execute_url},
             {"capability_table_digest", cap_digest},
             {"capabilities", defs},
-        });
+        };
+        if (!room_id_.empty()) cap_payload["room_id"] = room_id_;
+        if (!faction_id_.empty()) cap_payload["faction_id"] = faction_id_;
+        transport_("origin.capabilities", cap_payload);
         flush_full_sync();
     }
 
@@ -353,6 +393,8 @@ private:
     std::string slot_id_;
     std::string role_kind_;
     std::string billing_mode_;
+    std::string room_id_;
+    std::string faction_id_;
     TransportPostFn transport_;
     mutable std::recursive_mutex mu_;
 

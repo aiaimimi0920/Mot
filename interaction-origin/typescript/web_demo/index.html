@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>G2A V0.0.1 — HTML5 Interaction Origin Hybrid Game</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --danger: #ef4444;
+      --secret: #a855f7;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: grid;
+      grid-template-columns: 1fr 410px;
+      height: 100vh;
+      overflow: hidden;
+    }
+    main {
+      display: flex;
+      flex-direction: column;
+      padding: 16px;
+      gap: 12px;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 16px;
+    }
+    .badge {
+      font-size: 12px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: #0369a1;
+      color: #e0f2fe;
+      font-weight: 600;
+    }
+    .badge.ok { background: #15803d; color: #dcfce7; }
+    canvas {
+      width: 100%;
+      flex: 1;
+      background: #0b1120;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      cursor: crosshair;
+    }
+    .controls {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+    }
+    input[type="text"] {
+      flex: 1;
+      min-width: 200px;
+      background: #0f172a;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+    }
+    button, a.btn {
+      background: #0284c7;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      font-size: 13px;
+    }
+    button.warn { background: #d97706; }
+    button.danger { background: #dc2626; }
+    button.secondary, a.btn.secondary { background: #334155; }
+    aside {
+      border-left: 1px solid var(--border);
+      background: var(--panel);
+      display: flex;
+      flex-direction: column;
+      padding: 14px;
+      gap: 10px;
+      overflow: hidden;
+    }
+    .card {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 13px;
+    }
+    #wireLog {
+      flex: 1;
+      overflow-y: auto;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 11.5px;
+      background: #090d16;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <strong>G2A V0.0.1 交互源点 (Interaction Origin)</strong>
+        <span style="color:var(--muted); margin-left:8px; font-size:13px;">HTML5 空间探索 + 工坊账本混合源点</span>
+      </div>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <span id="connStatus" class="badge">Connecting Hub...</span>
+        <a id="dashLink" class="btn secondary" target="_blank" href="http://127.0.0.1:19230/">打开智能枢纽安全中心</a>
+      </div>
+    </header>
+
+    <canvas id="world" width="900" height="520"></canvas>
+
+    <div class="controls">
+      <input id="cmdInput" type="text" value="打开我右侧的宝箱" placeholder="向 AI 伙伴下达自然语言指令..." />
+      <button id="btnSend">发送玩家指令</button>
+      <button id="btnShortage" class="warn">模拟工坊断料告警 (触发单次确认)</button>
+      <button id="btnStop" class="danger">紧急制动 (Emergency Stop)</button>
+      <button id="btnReset" class="secondary">重置场景</button>
+    </div>
+  </main>
+
+  <aside>
+    <div class="card">
+      <div><strong>会话与世界状态</strong></div>
+      <div id="metrics" style="color:var(--muted); margin-top:4px;">epoch=1 | rev=0 | gold=120 | timber=15</div>
+      <div id="chatBox" style="margin-top:8px; color:#38bdf8; font-weight:600;">伙伴气泡：等待指令中…</div>
+    </div>
+    <div class="card" style="font-size:12px; color:var(--muted);">
+      <strong>防剧透与操作互斥验证：</strong>
+      紫色虚线框 <code>mimic_secret</code> 属于隐藏陷阱，游戏源点已在底层将其彻底剥离，绝不进入 <code>state_brief</code> 或候选目标；伙伴移动与开箱不占用玩家 WASD/快捷键。
+    </div>
+    <div style="font-weight:600; font-size:13px;">实时源点接口报文流 (Origin Interface Wire)</div>
+    <div id="wireLog"></div>
+  </aside>
+
+  <script type="module">
+    import { WebOriginSDK } from "./g2a_web_origin.js";
+
+    const params = new URLSearchParams(location.search);
+    const hubUrl = params.get("hub") || "http://127.0.0.1:19210";
+    const dashUrl = params.get("dashboard") || "http://127.0.0.1:19230/";
+    const slotId = params.get("slot") || "slot-web-hybrid";
+    const originToken = params.get("token") || "";
+    document.getElementById("dashLink").href = dashUrl;
+
+    const state = {
+      player: { x: 210, y: 310 },
+      companion: { x: 260, y: 340, movingExecId: null, targetId: null },
+      pointedId: "chest_right",
+      props: [
+        { id: "chest_left", label: "左侧木宝箱", x: 150, y: 150, opened: false, secret: false, anchor: "left" },
+        { id: "chest_right", label: "右侧铁宝箱", x: 520, y: 165, opened: false, secret: false, anchor: "pointed_right" },
+        { id: "mimic_secret", label: "隐藏宝箱怪陷阱", x: 360, y: 110, opened: false, secret: true, anchor: "hidden" },
+      ],
+      workshop: { gold: 120, timber: 15, lineHalted: false },
+    };
+
+    const wireLog = document.getElementById("wireLog");
+    function appendLog(tag, payload) {
+      const line = `[${new Date().toLocaleTimeString()}] ${tag}\n${JSON.stringify(payload).slice(0, 260)}\n\n`;
+      wireLog.textContent = (line + wireLog.textContent).slice(0, 6000);
+    }
+
+    const sdk = new WebOriginSDK({
+      slotId,
+      hubOriginBaseUrl: hubUrl,
+      originToken,
+      onChatDelivered: (aud, text) => {
+        document.getElementById("chatBox").textContent = `伙伴气泡 (${aud})：${text}`;
+      },
+      onWireEvent: appendLog,
+    });
+
+    sdk.bindActorSubject("companion", state.companion);
+    sdk.bindActorSubject("player", state.player);
+
+    sdk.registerCapability(
+      {
+        method_id: "#01",
+        name: "move_to",
+        description: "Navigate companion to a visible scene prop",
+        permitted_actors: ["companion"],
+        params_schema: { target_id: "string" },
+        sustained: true,
+      },
+      (_actor, _sub, args, execId) => {
+        const prop = state.props.find((p) => !p.secret && p.id === args.target_id);
+        if (!prop) return { kind: "failed", reason: "target_not_visible" };
+        state.companion.movingExecId = execId;
+        state.companion.targetId = prop.id;
+        return {
+          kind: "executing",
+          cancel_fn: () => {
+            state.companion.movingExecId = null;
+            state.companion.targetId = null;
+          },
+        };
+      }
+    );
+
+    sdk.registerCapability(
+      {
+        method_id: "#02",
+        name: "interact",
+        description: "Open or interact with an in-range visible prop",
+        permitted_actors: ["companion"],
+        params_schema: { target_id: "string" },
+      },
+      (_actor, _sub, args) => {
+        const prop = state.props.find((p) => !p.secret && p.id === args.target_id);
+        if (!prop) return { kind: "failed", reason: "target_not_visible" };
+        const dist = Math.hypot(state.companion.x - prop.x, state.companion.y - prop.y);
+        if (dist > 65) return { kind: "failed", reason: "out_of_range" };
+        prop.opened = true;
+        return { kind: "succeeded", effect_summary: { opened: prop.id } };
+      }
+    );
+
+    sdk.registerCapability(
+      {
+        method_id: "#05",
+        name: "market_buy",
+        description: "Purchase raw workshop materials with gold",
+        permitted_actors: ["player"],
+        params_schema: { item: "string", qty: "integer" },
+        risk_flags: ["resource_spend"],
+        default_policy: "confirm",
+      },
+      (_actor, _sub, args) => {
+        const qty = Number(args.qty || 20);
+        state.workshop.gold = Math.max(0, state.workshop.gold - qty * 2);
+        state.workshop.timber += qty;
+        return { kind: "succeeded", effect_summary: { bought_timber: qty, gold_left: state.workshop.gold } };
+      }
+    );
+
+    sdk.registerCapability(
+      {
+        method_id: "#06",
+        name: "resume_line",
+        description: "Resume halted workshop production line",
+        permitted_actors: ["player"],
+        params_schema: { line_id: "string" },
+      },
+      () => {
+        if (state.workshop.timber < 10) return { kind: "failed", reason: "insufficient_timber" };
+        state.workshop.lineHalted = false;
+        return { kind: "succeeded", effect_summary: { line_A: "running" } };
+      }
+    );
+
+    sdk.bindStateModule(
+      "spatial",
+      () => ({
+        companion_pos: [Math.round(state.companion.x), Math.round(state.companion.y)],
+        visible_props: state.props
+          .filter((p) => !p.secret)
+          .map((p) => ({ id: p.id, opened: p.opened })),
+      }),
+      () => {
+        const moveTargets = [];
+        const interactTargets = [];
+        for (const p of state.props) {
+          if (p.secret || p.opened) continue;
+          const dist = Math.hypot(state.companion.x - p.x, state.companion.y - p.y);
+          const pAnchor = state.pointedId === p.id ? "pointed_right" : p.anchor;
+          moveTargets.push({
+            target_id: p.id,
+            label: p.label,
+            readiness: "ready",
+            actor_anchor: `${(dist / 40).toFixed(1)}m`,
+            player_anchor: pAnchor,
+          });
+          interactTargets.push({
+            target_id: p.id,
+            label: p.label,
+            readiness: dist <= 65 ? "ready" : "staged",
+            prerequisite_hint: dist <= 65 ? undefined : "move_within_range",
+            actor_anchor: `${(dist / 40).toFixed(1)}m`,
+            player_anchor: pAnchor,
+          });
+        }
+        const out = [];
+        if (moveTargets.length) out.push({ method_id: "#01", actor: "companion", readiness: "ready", targets: moveTargets });
+        if (interactTargets.length) {
+          const r = interactTargets.some((t) => t.readiness === "ready") ? "ready" : "staged";
+          out.push({ method_id: "#02", actor: "companion", readiness: r, targets: interactTargets });
+        }
+        return out;
+      }
+    );
+
+    sdk.bindStateModule(
+      "workshop",
+      () => ({
+        gold: state.workshop.gold,
+        timber: state.workshop.timber,
+        line_A_status: state.workshop.lineHalted ? "halted_no_material" : "running",
+      }),
+      () => {
+        if (!state.workshop.lineHalted) return [];
+        return [
+          {
+            method_id: "#05",
+            actor: "player",
+            readiness: "ready",
+            targets: [{ target_id: "market_timber", label: "Purchase Timber x20", readiness: "ready" }],
+          },
+          {
+            method_id: "#06",
+            actor: "player",
+            readiness: state.workshop.timber >= 20 ? "ready" : "staged",
+            targets: [
+              {
+                target_id: "line_A",
+                label: "Sawmill Line A",
+                readiness: state.workshop.timber >= 20 ? "ready" : "staged",
+                alert_tag: "halted_no_material",
+              },
+            ],
+          },
+        ];
+      }
+    );
+
+    const canvas = document.getElementById("world");
+    const ctx = canvas.getContext("2d");
+
+    canvas.addEventListener("click", async (ev) => {
+      const rect = canvas.getBoundingClientRect();
+      const sx = ((ev.clientX - rect.left) / rect.width) * canvas.width;
+      const sy = ((ev.clientY - rect.top) / rect.height) * canvas.height;
+      for (const p of state.props) {
+        if (!p.secret && Math.hypot(sx - p.x, sy - p.y) < 42) {
+          state.pointedId = p.id;
+          await sdk.flushDirtySync(false);
+          return;
+        }
+      }
+      state.player.x = sx;
+      state.player.y = Math.min(460, Math.max(220, sy));
+    });
+
+    function tick() {
+      if (state.companion.movingExecId && state.companion.targetId) {
+        const target = state.props.find((p) => p.id === state.companion.targetId);
+        if (target) {
+          const dx = target.x - state.companion.x;
+          const dy = target.y - state.companion.y;
+          const dist = Math.hypot(dx, dy);
+          if (dist <= 45) {
+            const doneId = state.companion.movingExecId;
+            state.companion.movingExecId = null;
+            state.companion.targetId = null;
+            sdk.completeStep(doneId, true, { arrived_at: target.id });
+          } else {
+            state.companion.x += (dx / dist) * 3.4;
+            state.companion.y += (dy / dist) * 3.4;
+          }
+        }
+      }
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Workshop Zone Banner
+      ctx.fillStyle = state.workshop.lineHalted ? "rgba(239,68,68,0.16)" : "rgba(34,197,94,0.12)";
+      ctx.strokeStyle = state.workshop.lineHalted ? "#ef4444" : "#22c55e";
+      ctx.lineWidth = 2;
+      ctx.fillRect(650, 40, 220, 140);
+      ctx.strokeRect(650, 40, 220, 140);
+      ctx.fillStyle = "#f8fafc";
+      ctx.font = "bold 14px sans-serif";
+      ctx.fillText("工坊锯木产线 Line A", 666, 68);
+      ctx.font = "13px sans-serif";
+      ctx.fillText(`状态: ${state.workshop.lineHalted ? "断料停机 (告警中!)" : "正常运转"}`, 666, 96);
+      ctx.fillText(`金币: ${state.workshop.gold}  |  木材: ${state.workshop.timber}`, 666, 124);
+
+      // Pointing ray from player
+      const pointed = state.props.find((p) => p.id === state.pointedId);
+      if (pointed) {
+        ctx.save();
+        ctx.setLineDash([6, 6]);
+        ctx.strokeStyle = "rgba(56,189,248,0.55)";
+        ctx.beginPath();
+        ctx.moveTo(state.player.x, state.player.y);
+        ctx.lineTo(pointed.x, pointed.y);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Props
+      for (const p of state.props) {
+        ctx.save();
+        if (p.secret) {
+          ctx.setLineDash([5, 4]);
+          ctx.strokeStyle = "#a855f7";
+          ctx.fillStyle = "rgba(168,85,247,0.15)";
+        } else if (p.opened) {
+          ctx.strokeStyle = "#22c55e";
+          ctx.fillStyle = "rgba(34,197,94,0.22)";
+        } else {
+          ctx.strokeStyle = "#f59e0b";
+          ctx.fillStyle = "rgba(245,158,11,0.2)";
+        }
+        ctx.lineWidth = 2.5;
+        ctx.fillRect(p.x - 28, p.y - 22, 56, 44);
+        ctx.strokeRect(p.x - 28, p.y - 22, 56, 44);
+        ctx.fillStyle = "#f8fafc";
+        ctx.font = "12px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText(p.opened ? `${p.label} (已开启)` : p.label, p.x, p.y - 30);
+        if (p.secret) {
+          ctx.fillStyle = "#d8b4fe";
+          ctx.fillText("[REDACTED FROM AI]", p.x, p.y + 38);
+        }
+        ctx.restore();
+      }
+
+      // Player
+      ctx.fillStyle = "#38bdf8";
+      ctx.beginPath();
+      ctx.arc(state.player.x, state.player.y, 18, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#f8fafc";
+      ctx.textAlign = "center";
+      ctx.font = "bold 12px sans-serif";
+      ctx.fillText("玩家 (Player)", state.player.x, state.player.y + 34);
+
+      // Companion
+      ctx.fillStyle = "#22c55e";
+      ctx.beginPath();
+      ctx.arc(state.companion.x, state.companion.y, 18, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#dcfce7";
+      ctx.fillText(
+        state.companion.movingExecId ? "AI 伙伴 (寻路移动中...)" : "AI 伙伴 (Companion)",
+        state.companion.x,
+        state.companion.y + 34
+      );
+
+      document.getElementById("metrics").textContent =
+        `epoch=${sdk.currentEpoch} | rev=${sdk.currentRev} | gold=${state.workshop.gold} | timber=${state.workshop.timber}`;
+
+      requestAnimationFrame(tick);
+    }
+
+    document.getElementById("btnSend").onclick = () => {
+      const txt = document.getElementById("cmdInput").value.trim();
+      if (txt) sdk.reportPlayerCommand(txt);
+    };
+    document.getElementById("btnShortage").onclick = async () => {
+      state.workshop.timber = 0;
+      state.workshop.lineHalted = true;
+      await sdk.flushDirtySync(true);
+    };
+    document.getElementById("btnStop").onclick = () => sdk.reportEmergencyStop();
+    document.getElementById("btnReset").onclick = async () => {
+      for (const p of state.props) p.opened = false;
+      state.companion.x = 260;
+      state.companion.y = 340;
+      state.workshop.gold = 120;
+      state.workshop.timber = 15;
+      state.workshop.lineHalted = false;
+      await sdk.flushFullSync();
+    };
+
+    tick();
+    sdk.connect()
+      .then(() => {
+        const badge = document.getElementById("connStatus");
+        badge.textContent = `Connected (${slotId})`;
+        badge.className = "badge ok";
+      })
+      .catch((err) => {
+        const badge = document.getElementById("connStatus");
+        badge.textContent = `Hub Offline: ${err.message}`;
+      });
+  </script>
+</body>
+</html>

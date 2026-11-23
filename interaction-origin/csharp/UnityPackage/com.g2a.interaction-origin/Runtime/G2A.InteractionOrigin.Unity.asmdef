@@ -1,0 +1,14 @@
+{
+  "name": "G2A.InteractionOrigin.Unity",
+  "rootNamespace": "G2A.InteractionOrigin.Unity",
+  "references": [],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}

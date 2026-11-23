@@ -95,7 +95,7 @@ func NewOriginHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
 
 	// Zero-inbound-port Outbound Origin Execute Stream (GET /g2a/v1/origin/execute-stream?slot_id=...)
 	mux.HandleFunc("/g2a/v1/origin/execute-stream", func(w http.ResponseWriter, r *http.Request) {
-		if auth.OriginToken != "" && extractBearer(r) != auth.OriginToken {
+		if auth.OriginToken != "" && extractStreamToken(r) != auth.OriginToken {
 			writeReplyError(w, "", nil, model.NewError(model.ErrUnauthenticated, 401, "Invalid Origin bearer token"))
 			return
 		}
@@ -160,7 +160,7 @@ func NewOriginHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
 		writeReplyAccepted(w, replyEnv.RequestID, nil, map[string]any{"delivered": delivered})
 	})
 
-	return mux
+	return withAPICORS(mux)
 }
 
 func NewCoreHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
@@ -310,7 +310,7 @@ func NewCoreHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
 	})
 
 	mux.HandleFunc("/g2a/v1/core/events", func(w http.ResponseWriter, r *http.Request) {
-		coreID, gErr := authenticateCore(r, auth)
+		coreID, gErr := authenticateCoreStream(r, auth)
 		if gErr != nil {
 			writeReplyError(w, "", nil, gErr)
 			return
@@ -355,7 +355,7 @@ func NewCoreHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
 
 	// RFC 6455 WebSocket Push Stream (/g2a/v1/core/ws?session_id=...) per Section 6.2
 	mux.HandleFunc("/g2a/v1/core/ws", func(w http.ResponseWriter, r *http.Request) {
-		coreID, gErr := authenticateCore(r, auth)
+		coreID, gErr := authenticateCoreStream(r, auth)
 		if gErr != nil {
 			writeReplyError(w, "", nil, gErr)
 			return
@@ -398,7 +398,27 @@ func NewCoreHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
 		}
 	})
 
-	return mux
+	return withAPICORS(mux)
+}
+
+func withAPICORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+		} else {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // NewTrustedConsentHandler serves the embedded Player Security Web Dashboard and local consent APIs.
@@ -607,7 +627,14 @@ func NewTrustedConsentHandler(engine *hub.Engine, auth AuthRegistry) http.Handle
 }
 
 func authenticateCore(r *http.Request, auth AuthRegistry) (string, *model.G2AError) {
-	tok := extractBearer(r)
+	return authenticateCoreWithToken(extractBearer(r), auth)
+}
+
+func authenticateCoreStream(r *http.Request, auth AuthRegistry) (string, *model.G2AError) {
+	return authenticateCoreWithToken(extractStreamToken(r), auth)
+}
+
+func authenticateCoreWithToken(tok string, auth AuthRegistry) (string, *model.G2AError) {
 	if tok == "" {
 		return "", model.NewError(model.ErrUnauthenticated, 401, "Missing Bearer token")
 	}
@@ -627,6 +654,13 @@ func extractBearer(r *http.Request) string {
 		return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
 	}
 	return ""
+}
+
+func extractStreamToken(r *http.Request) string {
+	if tok := extractBearer(r); tok != "" {
+		return tok
+	}
+	return strings.TrimSpace(r.URL.Query().Get("access_token"))
 }
 
 func decodeStrictRequestEnvelope(r *http.Request) (model.RequestEnvelope, *model.G2AError) {
