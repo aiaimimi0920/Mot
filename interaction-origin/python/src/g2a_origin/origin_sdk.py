@@ -389,6 +389,8 @@ class OriginSDK:
         billing_mode: str = "player_metered",
         player_id: str = "player-local",
         game_instance_id: str = "game-local",
+        room_id: str = "",
+        faction_id: str = "",
         engine_dispatcher: Optional[EngineDispatcherPort] = None,
         spatial: Optional[SpatialAdapterPort] = None,
         perception_radius: float = 15.0,
@@ -400,6 +402,8 @@ class OriginSDK:
         self.billing_mode = billing_mode
         self.player_id = player_id
         self.game_instance_id = game_instance_id
+        self.room_id = room_id
+        self.faction_id = faction_id
         self.hub_transport = hub_transport
         self.engine_dispatcher = engine_dispatcher or LockingGameThreadDispatcher()
         self.spatial = spatial
@@ -629,6 +633,8 @@ class OriginSDK:
                 "billing_mode": self.billing_mode,
                 "player_id": self.player_id,
                 "game_instance_id": self.game_instance_id,
+                "room_id": self.room_id,
+                "faction_id": self.faction_id,
                 "origin_execute_url": self.origin_execute_url,
                 "capability_table_digest": cap_digest,
                 "capabilities": defs,

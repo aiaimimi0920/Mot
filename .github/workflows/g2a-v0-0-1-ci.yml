@@ -1,0 +1,45 @@
+name: G2A V0.0.1 Polyglot Verification & Packaging
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "interaction-origin/**"
+      - "intelligent-hub/**"
+      - "computation-core/**"
+      - "scripts/**"
+      - ".github/workflows/g2a-v0-0-1-ci.yml"
+  pull_request:
+    paths:
+      - "interaction-origin/**"
+      - "intelligent-hub/**"
+      - "computation-core/**"
+      - "scripts/**"
+
+jobs:
+  verify-and-package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go 1.22+
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run 4-Language Build, Conformance, and E2E Suite
+        run: python scripts/verify_v0_0_1_all.py
+
+      - name: Build Cross-Platform V0.0.1 Release Archives
+        run: python scripts/build_releases.py

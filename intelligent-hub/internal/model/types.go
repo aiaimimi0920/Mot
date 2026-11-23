@@ -135,6 +135,8 @@ type OriginCapabilitiesPayload struct {
 	Capabilities          []CapabilityEntry `json:"capabilities"`
 	OriginExecuteURL      string            `json:"origin_execute_url,omitempty"`
 	GameInstanceID        string            `json:"game_instance_id,omitempty"`
+	RoomID                string            `json:"room_id,omitempty"`
+	FactionID             string            `json:"faction_id,omitempty"`
 	PlayerID              string            `json:"player_id,omitempty"`
 	AllowlistedCores      []string          `json:"allowlisted_cores,omitempty"`
 }
@@ -242,6 +244,8 @@ type ExtensionSpec struct {
 
 type AuthorizeRequest struct {
 	SlotID                 string             `json:"slot_id"`
+	PlayerID               string             `json:"player_id,omitempty"`
+	FactionID              string             `json:"faction_id,omitempty"`
 	RequestedScope         RequestedScopeSpec `json:"requested_scope"`
 	CachedCapabilityDigest *string            `json:"cached_capability_digest,omitempty"`
 	ConsumptionCap         *int64             `json:"consumption_cap,omitempty"`

@@ -1,0 +1,13 @@
+{
+  "name": "@g2a/computation-core",
+  "version": "0.0.1",
+  "description": "G2A V0.0.1 Computation Core SDK for TypeScript / Node 20+ / Edge AI Agents",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "src",
+    "dist"
+  ],
+  "license": "LGPL-3.0-only"
+}

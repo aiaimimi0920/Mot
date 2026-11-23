@@ -50,7 +50,10 @@ interaction-origin/**/[Oo]bj/
 interaction-origin/cpp/build/
 interaction-origin/typescript/dist/
 interaction-origin/typescript/node_modules/
+computation-core/typescript/dist/
+computation-core/typescript/node_modules/
 intelligent-hub/bin/
+release-artifacts/
 computation-core/*.db
 computation-core/*.db-wal
 computation-core/*.db-shm

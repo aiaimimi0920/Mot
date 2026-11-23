@@ -35,6 +35,7 @@ func main() {
 	consentToken := flag.String("consent-token", "", "Bearer token protecting Trusted Player Consent port")
 	tlsCert := flag.String("tls-cert", "", "Optional TLS 1.3 certificate file for Core Interface")
 	tlsKey := flag.String("tls-key", "", "Optional TLS 1.3 private key file for Core Interface")
+	tlsSelfSigned := flag.Bool("tls-self-signed", false, "Generate ephemeral in-memory ECDSA P-256 TLS 1.3 certificate for Core Interface")
 	rateLimit := flag.Int("rate-limit-per-sec", 240, "Max requests per second per session before 429 resource_limit")
 	runtimeFile := flag.String("runtime-file", discovery.DefaultRuntimeFilePath(), "Local Hub discovery manifest path (set empty to disable)")
 	noRuntimeFile := flag.Bool("no-runtime-file", false, "Disable writing local Hub discovery manifest")
@@ -91,15 +92,30 @@ func main() {
 		CoreAddr:     coreLn.Addr().String(),
 	}
 
+	var ephemeralCertPEM []byte
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS13}
+	useTLS := (*tlsCert != "" && *tlsKey != "") || *tlsSelfSigned
+	if *tlsSelfSigned {
+		genCert, pemBytes, err := discovery.GenerateEphemeralTLS13Cert()
+		if err != nil {
+			log.Fatalf("generate self-signed TLS 1.3 cert: %v", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{genCert}
+		ephemeralCertPEM = pemBytes
+	}
+
 	coreHandler := server.NewCoreHandler(engine, auth)
 	go func() { _ = http.Serve(originLn, server.NewOriginHandler(engine, auth)) }()
 	go func() {
 		coreSrv := &http.Server{
 			Handler:   coreHandler,
-			TLSConfig: &tls.Config{MinVersion: tls.VersionTLS13},
+			TLSConfig: tlsConfig,
 		}
 		if *tlsCert != "" && *tlsKey != "" {
 			_ = coreSrv.ServeTLS(coreLn, *tlsCert, *tlsKey)
+		} else if *tlsSelfSigned {
+			tlsLn := tls.NewListener(coreLn, tlsConfig)
+			_ = coreSrv.Serve(tlsLn)
 		} else {
 			_ = coreSrv.Serve(coreLn)
 		}
@@ -123,18 +139,24 @@ func main() {
 			originLn.Addr().String(),
 			coreLn.Addr().String(),
 			consentLn.Addr().String(),
-			*tlsCert != "" && *tlsKey != "",
+			useTLS,
 		)
 		defer discovery.RemoveRuntimeManifestIfOwned(manifestPath)
 	}
 
+	coreScheme := "http"
+	if useTLS {
+		coreScheme = "https"
+	}
 	info := map[string]string{
 		"g2a_version":   "0.0.1",
 		"origin_addr":   originLn.Addr().String(),
 		"core_addr":     coreLn.Addr().String(),
+		"core_url":      coreScheme + "://" + coreLn.Addr().String(),
 		"consent_addr":  consentLn.Addr().String(),
 		"dashboard_url": "http://" + consentLn.Addr().String() + "/",
 		"runtime_file":  manifestPath,
+		"ca_cert_pem":   string(ephemeralCertPEM),
 	}
 	if *openDashboard {
 		openBrowser(info["dashboard_url"])

@@ -15,6 +15,7 @@ import (
 	"github.com/aiaimimi0920/g2a-intelligent-hub/internal/jcs"
 	"github.com/aiaimimi0920/g2a-intelligent-hub/internal/model"
 	"github.com/aiaimimi0920/g2a-intelligent-hub/internal/ui"
+	"github.com/aiaimimi0920/g2a-intelligent-hub/internal/ws"
 )
 
 type AuthRegistry struct {
@@ -348,6 +349,51 @@ func NewCoreHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
 				raw, _ := json.Marshal(ev)
 				_, _ = fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", ev.EventID, ev.Event, string(raw))
 				flusher.Flush()
+			}
+		}
+	})
+
+	// RFC 6455 WebSocket Push Stream (/g2a/v1/core/ws?session_id=...) per Section 6.2
+	mux.HandleFunc("/g2a/v1/core/ws", func(w http.ResponseWriter, r *http.Request) {
+		coreID, gErr := authenticateCore(r, auth)
+		if gErr != nil {
+			writeReplyError(w, "", nil, gErr)
+			return
+		}
+		sid := r.URL.Query().Get("session_id")
+		if sid == "" {
+			writeReplyError(w, "", nil, model.NewError(model.ErrInvalidRequest, 400, "session_id query parameter required"))
+			return
+		}
+		if _, errHb := engine.HandleSessionHeartbeat(coreID, sid); errHb != nil {
+			writeReplyError(w, "", &sid, errHb)
+			return
+		}
+		replay := r.URL.Query().Get("replay") == "1"
+		ch, unsubscribe := engine.PushStream().Subscribe(sid, replay)
+		defer unsubscribe()
+
+		wsConn, err := ws.Upgrade(w, r)
+		if err != nil {
+			return
+		}
+		defer wsConn.Close()
+
+		closedCh := make(chan struct{})
+		go func() {
+			wsConn.ReadLoop()
+			close(closedCh)
+		}()
+
+		for {
+			select {
+			case <-closedCh:
+				return
+			case ev := <-ch:
+				raw, _ := json.Marshal(ev)
+				if err := wsConn.WriteText(raw); err != nil {
+					return
+				}
 			}
 		}
 	})

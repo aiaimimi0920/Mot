@@ -17,6 +17,8 @@ type SlotRecord struct {
 	BillingMode           string                           `json:"billing_mode"`
 	PlayerID              string                           `json:"player_id"`
 	GameInstanceID        string                           `json:"game_instance_id"`
+	RoomID                string                           `json:"room_id,omitempty"`
+	FactionID             string                           `json:"faction_id,omitempty"`
 	OriginExecuteURL      string                           `json:"origin_execute_url"`
 	PlayerOnline          bool                             `json:"player_online"`
 	Capabilities          []model.CapabilityEntry          `json:"capabilities"`

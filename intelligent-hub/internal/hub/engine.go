@@ -424,6 +424,12 @@ func (e *Engine) HandleOriginCapabilities(payload model.OriginCapabilitiesPayloa
 		} else if slot.GameInstanceID == "" {
 			slot.GameInstanceID = "game-local"
 		}
+		if payload.RoomID != "" {
+			slot.RoomID = payload.RoomID
+		}
+		if payload.FactionID != "" {
+			slot.FactionID = payload.FactionID
+		}
 		if payload.OriginExecuteURL != "" {
 			slot.OriginExecuteURL = payload.OriginExecuteURL
 		}
@@ -642,8 +648,10 @@ func (e *Engine) HandleOriginPlayerEvent(ev model.OriginPlayerEvent) *model.G2AE
 func (e *Engine) OnPlayerPresenceChanged(slotID string, online bool, remainingOnlineHumans int) {
 	closedSessions, _ := store.Atomic(e.persistence, func(d *store.HubStoreData) ([]string, *model.G2AError) {
 		slot, ok := d.Slots[slotID]
+		var targetRoomID string
 		if ok {
 			slot.PlayerOnline = online
+			targetRoomID = slot.RoomID
 		}
 		var closed []string
 		if !online {
@@ -653,10 +661,26 @@ func (e *Engine) OnPlayerPresenceChanged(slotID string, online bool, remainingOn
 					(sess.Scope.RoleKind == "companion") ||
 					(sess.Scope.BillingMode == "player_metered")
 				if shouldStop && sess.State != "closed" {
-					// Clear undispatched pending steps; in-flight Origin step settles naturally under game rules.
 					e.clearUndispatchedQueuesInTx(d, sess)
 					sess.State = "closed"
 					closed = append(closed, sess.SessionID)
+				}
+			}
+			// Multiplayer room rule: when remainingOnlineHumans drops to 0 in a room, stop ALL shared developer_sponsored NPCs in that room too!
+			if remainingOnlineHumans == 0 && targetRoomID != "" {
+				for otherSlotID, otherSlot := range d.Slots {
+					if otherSlotID == slotID || otherSlot.RoomID != targetRoomID {
+						continue
+					}
+					otherSlot.PlayerOnline = false
+					for _, roomSess := range d.SessionsForSlot(otherSlotID) {
+						roomSess.PlayerOnline = false
+						if roomSess.State != "closed" {
+							e.clearUndispatchedQueuesInTx(d, roomSess)
+							roomSess.State = "closed"
+							closed = append(closed, roomSess.SessionID)
+						}
+					}
 				}
 			}
 		} else {
@@ -707,6 +731,13 @@ func (e *Engine) HandleSessionAuthorize(g2aVersion, callerCoreID string, req mod
 		}
 		if !slot.PlayerOnline {
 			return zp, model.NewError(model.ErrPermissionDenied, 403, "Associated player is offline")
+		}
+		// Multiplayer faction & personal-seat confidentiality isolation (Section 2.2 Row 2)
+		if slot.FactionID != "" && req.FactionID != "" && req.FactionID != slot.FactionID {
+			return zp, model.NewError(model.ErrPermissionDenied, 403, "Cross-faction slot authorization is forbidden")
+		}
+		if slot.RoleKind == "companion" && req.PlayerID != "" && req.PlayerID != slot.PlayerID {
+			return zp, model.NewError(model.ErrPermissionDenied, 403, "Personal companion slot belongs to another player")
 		}
 		if slot.AllowlistEnabled && !slot.AllowlistedCores[callerCoreID] {
 			return zp, model.NewError(model.ErrPermissionDenied, 403, "Core not allowlisted on this slot")

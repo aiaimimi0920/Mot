@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import socket
+import ssl
+import struct
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Protocol
@@ -77,6 +81,8 @@ class CoreSDK:
         allow_loopback: bool = False,
         request_timeout_sec: float = 8.0,
         heartbeat_interval_sec: float = 5.0,
+        stream_mode: str = "sse",  # "sse" | "websocket"
+        ssl_context: Optional[ssl.SSLContext] = None,
         custom_post_fn: Optional[Callable[[str, str, Dict[str, Any], str, Optional[str]], Dict[str, Any]]] = None,
     ) -> None:
         self.planner = planner
@@ -84,6 +90,8 @@ class CoreSDK:
         self.allow_loopback = allow_loopback
         self.request_timeout_sec = request_timeout_sec
         self.heartbeat_interval_sec = heartbeat_interval_sec
+        self.stream_mode = stream_mode
+        self.ssl_context = ssl_context
         self._custom_post_fn = custom_post_fn
 
         self.capability_cache: Dict[str, List[CapabilityEntry]] = {}
@@ -115,6 +123,8 @@ class CoreSDK:
         requested_scope: Optional[Dict[str, Any]] = None,
         consumption_cap: Optional[int] = None,
         extensions: Optional[Dict[str, Any]] = None,
+        player_id: Optional[str] = None,
+        faction_id: Optional[str] = None,
         start_background_loops: bool = True,
     ) -> FrozenScope:
         validate_outbound_url_against_ssrf(hub_endpoint, allow_loopback=self.allow_loopback)
@@ -128,6 +138,10 @@ class CoreSDK:
             "slot_id": slot_id,
             "requested_scope": requested_scope or {"allow_chat": True},
         }
+        if player_id:
+            auth_payload["player_id"] = player_id
+        if faction_id:
+            auth_payload["faction_id"] = faction_id
         if cached_digest:
             auth_payload["cached_capability_digest"] = cached_digest
         if consumption_cap is not None:
@@ -156,7 +170,10 @@ class CoreSDK:
 
         if start_background_loops:
             self._start_heartbeat_loop_async()
-            self._start_event_stream_async()
+            if self.stream_mode == "websocket":
+                self._start_websocket_stream_async()
+            else:
+                self._start_event_stream_async()
         return self.scope
 
     def connect_local_hub(
@@ -374,11 +391,12 @@ class CoreSDK:
             "Authorization": f"Bearer {self.auth_token}",
         }
         req = urllib.request.Request(url, data=body, method="POST", headers=headers)
-        opener = (
-            urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            if ("127.0.0.1" in url or "localhost" in url)
-            else urllib.request.build_opener()
-        )
+        handlers: List[Any] = []
+        if "127.0.0.1" in url or "localhost" in url:
+            handlers.append(urllib.request.ProxyHandler({}))
+        if self.ssl_context is not None:
+            handlers.append(urllib.request.HTTPSHandler(context=self.ssl_context))
+        opener = urllib.request.build_opener(*handlers)
         try:
             with opener.open(req, timeout=self.request_timeout_sec) as resp:
                 raw = resp.read()
@@ -445,11 +463,12 @@ class CoreSDK:
                         if self.closed:
                             return
                     first_connect = False
-                    opener = (
-                        urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                        if ("127.0.0.1" in stream_url or "localhost" in stream_url)
-                        else urllib.request.build_opener()
-                    )
+                    handlers: List[Any] = []
+                    if "127.0.0.1" in stream_url or "localhost" in stream_url:
+                        handlers.append(urllib.request.ProxyHandler({}))
+                    if self.ssl_context is not None:
+                        handlers.append(urllib.request.HTTPSHandler(context=self.ssl_context))
+                    opener = urllib.request.build_opener(*handlers)
                     with opener.open(req, timeout=60.0) as resp:
                         data_lines: List[str] = []
                         while not self._stop_event.is_set() and not self.closed:
@@ -476,4 +495,115 @@ class CoreSDK:
                     time.sleep(0.2)
 
         self._sse_thread = threading.Thread(target=_stream_worker, name="g2a-core-sse", daemon=True)
+        self._sse_thread.start()
+
+    def _start_websocket_stream_async(self) -> None:
+        """RFC 6455 WebSocket push stream consumer (Section 6.2 alternative to SSE, supporting TLS 1.3 wss://)."""
+
+        def _recv_exact(sock: socket.socket, n: int) -> bytes:
+            buf = bytearray()
+            while len(buf) < n:
+                chunk = sock.recv(n - len(buf))
+                if not chunk:
+                    raise EOFError("WebSocket closed")
+                buf.extend(chunk)
+            return bytes(buf)
+
+        def _send_masked_frame(sock: socket.socket, opcode: int, payload: bytes = b"") -> None:
+            mask = os.urandom(4)
+            masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            hdr = bytearray([0x80 | (opcode & 0x0F)])
+            ln = len(payload)
+            if ln < 126:
+                hdr.append(0x80 | ln)
+            elif ln <= 65535:
+                hdr.append(0x80 | 126)
+                hdr.extend(struct.pack("!H", ln))
+            else:
+                hdr.append(0x80 | 127)
+                hdr.extend(struct.pack("!Q", ln))
+            sock.sendall(bytes(hdr) + mask + masked)
+
+        def _ws_worker() -> None:
+            first_connect = True
+            while not self._stop_event.is_set() and not self.closed and self.session_id:
+                parsed = urllib.parse.urlparse(self.hub_endpoint)
+                is_tls = parsed.scheme in ("https", "wss")
+                host = parsed.hostname or "127.0.0.1"
+                port = parsed.port or (443 if is_tls else 80)
+                base_path = parsed.path.rstrip("/")
+                ws_path = f"{base_path}/g2a/v1/core/ws?session_id={urllib.parse.quote(self.session_id)}"
+
+                raw_sock: Optional[socket.socket] = None
+                try:
+                    if not first_connect:
+                        self.on_stream_reconnected()
+                        if self.closed:
+                            return
+                    first_connect = False
+
+                    raw_sock = socket.create_connection((host, port), timeout=10.0)
+                    if is_tls:
+                        ctx = self.ssl_context or ssl.create_default_context()
+                        raw_sock = ctx.wrap_socket(raw_sock, server_hostname=host)
+                    raw_sock.settimeout(60.0)
+
+                    ws_key = base64.b64encode(os.urandom(16)).decode("ascii")
+                    handshake = (
+                        f"GET {ws_path} HTTP/1.1\r\n"
+                        f"Host: {host}:{port}\r\n"
+                        "Upgrade: websocket\r\n"
+                        "Connection: Upgrade\r\n"
+                        f"Sec-WebSocket-Key: {ws_key}\r\n"
+                        "Sec-WebSocket-Version: 13\r\n"
+                        f"Authorization: Bearer {self.auth_token}\r\n\r\n"
+                    )
+                    raw_sock.sendall(handshake.encode("ascii"))
+
+                    resp_head = b""
+                    while b"\r\n\r\n" not in resp_head:
+                        chunk = raw_sock.recv(1)
+                        if not chunk:
+                            raise EOFError("Handshake closed")
+                        resp_head += chunk
+                    status_line = resp_head.split(b"\r\n", 1)[0].decode("latin1")
+                    if " 101 " not in status_line:
+                        if " 401 " in status_line or " 403 " in status_line:
+                            self.shutdown_session_cleanly(notify_hub=False)
+                            return
+                        raise ConnectionError(f"WebSocket upgrade rejected: {status_line}")
+
+                    while not self._stop_event.is_set() and not self.closed:
+                        b0, b1 = _recv_exact(raw_sock, 2)
+                        opcode = b0 & 0x0F
+                        masked = (b1 & 0x80) != 0
+                        length = b1 & 0x7F
+                        if length == 126:
+                            length = struct.unpack("!H", _recv_exact(raw_sock, 2))[0]
+                        elif length == 127:
+                            length = struct.unpack("!Q", _recv_exact(raw_sock, 8))[0]
+                        mask_key = _recv_exact(raw_sock, 4) if masked else b""
+                        data = _recv_exact(raw_sock, length) if length > 0 else b""
+                        if masked:
+                            data = bytes(b ^ mask_key[i % 4] for i, b in enumerate(data))
+                        if opcode == 0x8:
+                            _send_masked_frame(raw_sock, 0x8)
+                            break
+                        if opcode == 0x9:
+                            _send_masked_frame(raw_sock, 0xA, data)
+                        elif opcode == 0x1:
+                            env = parse_strict_json(data)
+                            self.handle_event_envelope(env)
+                except Exception:
+                    if self._stop_event.is_set() or self.closed:
+                        return
+                    time.sleep(0.2)
+                finally:
+                    if raw_sock is not None:
+                        try:
+                            raw_sock.close()
+                        except Exception:
+                            pass
+
+        self._sse_thread = threading.Thread(target=_ws_worker, name="g2a-core-ws", daemon=True)
         self._sse_thread.start()
