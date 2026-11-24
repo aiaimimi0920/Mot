@@ -335,14 +335,17 @@ func (c *TrustedConsentBroker) SnapshotPending() map[string]any {
 	for _, s := range c.scopePrompts {
 		scopes = append(scopes, *s)
 	}
+	sort.Slice(scopes, func(i, j int) bool { return scopes[i].PromptID < scopes[j].PromptID })
 	queues := make([]PendingQueuePrompt, 0, len(c.queuePrompts))
 	for _, q := range c.queuePrompts {
 		queues = append(queues, *q)
 	}
+	sort.Slice(queues, func(i, j int) bool { return queues[i].QueueID < queues[j].QueueID })
 	resumes := make([]PendingResumePrompt, 0, len(c.resumes))
 	for _, r := range c.resumes {
 		resumes = append(resumes, *r)
 	}
+	sort.Slice(resumes, func(i, j int) bool { return resumes[i].SessionID < resumes[j].SessionID })
 	return map[string]any{
 		"scope_prompts":  scopes,
 		"queue_prompts":  queues,
@@ -1777,13 +1780,21 @@ func (e *Engine) StartBackgroundLeaseReaper(stopCh <-chan struct{}, interval tim
 
 func (e *Engine) SnapshotDashboardStatus() map[string]any {
 	res, _ := store.ReadOnly(e.persistence, func(d *store.HubStoreData) (map[string]any, *model.G2AError) {
-		slotsOut := make([]map[string]any, 0, len(d.Slots))
-		for _, sl := range d.Slots {
+		slotKeys := make([]string, 0, len(d.Slots))
+		for k := range d.Slots {
+			slotKeys = append(slotKeys, k)
+		}
+		sort.Strings(slotKeys)
+		slotsOut := make([]map[string]any, 0, len(slotKeys))
+		for _, k := range slotKeys {
+			sl := d.Slots[k]
 			v := d.SlotViews[sl.SlotID]
 			var ep, rev int64
 			if v != nil {
 				ep, rev = v.Epoch, v.Rev
 			}
+			capsCopy := make([]model.CapabilityEntry, len(sl.Capabilities))
+			copy(capsCopy, sl.Capabilities)
 			slotsOut = append(slotsOut, map[string]any{
 				"slot_id":          sl.SlotID,
 				"role_kind":        sl.RoleKind,
@@ -1791,12 +1802,19 @@ func (e *Engine) SnapshotDashboardStatus() map[string]any {
 				"player_online":    sl.PlayerOnline,
 				"epoch":            ep,
 				"rev":              rev,
-				"capabilities":     len(sl.Capabilities),
-				"capability_items": sl.Capabilities,
+				"capabilities":     len(capsCopy),
+				"capability_items": capsCopy,
 			})
 		}
-		sessOut := make([]map[string]any, 0, len(d.Sessions))
-		for _, se := range d.Sessions {
+
+		sessKeys := make([]string, 0, len(d.Sessions))
+		for k := range d.Sessions {
+			sessKeys = append(sessKeys, k)
+		}
+		sort.Strings(sessKeys)
+		sessOut := make([]map[string]any, 0, len(sessKeys))
+		for _, k := range sessKeys {
+			se := d.Sessions[k]
 			sessOut = append(sessOut, map[string]any{
 				"session_id":       se.SessionID,
 				"core_id":          se.CallerCoreID,
@@ -1808,20 +1826,28 @@ func (e *Engine) SnapshotDashboardStatus() map[string]any {
 				"consumption_cap":  se.ConsumptionCap,
 			})
 		}
+
 		autoScopes := make([]string, 0, len(d.ApprovedScopes))
 		for sd := range d.ApprovedScopes {
 			autoScopes = append(autoScopes, sd)
 		}
+		sort.Strings(autoScopes)
+
+		overridesCopy := make(map[string]string, len(d.PolicyOverrides))
+		for pk, pv := range d.PolicyOverrides {
+			overridesCopy[pk] = pv
+		}
+
 		auditCopy := make([]store.AuditEntry, len(d.AuditLog))
 		copy(auditCopy, d.AuditLog)
 		return map[string]any{
-			"g2a_version":       model.WireVersion,
-			"slots":             slotsOut,
-			"sessions":          sessOut,
-			"auto_join_scopes":  autoScopes,
-			"policy_overrides":  d.PolicyOverrides,
-			"audit_log":         auditCopy,
-			"pending":           e.consent.SnapshotPending(),
+			"g2a_version":      model.WireVersion,
+			"slots":            slotsOut,
+			"sessions":         sessOut,
+			"auto_join_scopes": autoScopes,
+			"policy_overrides": overridesCopy,
+			"audit_log":        auditCopy,
+			"pending":          e.consent.SnapshotPending(),
 			"core_directory": map[string]any{
 				"custom_endpoint_open": true,
 				"featured": []map[string]string{

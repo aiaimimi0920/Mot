@@ -21,11 +21,19 @@ import (
 )
 
 type AuthRegistry struct {
-	OriginToken  string
-	CoreTokens   map[string]string // bearer token -> verified core_id
-	ConsentToken string
-	OriginAddr   string
-	CoreAddr     string
+	OriginToken             string
+	CoreTokens              map[string]string // bearer token -> verified core_id
+	ConsentToken            string
+	OriginAddr              string
+	CoreAddr                string
+	StreamKeepAliveInterval time.Duration
+}
+
+func streamKeepAliveInterval(auth AuthRegistry) time.Duration {
+	if auth.StreamKeepAliveInterval > 0 {
+		return auth.StreamKeepAliveInterval
+	}
+	return 20 * time.Second
 }
 
 func NewOriginHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
@@ -122,13 +130,22 @@ func NewOriginHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
 		flusher.Flush()
 
 		ctx := r.Context()
+		kaTicker := time.NewTicker(streamKeepAliveInterval(auth))
+		defer kaTicker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-kaTicker.C:
+				if _, wErr := fmt.Fprint(w, ": g2a-keepalive\n\n"); wErr != nil {
+					return
+				}
+				flusher.Flush()
 			case reqEnv := <-ch:
 				raw, _ := json.Marshal(reqEnv)
-				_, _ = fmt.Fprintf(w, "id: %s\nevent: origin.execute\ndata: %s\n\n", reqEnv.RequestID, string(raw))
+				if _, wErr := fmt.Fprintf(w, "id: %s\nevent: origin.execute\ndata: %s\n\n", reqEnv.RequestID, string(raw)); wErr != nil {
+					return
+				}
 				flusher.Flush()
 			}
 		}
@@ -343,13 +360,22 @@ func NewCoreHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
 		flusher.Flush()
 
 		ctx := r.Context()
+		kaTicker := time.NewTicker(streamKeepAliveInterval(auth))
+		defer kaTicker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-kaTicker.C:
+				if _, wErr := fmt.Fprint(w, ": g2a-keepalive\n\n"); wErr != nil {
+					return
+				}
+				flusher.Flush()
 			case ev := <-ch:
 				raw, _ := json.Marshal(ev)
-				_, _ = fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", ev.EventID, ev.Event, string(raw))
+				if _, wErr := fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", ev.EventID, ev.Event, string(raw)); wErr != nil {
+					return
+				}
 				flusher.Flush()
 			}
 		}
@@ -387,10 +413,16 @@ func NewCoreHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
 			close(closedCh)
 		}()
 
+		kaTicker := time.NewTicker(streamKeepAliveInterval(auth))
+		defer kaTicker.Stop()
 		for {
 			select {
 			case <-closedCh:
 				return
+			case <-kaTicker.C:
+				if err := wsConn.WritePing([]byte("g2a")); err != nil {
+					return
+				}
 			case ev := <-ch:
 				raw, _ := json.Marshal(ev)
 				if err := wsConn.WriteText(raw); err != nil {

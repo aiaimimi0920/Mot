@@ -2,9 +2,81 @@
 
 export const G2A_WIRE_VERSION = "0.0.1";
 export const MAX_CANDIDATE_TARGETS_PER_METHOD = 24;
+export const MAX_EXECUTION_LEDGER_ENTRIES = 512;
+
+export function parseStrictJson(raw) {
+  let pos = 0;
+  const n = raw.length;
+  const skipWs = () => {
+    while (pos < n && (raw[pos] === " " || raw[pos] === "\t" || raw[pos] === "\r" || raw[pos] === "\n")) pos++;
+  };
+  const scanString = () => {
+    const start = pos;
+    pos++;
+    while (pos < n) {
+      const ch = raw[pos++];
+      if (ch === "\\") {
+        pos += raw[pos] === "u" ? 5 : 1;
+      } else if (ch === '"') {
+        return JSON.parse(raw.slice(start, pos));
+      }
+    }
+    throw new Error("Unterminated JSON string");
+  };
+  const scanValue = () => {
+    skipWs();
+    if (pos >= n) throw new Error("Unexpected end of JSON");
+    const c = raw[pos];
+    if (c === '"') {
+      scanString();
+    } else if (c === "{") {
+      pos++;
+      skipWs();
+      if (raw[pos] === "}") {
+        pos++;
+        return;
+      }
+      const seen = new Set();
+      while (pos < n) {
+        skipWs();
+        if (raw[pos] !== '"') throw new Error("Expected string key in JSON object");
+        const key = scanString();
+        if (seen.has(key)) throw new Error(`Duplicate JSON object key: ${key}`);
+        seen.add(key);
+        skipWs();
+        if (raw[pos++] !== ":") throw new Error("Expected ':' after JSON key");
+        scanValue();
+        skipWs();
+        const sep = raw[pos++];
+        if (sep === "}") break;
+        if (sep !== ",") throw new Error("Expected ',' or '}' in JSON object");
+      }
+    } else if (c === "[") {
+      pos++;
+      skipWs();
+      if (raw[pos] === "]") {
+        pos++;
+        return;
+      }
+      while (pos < n) {
+        scanValue();
+        skipWs();
+        const sep = raw[pos++];
+        if (sep === "]") break;
+        if (sep !== ",") throw new Error("Expected ',' or ']' in JSON array");
+      }
+    } else {
+      while (pos < n && !",]} \t\r\n".includes(raw[pos])) pos++;
+    }
+  };
+  scanValue();
+  skipWs();
+  if (pos !== n) throw new Error("Trailing characters in strict JSON");
+  return JSON.parse(raw);
+}
 
 export function canonicalizeJcs(value) {
-  if (value === null) return "null";
+  if (value === null || value === undefined) return "null";
   if (typeof value === "boolean") return value ? "true" : "false";
   if (typeof value === "number") {
     if (!Number.isFinite(value)) throw new Error("Non-finite numbers forbidden in JCS");
@@ -16,7 +88,7 @@ export function canonicalizeJcs(value) {
   if (typeof value === "object") {
     const keys = Object.keys(value)
       .filter((k) => value[k] !== undefined)
-      .sort();
+      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
     return "{" + keys.map((k) => `${JSON.stringify(k)}:${canonicalizeJcs(value[k])}`).join(",") + "}";
   }
   throw new Error(`Unsupported JCS type: ${typeof value}`);
@@ -122,7 +194,7 @@ export class WebOriginSDK {
     const url = `${this.hubOriginBaseUrl}/g2a/v1/origin/execute-stream?slot_id=${encodeURIComponent(this.slotId)}${tokenParam}`;
     this.eventSource = new EventSource(url);
     this.eventSource.addEventListener("origin.execute", async (ev) => {
-      const env = JSON.parse(ev.data);
+      const env = parseStrictJson(ev.data);
       this.onWireEvent?.("IN  origin.execute", env.payload);
       const reply = await this.handleOriginExecute(env.payload);
       const headers = { "Content-Type": "application/json" };
@@ -227,16 +299,27 @@ export class WebOriginSDK {
     if (out.kind === "executing") {
       this.inFlight.set(req.execution_id, out.cancel_fn);
       const rep = { execution_id: req.execution_id, state: "executing" };
-      this.ledger.set(req.execution_id, rep);
+      this.storeLedgerReply(rep);
       return rep;
     }
     const rep =
       out.kind === "succeeded"
         ? { execution_id: req.execution_id, state: "succeeded", effect_summary: out.effect_summary }
         : { execution_id: req.execution_id, state: "failed", failure_reason: out.reason };
-    this.ledger.set(req.execution_id, rep);
+    this.storeLedgerReply(rep);
     await this.flushDirtySync(false);
     return rep;
+  }
+
+  storeLedgerReply(rep) {
+    this.ledger.delete(rep.execution_id);
+    this.ledger.set(rep.execution_id, rep);
+    if (this.ledger.size > MAX_EXECUTION_LEDGER_ENTRIES) {
+      for (const oldId of this.ledger.keys()) {
+        if (this.ledger.size <= MAX_EXECUTION_LEDGER_ENTRIES) break;
+        if (!this.inFlight.has(oldId)) this.ledger.delete(oldId);
+      }
+    }
   }
 
   async completeStep(executionId, succeeded, summary = {}, reason = undefined) {
@@ -247,7 +330,7 @@ export class WebOriginSDK {
       effect_summary: succeeded ? summary : undefined,
       failure_reason: succeeded ? undefined : reason,
     };
-    this.ledger.set(executionId, rep);
+    this.storeLedgerReply(rep);
     this.pendingSettled.push(rep);
     await this.flushDirtySync(false);
   }
@@ -258,7 +341,7 @@ export class WebOriginSDK {
       this.inFlight.delete(executionId);
       cancelFn();
       const rep = { execution_id: executionId, state: "cancelled", failure_reason: "cancelled_by_hub" };
-      this.ledger.set(executionId, rep);
+      this.storeLedgerReply(rep);
       this.pendingSettled.push(rep);
       await this.flushDirtySync(false);
       return rep;
@@ -285,15 +368,57 @@ export class WebOriginSDK {
     });
   }
 
+  static parseAnchorMeters(anchor) {
+    if (!anchor) return 1e9;
+    const s = String(anchor).trim();
+    if (!s.endsWith("m")) return 1e9;
+    const token = s.slice(0, -1).split(" ").pop() ?? "";
+    const d = Number(token);
+    return Number.isFinite(d) ? d : 1e9;
+  }
+
+  static prioritizeTargets(targets) {
+    const dedup = new Map();
+    for (const t of targets) {
+      if (!dedup.has(t.target_id) || t.readiness === "ready") {
+        dedup.set(t.target_id, t);
+      }
+    }
+    return [...dedup.values()]
+      .sort((a, b) => {
+        const aAlert = a.alert_tag ? 0 : 1;
+        const bAlert = b.alert_tag ? 0 : 1;
+        if (aAlert !== bAlert) return aAlert - bAlert;
+        const aPoint = a.player_anchor?.toLowerCase().includes("pointed") ? 0 : 1;
+        const bPoint = b.player_anchor?.toLowerCase().includes("pointed") ? 0 : 1;
+        if (aPoint !== bPoint) return aPoint - bPoint;
+        const aReady = a.readiness === "ready" ? 0 : 1;
+        const bReady = b.readiness === "ready" ? 0 : 1;
+        if (aReady !== bReady) return aReady - bReady;
+        const distDiff = WebOriginSDK.parseAnchorMeters(a.actor_anchor) - WebOriginSDK.parseAnchorMeters(b.actor_anchor);
+        if (Math.abs(distDiff) > 1e-6) return distDiff;
+        return a.target_id < b.target_id ? -1 : a.target_id > b.target_id ? 1 : 0;
+      })
+      .slice(0, MAX_CANDIDATE_TARGETS_PER_METHOD);
+  }
+
   collectView() {
     const brief = {};
     const grants = new Map();
     for (const [name, mod] of this.modules.entries()) {
       brief[name] = mod.snapshotFn();
       for (const g of mod.grantsFn()) {
-        grants.set(`${g.method_id}|${g.actor}`, {
+        const key = `${g.method_id}|${g.actor}`;
+        const prev = grants.get(key);
+        const mergedTargets = WebOriginSDK.prioritizeTargets(prev ? [...prev.targets, ...g.targets] : g.targets);
+        const overall =
+          prev?.readiness === "ready" || g.readiness === "ready" || mergedTargets.some((t) => t.readiness === "ready")
+            ? "ready"
+            : "staged";
+        grants.set(key, {
           ...g,
-          targets: g.targets.slice(0, MAX_CANDIDATE_TARGETS_PER_METHOD),
+          readiness: overall,
+          targets: mergedTargets,
         });
       }
     }

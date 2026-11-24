@@ -1,4 +1,4 @@
-import { canonicalizeJcs, jcsSha256 } from "./jcs.js";
+import { canonicalizeJcs, jcsSha256, parseStrictJson } from "./jcs.js";
 
 export const G2A_WIRE_VERSION = "0.0.1";
 export const MAX_CANDIDATE_TARGETS_PER_METHOD = 24;
@@ -148,7 +148,7 @@ export class OriginSDK {
     const url = `${this.hubOriginBaseUrl.replace(/\/$/, "")}/g2a/v1/origin/execute-stream?slot_id=${encodeURIComponent(this.slotId)}${tokenParam}`;
     this.eventSource = new EventSource(url);
     this.eventSource.addEventListener("origin.execute", async (ev: MessageEvent) => {
-      const env = JSON.parse(ev.data);
+      const env = parseStrictJson<Record<string, any>>(String(ev.data));
       const reply = await this.handleOriginExecute(env.payload as OriginExecuteRequest);
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       if (this.originToken) headers.Authorization = `Bearer ${this.originToken}`;
@@ -340,15 +340,58 @@ export class OriginSDK {
     });
   }
 
+  private static parseAnchorMeters(anchor?: string): number {
+    if (!anchor) return 1e9;
+    const s = anchor.trim();
+    if (!s.endsWith("m")) return 1e9;
+    const token = s.slice(0, -1).split(" ").pop() ?? "";
+    const d = Number(token);
+    return Number.isFinite(d) ? d : 1e9;
+  }
+
+  private static prioritizeTargets(targets: TargetCandidate[]): TargetCandidate[] {
+    const dedup = new Map<string, TargetCandidate>();
+    for (const t of targets) {
+      if (!dedup.has(t.target_id) || t.readiness === "ready") {
+        dedup.set(t.target_id, t);
+      }
+    }
+    return [...dedup.values()]
+      .sort((a, b) => {
+        const aAlert = a.alert_tag ? 0 : 1;
+        const bAlert = b.alert_tag ? 0 : 1;
+        if (aAlert !== bAlert) return aAlert - bAlert;
+        const aPoint = a.player_anchor?.toLowerCase().includes("pointed") ? 0 : 1;
+        const bPoint = b.player_anchor?.toLowerCase().includes("pointed") ? 0 : 1;
+        if (aPoint !== bPoint) return aPoint - bPoint;
+        const aReady = a.readiness === "ready" ? 0 : 1;
+        const bReady = b.readiness === "ready" ? 0 : 1;
+        if (aReady !== bReady) return aReady - bReady;
+        const distDiff = OriginSDK.parseAnchorMeters(a.actor_anchor) - OriginSDK.parseAnchorMeters(b.actor_anchor);
+        if (Math.abs(distDiff) > 1e-6) return distDiff;
+        return a.target_id < b.target_id ? -1 : a.target_id > b.target_id ? 1 : 0;
+      })
+      .slice(0, MAX_CANDIDATE_TARGETS_PER_METHOD);
+  }
+
   private collectView(): { brief: Record<string, unknown>; grants: Map<string, ActiveMethodGrant> } {
     const brief: Record<string, unknown> = {};
     const grants = new Map<string, ActiveMethodGrant>();
     for (const [name, mod] of this.modules.entries()) {
       brief[name] = mod.snapshotFn();
       for (const g of mod.grantsFn()) {
-        grants.set(`${g.method_id}|${g.actor}`, {
-          ...g,
-          targets: g.targets.slice(0, MAX_CANDIDATE_TARGETS_PER_METHOD),
+        const key = `${g.method_id}|${g.actor}`;
+        const prev = grants.get(key);
+        const mergedTargets = OriginSDK.prioritizeTargets(prev ? [...prev.targets, ...g.targets] : g.targets);
+        const overall: Readiness =
+          prev?.readiness === "ready" || g.readiness === "ready" || mergedTargets.some((t) => t.readiness === "ready")
+            ? "ready"
+            : "staged";
+        grants.set(key, {
+          method_id: g.method_id,
+          actor: g.actor,
+          readiness: overall,
+          targets: mergedTargets,
         });
       }
     }
@@ -373,4 +416,4 @@ export class OriginSDK {
   }
 }
 
-export { canonicalizeJcs, jcsSha256 };
+export { canonicalizeJcs, jcsSha256, parseStrictJson };

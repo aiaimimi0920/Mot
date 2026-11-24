@@ -63,6 +63,10 @@ func (c *Conn) WriteText(payload []byte) error {
 	return c.writeFrame(0x1, payload)
 }
 
+func (c *Conn) WritePing(payload []byte) error {
+	return c.writeFrame(0x9, payload)
+}
+
 func (c *Conn) writeFrame(opcode byte, payload []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
