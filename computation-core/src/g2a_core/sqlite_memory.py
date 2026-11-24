@@ -6,7 +6,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from .memory import MemoryBundleV1, MemoryRecord, SpoilerGuard
+from .memory import MemoryBundleV1, MemoryRecord, SpoilerGuard, filter_and_rank_safe_memories
 
 
 class SQLiteCompanionStore:
@@ -24,6 +24,9 @@ class SQLiteCompanionStore:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL;")
+            self._conn.execute("PRAGMA synchronous=NORMAL;")
+            self._conn.execute("PRAGMA busy_timeout=5000;")
+            self._conn.execute("PRAGMA temp_store=MEMORY;")
             self._conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS memory_records (
@@ -40,6 +43,8 @@ class SQLiteCompanionStore:
                     observed_epoch INTEGER,
                     PRIMARY KEY (player_id, memory_id)
                 );
+                CREATE INDEX IF NOT EXISTS idx_memory_records_player_rank
+                    ON memory_records (player_id, pinned_by_player DESC, created_at_ms DESC);
                 CREATE TABLE IF NOT EXISTS persona_settings (
                     player_id TEXT NOT NULL,
                     key TEXT NOT NULL,
@@ -165,17 +170,7 @@ class SQLiteCompanionStore:
             self.upsert_player_record(player_id, summary_record)
 
     def recall_safe(self, player_id: str, guard: SpoilerGuard) -> List[MemoryRecord]:
-        records = self.list_records(player_id)
-        out: List[MemoryRecord] = []
-        for rec in records:
-            if guard.game_origin_id and rec.game_origin_id and rec.game_origin_id != guard.game_origin_id:
-                if rec.max_disclosure_scope != "cross_game_companion":
-                    continue
-            if rec.timeline_tag and guard.allowed_timeline_tags is not None:
-                if rec.timeline_tag not in guard.allowed_timeline_tags:
-                    continue
-            out.append(rec)
-        return out
+        return filter_and_rank_safe_memories(self.list_records(player_id), guard)
 
     def export_all(self, player_id: str) -> MemoryBundleV1:
         with self._lock:

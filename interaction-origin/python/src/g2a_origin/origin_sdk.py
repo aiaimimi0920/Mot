@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import os
@@ -7,8 +8,10 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
@@ -17,6 +20,7 @@ from .jcs import StrictJSONError, jcs_sha256, parse_strict_json
 
 G2A_WIRE_VERSION = "0.0.1"
 MAX_CANDIDATE_TARGETS_PER_METHOD = 24
+MAX_EXECUTION_LEDGER_ENTRIES = 512
 
 
 def _gen_id(prefix: str) -> str:
@@ -250,13 +254,63 @@ def discover_local_hub_origin_url(runtime_file: Optional[str] = None, verify_hea
 
 
 class LoopbackHTTPTransportClient:
+    """Persistent HTTP/1.1 Keep-Alive transport client avoiding ephemeral TCP TIME_WAIT churn at 60Hz."""
+
     def __init__(self, hub_origin_url: str, shared_token: str = "", timeout_sec: float = 5.0) -> None:
         self.hub_origin_url = hub_origin_url.rstrip("/")
         self.shared_token = shared_token
         self.timeout_sec = timeout_sec
+        parsed = urllib.parse.urlparse(self.hub_origin_url)
+        self._is_https = parsed.scheme == "https"
+        self._host = parsed.hostname or "127.0.0.1"
+        self._port = parsed.port or (443 if self._is_https else 80)
+        self._path = (parsed.path.rstrip("/") or "") + "/g2a/v1/origin"
+        self._tls = threading.local()
+        self._pool_lock = threading.Lock()
+        self._pooled_conns: List[http.client.HTTPConnection] = []
+
+    def _get_conn(self) -> http.client.HTTPConnection:
+        conn = getattr(self._tls, "conn", None)
+        if conn is None:
+            if self._is_https:
+                conn = http.client.HTTPSConnection(self._host, self._port, timeout=self.timeout_sec)
+            else:
+                conn = http.client.HTTPConnection(self._host, self._port, timeout=self.timeout_sec)
+            with self._pool_lock:
+                self._pooled_conns.append(conn)
+            self._tls.conn = conn
+        return conn
+
+    def _reset_conn(self) -> None:
+        conn = getattr(self._tls, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._pool_lock:
+                if conn in self._pooled_conns:
+                    self._pooled_conns.remove(conn)
+            self._tls.conn = None
+
+    def close(self) -> None:
+        with self._pool_lock:
+            conns = list(self._pooled_conns)
+            self._pooled_conns.clear()
+        for c in conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+        self._tls.conn = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def post_to_hub(self, operation: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        url = f"{self.hub_origin_url}/g2a/v1/origin"
         env = {
             "g2a_version": G2A_WIRE_VERSION,
             "request_id": _gen_id("orig-req"),
@@ -266,29 +320,39 @@ class LoopbackHTTPTransportClient:
             "extensions": {},
         }
         body = json.dumps(env, ensure_ascii=False, allow_nan=False).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "Connection": "keep-alive",
+        }
         if self.shared_token:
             headers["Authorization"] = f"Bearer {self.shared_token}"
-        req = urllib.request.Request(url, data=body, method="POST", headers=headers)
-        opener = (
-            urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            if ("127.0.0.1" in url or "localhost" in url)
-            else urllib.request.build_opener()
-        )
-        try:
-            with opener.open(req, timeout=self.timeout_sec) as resp:
-                parsed = parse_strict_json(resp.read())
-                if parsed.get("acceptance") == "accepted":
-                    return parsed.get("result") or {}
-                err = parsed.get("error") or {}
-                raise G2AOriginError(err.get("code", "invalid_request"), int(err.get("http_status", 400)), err.get("message", ""))
-        except urllib.error.HTTPError as herr:
-            raw = herr.read()
-            if raw:
-                parsed = parse_strict_json(raw)
-                err = parsed.get("error") or {}
-                raise G2AOriginError(err.get("code", "invalid_request"), int(err.get("http_status", herr.code)), err.get("message", ""))
-            raise G2AOriginError("unavailable", herr.code, str(herr)) from herr
+
+        for attempt in range(2):
+            conn = self._get_conn()
+            try:
+                conn.request("POST", self._path, body=body, headers=headers)
+                resp = conn.getresponse()
+                raw = resp.read()
+                status = resp.status
+                if raw:
+                    parsed = parse_strict_json(raw)
+                    if parsed.get("acceptance") == "accepted":
+                        return parsed.get("result") or {}
+                    err = parsed.get("error") or {}
+                    raise G2AOriginError(
+                        err.get("code", "invalid_request"),
+                        int(err.get("http_status", status)),
+                        err.get("message", ""),
+                    )
+                raise G2AOriginError("unavailable", status, f"HTTP {status}")
+            except G2AOriginError:
+                raise
+            except Exception as ex:
+                self._reset_conn()
+                if attempt == 0:
+                    continue
+                raise G2AOriginError("unavailable", 503, f"Hub transport error: {ex}") from ex
+        raise G2AOriginError("unavailable", 503, "Unreachable")
 
 
 # --- Spatial Math & Aggregation Helpers ---
@@ -311,14 +375,29 @@ def _compute_player_deictic_label(focus: PlayerFocusInfo, obj: InteractableRef) 
     return f"{side} {dist}m"
 
 
+def _parse_anchor_meters(anchor: Optional[str]) -> float:
+    if not anchor:
+        return 1e9
+    s = anchor.strip()
+    if s.endswith("m"):
+        token = s[:-1].rsplit(" ", 1)[-1]
+        try:
+            return float(token)
+        except ValueError:
+            return 1e9
+    return 1e9
+
+
 def _prioritize_alerts_and_focus(
     targets: List[TargetCandidate],
     limit: int = MAX_CANDIDATE_TARGETS_PER_METHOD,
 ) -> List[TargetCandidate]:
-    def _rank(c: TargetCandidate) -> Tuple[int, int, str]:
+    def _rank(c: TargetCandidate) -> Tuple[int, int, int, float, str]:
         is_alert = 0 if c.alert_tag else 1
         is_pointed = 0 if (c.player_anchor and "pointed" in c.player_anchor) else 1
-        return (is_alert, is_pointed, c.target_id)
+        is_ready = 0 if c.readiness == "ready" else 1
+        dist_m = _parse_anchor_meters(c.actor_anchor)
+        return (is_alert, is_pointed, is_ready, dist_m, c.target_id)
 
     dedup: Dict[str, TargetCandidate] = {}
     for t in targets:
@@ -415,7 +494,7 @@ class OriginSDK:
         self.actors: Dict[str, Any] = {}
         self.signal_modules: Dict[str, _SignalModule] = {}
         self.in_flight_steps: Dict[str, Callable[[], None]] = {}
-        self.execution_ledger: Dict[str, OriginExecuteReply] = {}
+        self.execution_ledger: OrderedDict[str, OriginExecuteReply] = OrderedDict()
         self.pending_settled_executions: List[OriginExecuteReply] = []
 
         self.current_epoch: int = 1
@@ -512,6 +591,17 @@ class OriginSDK:
             self._http_server.shutdown()
             self._http_server.server_close()
             self._http_server = None
+        close_fn = getattr(self.hub_transport, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+    def __del__(self) -> None:
+        try:
+            close_fn = getattr(self.hub_transport, "close", None)
+            if callable(close_fn):
+                close_fn()
+        except Exception:
+            pass
 
     def start_outbound_execute_stream(self, hub_origin_url: str) -> str:
         """Zero-inbound-port mode (NAT / console / strict sandbox): never calls socket.bind!"""
@@ -910,18 +1000,18 @@ class OriginSDK:
 
             if isinstance(outcome, ImmediateSucceeded):
                 rep = OriginExecuteReply(req.execution_id, "succeeded", effect_summary=outcome.effect_summary)
-                self.execution_ledger[req.execution_id] = rep
+                self._store_ledger_reply(rep)
                 sync_needed["flag"] = True
                 return rep
             if isinstance(outcome, ImmediateFailed):
                 rep = OriginExecuteReply(req.execution_id, "failed", failure_reason=outcome.reason)
-                self.execution_ledger[req.execution_id] = rep
+                self._store_ledger_reply(rep)
                 sync_needed["flag"] = True
                 return rep
             if isinstance(outcome, StartedExecuting):
                 self.in_flight_steps[req.execution_id] = outcome.cancel_fn
                 rep = OriginExecuteReply(req.execution_id, "executing")
-                self.execution_ledger[req.execution_id] = rep
+                self._store_ledger_reply(rep)
                 return rep
             raise G2AOriginError("invalid_request", 400, "Invalid EffectInvocationResult")
 
@@ -929,6 +1019,16 @@ class OriginSDK:
         if sync_needed["flag"]:
             self.flush_dirty_sync(significant_event=False)
         return reply
+
+    def _store_ledger_reply(self, rep: OriginExecuteReply) -> None:
+        self.execution_ledger[rep.execution_id] = rep
+        self.execution_ledger.move_to_end(rep.execution_id)
+        if len(self.execution_ledger) > MAX_EXECUTION_LEDGER_ENTRIES:
+            for old_id in list(self.execution_ledger.keys()):
+                if len(self.execution_ledger) <= MAX_EXECUTION_LEDGER_ENTRIES:
+                    break
+                if old_id not in self.in_flight_steps:
+                    self.execution_ledger.pop(old_id, None)
 
     def complete_step(
         self,
@@ -945,7 +1045,7 @@ class OriginSDK:
             self.in_flight_steps.pop(execution_id, None)
             state = "succeeded" if succeeded else "failed"
             rep = OriginExecuteReply(execution_id, state, effect_summary=summary, failure_reason=reason)
-            self.execution_ledger[execution_id] = rep
+            self._store_ledger_reply(rep)
             self.pending_settled_executions.append(rep)
             settled_flag["queued"] = True
 
@@ -961,7 +1061,7 @@ class OriginSDK:
             if cancel_fn is not None:
                 cancel_fn()
                 rep = OriginExecuteReply(execution_id, "cancelled", failure_reason="cancelled_by_hub")
-                self.execution_ledger[execution_id] = rep
+                self._store_ledger_reply(rep)
                 self.pending_settled_executions.append(rep)
                 cancelled_flag["queued"] = True
                 return rep
@@ -977,7 +1077,8 @@ class OriginSDK:
             for exec_id, cancel_fn in list(self.in_flight_steps.items()):
                 cancel_fn()
                 rep = OriginExecuteReply(exec_id, "cancelled", failure_reason=reason)
-                self.execution_ledger[exec_id] = rep
+                self._store_ledger_reply(rep)
+                self.pending_settled_executions.append(rep)
             self.in_flight_steps.clear()
 
         self.engine_dispatcher.run_on_game_thread(_clear)

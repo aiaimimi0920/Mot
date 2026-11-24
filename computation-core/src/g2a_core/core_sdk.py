@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import os
 import socket
@@ -13,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
 from .jcs import jcs_sha256, parse_strict_json
@@ -98,8 +100,11 @@ class CoreSDK:
         self.slot_digest_index: Dict[str, str] = {}
         self.pending_confirm_queues: Dict[str, MethodCallQueue] = {}
         self.completed_receipts: List[QueueReceipt] = []
-        self.seen_event_ids: set[str] = set()
+        self.seen_event_ids: OrderedDict[str, None] = OrderedDict()
         self.refusal_cooldowns: Dict[str, int] = {}
+        self._http_tls = threading.local()
+        self._pool_lock = threading.Lock()
+        self._pooled_conns: List[http.client.HTTPConnection] = []
 
         self.hub_endpoint: str = ""
         self.auth_token: str = ""
@@ -111,6 +116,7 @@ class CoreSDK:
         self.latest_context: Optional[ProjectedContext] = None
 
         self._stop_event = threading.Event()
+        self._stream_ready = threading.Event()
         self._hb_thread: Optional[threading.Thread] = None
         self._sse_thread: Optional[threading.Thread] = None
         self.on_receipt_callback: Optional[Callable[[QueueReceipt], None]] = None
@@ -169,11 +175,14 @@ class CoreSDK:
         self.negotiated_extensions = list(reply.get("negotiated_extensions") or [])
 
         if start_background_loops:
+            self._stream_ready.clear()
             self._start_heartbeat_loop_async()
             if self.stream_mode == "websocket":
                 self._start_websocket_stream_async()
             else:
                 self._start_event_stream_async()
+            if self._custom_post_fn is None:
+                self._stream_ready.wait(timeout=2.0)
         return self.scope
 
     def connect_local_hub(
@@ -197,6 +206,13 @@ class CoreSDK:
                 self._post_envelope("session.close", {}, session_id=self.session_id)
             except Exception:
                 pass
+        self._close_all_keepalive_conns()
+
+    def __del__(self) -> None:
+        try:
+            self._close_all_keepalive_conns()
+        except Exception:
+            pass
 
     # --- Reconnect & Resume State Machine (§4.2) ---
 
@@ -240,6 +256,7 @@ class CoreSDK:
                 current_epoch=ctx.epoch,
                 game_origin_id=self.scope.game_instance_id,
                 allowed_timeline_tags=allowed_tags,
+                query_hint=ctx.player_command,
             ),
         )
         decision = self.planner.plan(caps, ctx, memories)
@@ -277,6 +294,14 @@ class CoreSDK:
     ) -> Optional[QueueReceipt]:
         if self.closed or not self.session_id:
             return None
+        # Client-side refusal cooldown pre-filter for proactive queues (avoids redundant 429 network round-trips)
+        now_ms = int(time.time() * 1000)
+        for k in [k for k, until in self.refusal_cooldowns.items() if now_ms >= until]:
+            self.refusal_cooldowns.pop(k, None)
+        if queue.trigger == "proactive":
+            fp = jcs_sha256("g2a.fp.v1", [s.to_dict() for s in queue.steps])
+            if now_ms < self.refusal_cooldowns.get(fp, 0):
+                return None
         try:
             res = self._post_envelope("queue.submit", queue.to_dict(), session_id=self.session_id)
             receipt = QueueReceipt.from_dict(res)
@@ -335,7 +360,9 @@ class CoreSDK:
         if ev_id:
             if ev_id in self.seen_event_ids:
                 return
-            self.seen_event_ids.add(ev_id)
+            self.seen_event_ids[ev_id] = None
+            if len(self.seen_event_ids) > 1024:
+                self.seen_event_ids.popitem(last=False)
 
         ev_name = env.get("event")
         payload = env.get("payload") or {}
@@ -358,10 +385,57 @@ class CoreSDK:
 
     def _record_receipt(self, receipt: QueueReceipt) -> None:
         self.completed_receipts.append(receipt)
+        if len(self.completed_receipts) > 256:
+            del self.completed_receipts[:-256]
         if receipt.latest_context is not None:
             self.latest_context = receipt.latest_context
         if self.on_receipt_callback:
             self.on_receipt_callback(receipt)
+
+    def _get_keepalive_conn(self, host: str, port: int, is_https: bool) -> http.client.HTTPConnection:
+        key = (host, port, is_https)
+        cached = getattr(self._http_tls, "entry", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        if cached is not None:
+            try:
+                cached[1].close()
+            except Exception:
+                pass
+        if is_https:
+            ctx = self.ssl_context or ssl.create_default_context()
+            conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+                host, port, timeout=self.request_timeout_sec, context=ctx
+            )
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=self.request_timeout_sec)
+        with self._pool_lock:
+            self._pooled_conns.append(conn)
+        self._http_tls.entry = (key, conn)
+        return conn
+
+    def _reset_keepalive_conn(self) -> None:
+        cached = getattr(self._http_tls, "entry", None)
+        if cached is not None:
+            try:
+                cached[1].close()
+            except Exception:
+                pass
+            with self._pool_lock:
+                if cached[1] in self._pooled_conns:
+                    self._pooled_conns.remove(cached[1])
+            self._http_tls.entry = None
+
+    def _close_all_keepalive_conns(self) -> None:
+        with self._pool_lock:
+            conns = list(self._pooled_conns)
+            self._pooled_conns.clear()
+        for c in conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+        self._http_tls.entry = None
 
     def _post_envelope(
         self,
@@ -373,7 +447,14 @@ class CoreSDK:
         if self._custom_post_fn is not None:
             return self._custom_post_fn(self.hub_endpoint, operation, payload, self.auth_token, session_id)
 
-        url = f"{self.hub_endpoint}/g2a/v1/core"
+        parsed_url = urllib.parse.urlparse(f"{self.hub_endpoint}/g2a/v1/core")
+        is_https = parsed_url.scheme == "https"
+        host = parsed_url.hostname or "127.0.0.1"
+        port = parsed_url.port or (443 if is_https else 80)
+        path = parsed_url.path or "/g2a/v1/core"
+        if parsed_url.query:
+            path = f"{path}?{parsed_url.query}"
+
         env: Dict[str, Any] = {
             "g2a_version": G2A_WIRE_VERSION,
             "request_id": generate_id("req"),
@@ -389,33 +470,35 @@ class CoreSDK:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.auth_token}",
+            "Connection": "keep-alive",
         }
-        req = urllib.request.Request(url, data=body, method="POST", headers=headers)
-        handlers: List[Any] = []
-        if "127.0.0.1" in url or "localhost" in url:
-            handlers.append(urllib.request.ProxyHandler({}))
-        if self.ssl_context is not None:
-            handlers.append(urllib.request.HTTPSHandler(context=self.ssl_context))
-        opener = urllib.request.build_opener(*handlers)
-        try:
-            with opener.open(req, timeout=self.request_timeout_sec) as resp:
+        for attempt in range(2):
+            conn = self._get_keepalive_conn(host, port, is_https)
+            try:
+                conn.request("POST", path, body=body, headers=headers)
+                resp = conn.getresponse()
                 raw = resp.read()
-                parsed = parse_strict_json(raw)
-                return self._unwrap_reply(parsed)
-        except urllib.error.HTTPError as http_err:
-            raw = http_err.read()
-            if raw:
-                parsed = parse_strict_json(raw)
-                return self._unwrap_reply(parsed)
-            if http_err.code == 504:
-                raise G2AError("outcome_unknown", 504, "Gateway timeout") from http_err
-            raise G2AError("unavailable", http_err.code, str(http_err)) from http_err
-        except (TimeoutError, socket.timeout) as tex:
-            raise G2AError("outcome_unknown", 504, f"Request timed out: {tex}") from tex
-        except urllib.error.URLError as uex:
-            if isinstance(uex.reason, (TimeoutError, socket.timeout)):
-                raise G2AError("outcome_unknown", 504, f"Request timed out: {uex}") from uex
-            raise G2AError("unavailable", 503, f"Hub connection failed: {uex}") from uex
+                status = resp.status
+                if raw:
+                    parsed = parse_strict_json(raw)
+                    return self._unwrap_reply(parsed)
+                if status == 504:
+                    raise G2AError("outcome_unknown", 504, "Gateway timeout")
+                raise G2AError("unavailable", status, f"HTTP {status}")
+            except G2AError:
+                raise
+            except (TimeoutError, socket.timeout) as tex:
+                self._reset_keepalive_conn()
+                raise G2AError("outcome_unknown", 504, f"Request timed out: {tex}") from tex
+            except (http.client.RemoteDisconnected, http.client.CannotSendRequest, ConnectionResetError, BrokenPipeError) as rex:
+                self._reset_keepalive_conn()
+                if attempt == 0:
+                    continue
+                raise G2AError("unavailable", 503, f"Hub connection closed: {rex}") from rex
+            except Exception as ex:
+                self._reset_keepalive_conn()
+                raise G2AError("unavailable", 503, f"Hub connection failed: {ex}") from ex
+        raise G2AError("unavailable", 503, "Unreachable")
 
     @staticmethod
     def _unwrap_reply(reply_env: Dict[str, Any]) -> Dict[str, Any]:
@@ -448,7 +531,8 @@ class CoreSDK:
         def _stream_worker() -> None:
             first_connect = True
             while not self._stop_event.is_set() and not self.closed and self.session_id:
-                stream_url = f"{self.hub_endpoint}/g2a/v1/core/events?session_id={self.session_id}"
+                replay_param = "" if first_connect else "&replay=1"
+                stream_url = f"{self.hub_endpoint}/g2a/v1/core/events?session_id={self.session_id}{replay_param}"
                 req = urllib.request.Request(
                     stream_url,
                     method="GET",
@@ -470,6 +554,7 @@ class CoreSDK:
                         handlers.append(urllib.request.HTTPSHandler(context=self.ssl_context))
                     opener = urllib.request.build_opener(*handlers)
                     with opener.open(req, timeout=60.0) as resp:
+                        self._stream_ready.set()
                         data_lines: List[str] = []
                         while not self._stop_event.is_set() and not self.closed:
                             raw_line = resp.readline()
@@ -532,7 +617,8 @@ class CoreSDK:
                 host = parsed.hostname or "127.0.0.1"
                 port = parsed.port or (443 if is_tls else 80)
                 base_path = parsed.path.rstrip("/")
-                ws_path = f"{base_path}/g2a/v1/core/ws?session_id={urllib.parse.quote(self.session_id)}"
+                replay_param = "" if first_connect else "&replay=1"
+                ws_path = f"{base_path}/g2a/v1/core/ws?session_id={urllib.parse.quote(self.session_id)}{replay_param}"
 
                 raw_sock: Optional[socket.socket] = None
                 try:
@@ -573,6 +659,7 @@ class CoreSDK:
                             return
                         raise ConnectionError(f"WebSocket upgrade rejected: {status_line}")
 
+                    self._stream_ready.set()
                     while not self._stop_event.is_set() and not self.closed:
                         b0, b1 = _recv_exact(raw_sock, 2)
                         opcode = b0 & 0x0F

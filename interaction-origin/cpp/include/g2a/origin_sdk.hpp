@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -130,6 +131,8 @@ using DomainEffectFn = std::function<EffectOutcome(const std::string& actor, con
 class OriginSdk {
 public:
     static constexpr const char* kWireVersion = "0.0.1";
+    static constexpr size_t kMaxCandidateTargets = 24;
+    static constexpr size_t kMaxExecutionLedger = 512;
 
     OriginSdk(
         std::string slot_id,
@@ -320,7 +323,7 @@ public:
         if (out.kind == "executing") {
             in_flight_[req.execution_id] = std::move(out.cancel_fn);
             OriginExecuteReply rep{req.execution_id, "executing", std::nullopt, std::nullopt};
-            ledger_[req.execution_id] = rep;
+            store_ledger_reply(rep);
             return rep;
         }
         OriginExecuteReply rep{
@@ -329,7 +332,7 @@ public:
             out.kind == "succeeded" ? std::optional<JsonObject>(out.summary) : std::nullopt,
             out.kind == "failed" ? std::optional<std::string>(out.failure_reason) : std::nullopt,
         };
-        ledger_[req.execution_id] = rep;
+        store_ledger_reply(rep);
         flush_dirty_sync(false);
         return rep;
     }
@@ -343,7 +346,7 @@ public:
             succeeded ? std::optional<JsonObject>(std::move(summary)) : std::nullopt,
             succeeded ? std::nullopt : std::optional<std::string>(std::move(reason)),
         };
-        ledger_[execution_id] = rep;
+        store_ledger_reply(rep);
         pending_settled_.push_back(std::move(rep));
         flush_dirty_sync(false);
     }
@@ -356,7 +359,7 @@ public:
             in_flight_.erase(it);
             if (fn) fn();
             OriginExecuteReply rep{execution_id, "cancelled", std::nullopt, "cancelled_by_hub"};
-            ledger_[execution_id] = rep;
+            store_ledger_reply(rep);
             pending_settled_.push_back(rep);
             flush_dirty_sync(false);
             return rep;
@@ -377,6 +380,23 @@ private:
         std::function<JsonObject()> snapshot_fn;
         std::function<std::vector<ActiveMethodGrant>()> grants_fn;
     };
+
+    void store_ledger_reply(const OriginExecuteReply& rep) {
+        if (ledger_.find(rep.execution_id) == ledger_.end()) {
+            ledger_order_.push_back(rep.execution_id);
+        }
+        ledger_[rep.execution_id] = rep;
+        size_t guard = ledger_order_.size();
+        while (ledger_.size() > kMaxExecutionLedger && guard-- > 0) {
+            std::string oldest = std::move(ledger_order_.front());
+            ledger_order_.pop_front();
+            if (in_flight_.find(oldest) != in_flight_.end()) {
+                ledger_order_.push_back(std::move(oldest));
+            } else {
+                ledger_.erase(oldest);
+            }
+        }
+    }
 
     std::pair<JsonObject, std::map<std::pair<std::string, std::string>, ActiveMethodGrant>> collect_view() {
         JsonObject brief;
@@ -407,6 +427,7 @@ private:
     std::map<std::string, StateMod> modules_;
     std::map<std::string, std::function<void()>> in_flight_;
     std::map<std::string, OriginExecuteReply> ledger_;
+    std::deque<std::string> ledger_order_;
     std::vector<OriginExecuteReply> pending_settled_;
     std::map<std::pair<std::string, std::string>, std::string> last_sent_methods_;
     std::string last_brief_digest_;

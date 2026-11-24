@@ -150,6 +150,56 @@ class TestInteractionOriginPythonSDK(unittest.TestCase):
         self.assertEqual(merged.readiness, "ready")
         self.assertEqual({t.target_id for t in merged.targets}, {"t1", "t2"})
 
+    def test_dense_crowd_priority_sorting_and_bounded_execution_ledger(self):
+        tx = RecordingTransport()
+        sdk = OriginSDK(slot_id="slot-crowd", hub_transport=tx)
+        sdk.bind_actor_subject("companion", object())
+        sdk.register_capability(
+            CapabilityEntry("#02", "interact", "Interact", ["companion"], {}),
+            effect_handler=lambda a, s, args, tok: (
+                StartedExecuting(lambda: None)
+                if args.get("hold")
+                else ImmediateSucceeded({"ok": True})
+            ),
+        )
+
+        # Build 60 candidate targets: distant staged chests 00..54, close ready chest_55, pointed chest_58, alerted chest_59
+        crowd = [
+            TargetCandidate(f"chest_{i:02d}", f"Chest {i}", "staged", actor_anchor="22.0m")
+            for i in range(55)
+        ]
+        crowd.append(TargetCandidate("chest_55", "Nearby Ready Chest", "ready", actor_anchor="1.2m"))
+        crowd.append(TargetCandidate("chest_58", "Pointed Chest", "staged", actor_anchor="9.0m", player_anchor="pointed_ray"))
+        crowd.append(TargetCandidate("chest_59", "Alerted Station", "staged", actor_anchor="14.0m", alert_tag="halted_no_material"))
+
+        sdk.bind_state_module(
+            "crowd_zone",
+            lambda: {"count": len(crowd)},
+            lambda: [ActiveMethodGrant("#02", "companion", "ready", crowd)],
+        )
+        _, grants = sdk.collect_current_view()
+        top_targets = grants[("#02", "companion")].targets
+        self.assertEqual(len(top_targets), 24)
+        self.assertEqual(top_targets[0].target_id, "chest_59")  # Alert tag #1
+        self.assertEqual(top_targets[1].target_id, "chest_58")  # Player pointed #2
+        self.assertEqual(top_targets[2].target_id, "chest_55")  # Ready & closest (1.2m) #3
+
+        # Start one sustained in-flight step and execute 600 immediate steps -> bounded at 512 while preserving in-flight!
+        r_hold = sdk.handle_origin_execute(
+            OriginExecuteRequest("slot-crowd", 1, "invoke", "exec-hold-inflight", "#02", "companion", {"hold": True})
+        )
+        self.assertEqual(r_hold.state, "executing")
+        for idx in range(600):
+            sdk.handle_origin_execute(
+                OriginExecuteRequest("slot-crowd", 1, "invoke", f"exec-fast-{idx}", "#02", "companion", {})
+            )
+        self.assertEqual(len(sdk.execution_ledger), 512)
+        self.assertIn("exec-hold-inflight", sdk.execution_ledger)
+
+        # Emergency stop settles all in-flight steps atomically into pending_settled_executions
+        sdk.report_emergency_stop()
+        self.assertEqual(sdk.execution_ledger["exec-hold-inflight"].state, "cancelled")
+
 
 if __name__ == "__main__":
     unittest.main()

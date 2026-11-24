@@ -7,8 +7,16 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/aiaimimi0920/g2a-intelligent-hub/internal/model"
+)
+
+const (
+	MaxAuditEntries         = 120
+	MaxChatDedupEntries     = 2048
+	MaxSettledPerSlot       = 256
+	MaxTerminalQueuesStored = 512
 )
 
 type SlotRecord struct {
@@ -36,9 +44,27 @@ type SlotView struct {
 	StateBrief          map[string]any                      `json:"state_brief"`
 	Methods             map[string]model.ActiveMethodGrant  `json:"methods"` // key: method_id + "|" + actor
 	SettledExecutions   map[string]model.OriginExecuteReply `json:"settled_executions"`
+	SettledOrder        []string                            `json:"settled_order,omitempty"`
 	LatestVisual        map[string]any                      `json:"latest_visual,omitempty"`
 	LatestAudio         map[string]any                      `json:"latest_audio,omitempty"`
 	AllowedTimelineTags []string                            `json:"allowed_timeline_tags,omitempty"`
+}
+
+func (v *SlotView) RecordSettledExecution(rep model.OriginExecuteReply) {
+	if v.SettledExecutions == nil {
+		v.SettledExecutions = make(map[string]model.OriginExecuteReply)
+	}
+	if _, exists := v.SettledExecutions[rep.ExecutionID]; !exists {
+		v.SettledOrder = append(v.SettledOrder, rep.ExecutionID)
+	}
+	v.SettledExecutions[rep.ExecutionID] = rep
+	if len(v.SettledOrder) > MaxSettledPerSlot {
+		evictCount := len(v.SettledOrder) - MaxSettledPerSlot
+		for _, oldID := range v.SettledOrder[:evictCount] {
+			delete(v.SettledExecutions, oldID)
+		}
+		v.SettledOrder = append([]string(nil), v.SettledOrder[evictCount:]...)
+	}
 }
 
 func MethodKey(methodID, actor string) string {
@@ -99,7 +125,9 @@ type HubStoreData struct {
 	SlotViews        map[string]*SlotView          `json:"slot_views"`
 	Sessions         map[string]*SessionRecord     `json:"sessions"`
 	Queues           map[string]*QueueLedgerRecord `json:"queues"`
+	QueueOrder       []string                      `json:"queue_order,omitempty"`
 	ChatDedup        map[string]bool               `json:"chat_dedup"`
+	ChatDedupOrder   []string                      `json:"chat_dedup_order,omitempty"`
 	ConfirmCooldowns map[string]int64              `json:"confirm_cooldowns"` // session_id|fingerprint -> deadline_ms
 	ApprovedScopes   map[string]bool               `json:"approved_scopes"`   // exact scope_digests approved for auto-join
 	PolicyOverrides  map[string]string             `json:"policy_overrides"`  // slot_id|method_id|actor -> allow|confirm|prohibit
@@ -112,7 +140,9 @@ func NewHubStoreData() *HubStoreData {
 		SlotViews:        make(map[string]*SlotView),
 		Sessions:         make(map[string]*SessionRecord),
 		Queues:           make(map[string]*QueueLedgerRecord),
+		QueueOrder:       make([]string, 0),
 		ChatDedup:        make(map[string]bool),
+		ChatDedupOrder:   make([]string, 0),
 		ConfirmCooldowns: make(map[string]int64),
 		ApprovedScopes:   make(map[string]bool),
 		PolicyOverrides:  make(map[string]string),
@@ -129,9 +159,101 @@ func (d *HubStoreData) AppendAudit(nowMs int64, category, slotID, sessionID, que
 		QueueID:     queueID,
 		Summary:     summary,
 	})
-	if len(d.AuditLog) > 120 {
-		d.AuditLog = d.AuditLog[len(d.AuditLog)-120:]
+	if len(d.AuditLog) > MaxAuditEntries {
+		d.AuditLog = append([]AuditEntry(nil), d.AuditLog[len(d.AuditLog)-MaxAuditEntries:]...)
 	}
+}
+
+func (d *HubStoreData) RecordChatDedup(key string) bool {
+	if d.ChatDedup[key] {
+		return true
+	}
+	d.ChatDedup[key] = true
+	d.ChatDedupOrder = append(d.ChatDedupOrder, key)
+	if len(d.ChatDedupOrder) > MaxChatDedupEntries {
+		evict := len(d.ChatDedupOrder) - MaxChatDedupEntries
+		if evict < 128 {
+			evict = 128
+		}
+		if evict > len(d.ChatDedupOrder) {
+			evict = len(d.ChatDedupOrder)
+		}
+		for _, old := range d.ChatDedupOrder[:evict] {
+			delete(d.ChatDedup, old)
+		}
+		d.ChatDedupOrder = append([]string(nil), d.ChatDedupOrder[evict:]...)
+	}
+	return false
+}
+
+func (d *HubStoreData) RegisterQueue(qKey string, rec *QueueLedgerRecord) {
+	if _, exists := d.Queues[qKey]; !exists {
+		d.QueueOrder = append(d.QueueOrder, qKey)
+	}
+	d.Queues[qKey] = rec
+	d.PruneTerminalQueues()
+}
+
+func (d *HubStoreData) PruneTerminalQueues() {
+	if len(d.Queues) <= MaxTerminalQueuesStored {
+		return
+	}
+	keptOrder := make([]string, 0, len(d.QueueOrder))
+	removed := 0
+	targetRemove := len(d.Queues) - MaxTerminalQueuesStored
+	for _, qKey := range d.QueueOrder {
+		rec, ok := d.Queues[qKey]
+		if !ok {
+			continue
+		}
+		isTerminal := rec.State == "completed" || rec.State == "aborted" || rec.State == "cancelled"
+		if removed < targetRemove && isTerminal {
+			delete(d.Queues, qKey)
+			removed++
+			continue
+		}
+		keptOrder = append(keptOrder, qKey)
+	}
+	d.QueueOrder = keptOrder
+}
+
+func (d *HubStoreData) SweepExpiredCooldowns(nowMs int64) {
+	for k, until := range d.ConfirmCooldowns {
+		if nowMs >= until {
+			delete(d.ConfirmCooldowns, k)
+		}
+	}
+}
+
+// SanitizeAfterRestart reconciles in-flight state after an unclean Hub process crash/restart:
+//   - "active" sessions lose live push transports on restart -> transition to "disconnected_grace" (requiring two-tier resume);
+//   - "running" queues had interrupted mid-execution steps -> transition to "aborted" so slots never deadlock.
+func (d *HubStoreData) SanitizeAfterRestart() bool {
+	mutated := false
+	reason := "hub_restarted_mid_execution"
+	for _, sess := range d.Sessions {
+		if sess.State == "active" {
+			sess.State = "disconnected_grace"
+			sess.LocalFallbackActivated = true
+			sess.ActiveQueueID = nil
+			mutated = true
+		}
+	}
+	for _, rec := range d.Queues {
+		if rec.State == "running" {
+			rec.State = "aborted"
+			rec.CurrentExecutionID = nil
+			for i := range rec.StepReceipts {
+				if rec.StepReceipts[i].State == "pending" || rec.StepReceipts[i].State == "executing" {
+					rec.StepReceipts[i].State = "aborted"
+					rCopy := reason
+					rec.StepReceipts[i].FailureReason = &rCopy
+				}
+			}
+			mutated = true
+		}
+	}
+	return mutated
 }
 
 func (d *HubStoreData) EnsureMaps() {
@@ -193,15 +315,21 @@ func (d *HubStoreData) ActiveSessionsForSlot(slotID string) []*SessionRecord {
 }
 
 type PersistencePort struct {
-	mu       sync.Mutex
-	filePath string
-	data     *HubStoreData
+	mu        sync.RWMutex
+	filePath  string
+	data      *HubStoreData
+	dirty     bool
+	stopFlush chan struct{}
+	flushDone chan struct{}
+	closeOnce sync.Once
 }
 
 func NewPersistencePort(filePath string) (*PersistencePort, error) {
 	p := &PersistencePort{
-		filePath: filePath,
-		data:     NewHubStoreData(),
+		filePath:  filePath,
+		data:      NewHubStoreData(),
+		stopFlush: make(chan struct{}),
+		flushDone: make(chan struct{}),
 	}
 	if filePath != "" {
 		if raw, err := os.ReadFile(filePath); err == nil && len(raw) > 0 {
@@ -210,12 +338,82 @@ func NewPersistencePort(filePath string) (*PersistencePort, error) {
 				return nil, fmt.Errorf("load hub ledger %s: %w", filePath, err)
 			}
 			loaded.EnsureMaps()
+			sanitized := loaded.SanitizeAfterRestart()
 			p.data = loaded
+			if sanitized {
+				_ = p.persistLocked()
+			}
 		}
+		go p.backgroundFlushLoop(250 * time.Millisecond)
+	} else {
+		close(p.flushDone)
 	}
 	return p, nil
 }
 
+func (p *PersistencePort) backgroundFlushLoop(interval time.Duration) {
+	defer close(p.flushDone)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.stopFlush:
+			_ = p.Flush()
+			return
+		case <-ticker.C:
+			_ = p.Flush()
+		}
+	}
+}
+
+func (p *PersistencePort) Flush() error {
+	if p.filePath == "" {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.dirty {
+		return nil
+	}
+	if err := p.persistLocked(); err != nil {
+		return err
+	}
+	p.dirty = false
+	return nil
+}
+
+func (p *PersistencePort) Close() error {
+	var err error
+	p.closeOnce.Do(func() {
+		if p.filePath != "" {
+			close(p.stopFlush)
+			<-p.flushDone
+		}
+	})
+	return err
+}
+
+// ReadOnly executes a concurrent read transaction under RLock with zero JSON marshaling or disk I/O.
+func ReadOnly[T any](p *PersistencePort, fn func(d *HubStoreData) (T, *model.G2AError)) (T, *model.G2AError) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return fn(p.data)
+}
+
+// MutateVolatile executes a fast in-memory state update (e.g., 60Hz delta syncs, heartbeats, rate limits)
+// without blocking on synchronous JSON snapshots or disk flushes; changes are coalesced by the background flusher.
+// Callers MUST validate preconditions before mutating `d`.
+func MutateVolatile[T any](p *PersistencePort, fn func(d *HubStoreData) (T, *model.G2AError)) (T, *model.G2AError) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	res, gErr := fn(p.data)
+	if gErr == nil && p.filePath != "" {
+		p.dirty = true
+	}
+	return res, gErr
+}
+
+// Atomic executes a durable ledger transaction with full rollback on error and immediate crash-safe disk persistence.
 func Atomic[T any](p *PersistencePort, tx func(d *HubStoreData) (T, *model.G2AError)) (T, *model.G2AError) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -243,6 +441,7 @@ func Atomic[T any](p *PersistencePort, tx func(d *HubStoreData) (T, *model.G2AEr
 			p.data = rolledBack
 			return zero, model.NewError(model.ErrUnavailable, 503, "Failed to persist ledger")
 		}
+		p.dirty = false
 	}
 	return res, nil
 }
@@ -251,7 +450,7 @@ func (p *PersistencePort) persistLocked() error {
 	if err := os.MkdirAll(filepath.Dir(p.filePath), 0o755); err != nil {
 		return err
 	}
-	out, err := json.MarshalIndent(p.data, "", "  ")
+	out, err := json.Marshal(p.data)
 	if err != nil {
 		return err
 	}
@@ -259,7 +458,16 @@ func (p *PersistencePort) persistLocked() error {
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, p.filePath)
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		if err := os.Rename(tmp, p.filePath); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	return lastErr
 }
 
 func ValidateArgsAgainstSchema(args map[string]any, schema map[string]any) *model.G2AError {

@@ -2,6 +2,7 @@ import { canonicalizeJcs, jcsSha256 } from "./jcs.js";
 
 export const G2A_WIRE_VERSION = "0.0.1";
 export const MAX_CANDIDATE_TARGETS_PER_METHOD = 24;
+export const MAX_EXECUTION_LEDGER_ENTRIES = 512;
 
 export type PolicyMode = "allow" | "confirm" | "prohibit";
 export type Readiness = "ready" | "staged";
@@ -251,15 +252,26 @@ export class OriginSDK {
     if (out.kind === "executing") {
       this.inFlight.set(req.execution_id, out.cancel_fn);
       const rep: OriginExecuteReply = { execution_id: req.execution_id, state: "executing" };
-      this.ledger.set(req.execution_id, rep);
+      this.storeLedgerReply(rep);
       return rep;
     }
     const rep: OriginExecuteReply = out.kind === "succeeded"
       ? { execution_id: req.execution_id, state: "succeeded", effect_summary: out.effect_summary }
       : { execution_id: req.execution_id, state: "failed", failure_reason: out.reason };
-    this.ledger.set(req.execution_id, rep);
+    this.storeLedgerReply(rep);
     await this.flushDirtySync(false);
     return rep;
+  }
+
+  private storeLedgerReply(rep: OriginExecuteReply): void {
+    this.ledger.delete(rep.execution_id);
+    this.ledger.set(rep.execution_id, rep);
+    if (this.ledger.size > MAX_EXECUTION_LEDGER_ENTRIES) {
+      for (const oldId of this.ledger.keys()) {
+        if (this.ledger.size <= MAX_EXECUTION_LEDGER_ENTRIES) break;
+        if (!this.inFlight.has(oldId)) this.ledger.delete(oldId);
+      }
+    }
   }
 
   async completeStep(executionId: string, succeeded: boolean, summary?: Record<string, unknown>, reason?: string): Promise<void> {
@@ -270,7 +282,7 @@ export class OriginSDK {
       effect_summary: summary,
       failure_reason: reason,
     };
-    this.ledger.set(executionId, rep);
+    this.storeLedgerReply(rep);
     this.pendingSettled.push(rep);
     await this.flushDirtySync(false);
   }
@@ -281,7 +293,7 @@ export class OriginSDK {
       this.inFlight.delete(executionId);
       cancelFn();
       const rep: OriginExecuteReply = { execution_id: executionId, state: "cancelled", failure_reason: "cancelled_by_hub" };
-      this.ledger.set(executionId, rep);
+      this.storeLedgerReply(rep);
       this.pendingSettled.push(rep);
       await this.flushDirtySync(false);
       return rep;

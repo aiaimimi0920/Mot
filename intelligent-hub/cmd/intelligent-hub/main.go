@@ -50,6 +50,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("init persistence: %v", err)
 	}
+	defer func() { _ = persistence.Close() }()
 
 	cfg := hub.DefaultConfig()
 	cfg.AutoApproveScope = *autoScope

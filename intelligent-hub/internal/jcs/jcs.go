@@ -157,8 +157,38 @@ func ValidateStrictValue(v any) error {
 	}
 }
 
+func isPureJSONAST(v any) bool {
+	switch val := v.(type) {
+	case nil, bool, string, int, int64, float64:
+		return true
+	case []any:
+		for _, item := range val {
+			if !isPureJSONAST(item) {
+				return false
+			}
+		}
+		return true
+	case map[string]any:
+		for _, child := range val {
+			if !isPureJSONAST(child) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
 // CanonicalizeUTF8 converts any JSON-serializable Go value into RFC 8785 (JCS) canonical UTF-8 bytes.
 func CanonicalizeUTF8(value any) ([]byte, error) {
+	if isPureJSONAST(value) {
+		var buf bytes.Buffer
+		if err := writeCanonical(&buf, value); err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
 	if err := ValidateStrictValue(value); err != nil {
 		return nil, err
 	}
@@ -202,6 +232,8 @@ func writeCanonical(buf *bytes.Buffer, v any) error {
 		}
 	case string:
 		writeCanonicalString(buf, val)
+	case int:
+		buf.WriteString(strconv.Itoa(val))
 	case int64:
 		buf.WriteString(strconv.FormatInt(val, 10))
 	case float64:
@@ -247,7 +279,19 @@ func writeCanonical(buf *bytes.Buffer, v any) error {
 	return nil
 }
 
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
 func lessUTF16(a, b string) bool {
+	if isASCII(a) && isASCII(b) {
+		return a < b
+	}
 	ua := utf16.Encode([]rune(a))
 	ub := utf16.Encode([]rune(b))
 	n := len(ua)

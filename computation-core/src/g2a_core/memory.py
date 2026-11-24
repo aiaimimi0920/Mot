@@ -26,6 +26,48 @@ class SpoilerGuard:
     current_epoch: int
     game_origin_id: Optional[str] = None
     allowed_timeline_tags: Optional[set[str]] = None
+    query_hint: Optional[str] = None
+    max_results: int = 48
+
+
+def _keyword_score(query_hint: Optional[str], content: str) -> int:
+    if not query_hint:
+        return 0
+    q_low = query_hint.lower()
+    c_low = content.lower()
+    tokens = [tok for tok in q_low.replace(",", " ").split() if len(tok) >= 2]
+    return sum(1 for tok in tokens if tok in c_low)
+
+
+def filter_and_rank_safe_memories(records: List[MemoryRecord], guard: SpoilerGuard) -> List[MemoryRecord]:
+    safe: List[MemoryRecord] = []
+    for rec in records:
+        if guard.game_origin_id and rec.game_origin_id and rec.game_origin_id != guard.game_origin_id:
+            if rec.max_disclosure_scope != "cross_game_companion":
+                continue
+        if rec.timeline_tag and guard.allowed_timeline_tags is not None:
+            if rec.timeline_tag not in guard.allowed_timeline_tags:
+                continue
+        # Save-reload anti-spoiler rule (Section 7.2): suppress game_observed facts from future epochs
+        if (
+            rec.epistemic_source == "game_observed"
+            and rec.observed_epoch is not None
+            and guard.current_epoch < rec.observed_epoch
+        ):
+            continue
+        safe.append(rec)
+
+    safe.sort(
+        key=lambda r: (
+            1 if (r.pinned_by_player or r.epistemic_source == "player_edited") else 0,
+            _keyword_score(guard.query_hint, r.content),
+            r.created_at_ms,
+        ),
+        reverse=True,
+    )
+    if guard.max_results > 0:
+        return safe[: guard.max_results]
+    return safe
 
 
 @dataclass
@@ -142,16 +184,7 @@ class InMemoryCompanionStore:
         self._records[player_id] = kept
 
     def recall_safe(self, player_id: str, guard: SpoilerGuard) -> List[MemoryRecord]:
-        out: List[MemoryRecord] = []
-        for rec in self._records.get(player_id, {}).values():
-            if guard.game_origin_id and rec.game_origin_id and rec.game_origin_id != guard.game_origin_id:
-                if rec.max_disclosure_scope != "cross_game_companion":
-                    continue
-            if rec.timeline_tag and guard.allowed_timeline_tags is not None:
-                if rec.timeline_tag not in guard.allowed_timeline_tags:
-                    continue
-            out.append(rec)
-        return out
+        return filter_and_rank_safe_memories(list(self._records.get(player_id, {}).values()), guard)
 
     def export_all(self, player_id: str) -> MemoryBundleV1:
         return MemoryBundleV1(

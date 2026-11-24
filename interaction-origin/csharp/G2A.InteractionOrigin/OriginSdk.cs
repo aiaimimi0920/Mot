@@ -16,6 +16,7 @@ public sealed class OriginSdk
 {
     public const string WireVersion = "0.0.1";
     public const int MaxCandidateTargetsPerMethod = 24;
+    public const int MaxExecutionLedgerEntries = 512;
 
     private readonly string _slotId;
     private readonly string _roleKind;
@@ -31,6 +32,7 @@ public sealed class OriginSdk
     private readonly Dictionary<string, (Func<Dictionary<string, object?>> SnapshotFn, Func<List<ActiveMethodGrant>> GrantsFn)> _modules = new();
     private readonly Dictionary<string, Action> _inFlightSteps = new();
     private readonly Dictionary<string, OriginExecuteReply> _executionLedger = new();
+    private readonly Queue<string> _ledgerOrder = new();
     private readonly List<OriginExecuteReply> _pendingSettled = new();
 
     private Dictionary<(string MethodId, string Actor), string> _lastSentMethodJson = new();
@@ -224,18 +226,18 @@ public sealed class OriginSdk
             {
                 case EffectInvocationResult.ImmediateSucceeded ok:
                     var okRep = new OriginExecuteReply(req.ExecutionId, "succeeded", ok.EffectSummary);
-                    _executionLedger[req.ExecutionId] = okRep;
+                    StoreLedgerReply(okRep);
                     shouldSync = true;
                     return okRep;
                 case EffectInvocationResult.ImmediateFailed fail:
                     var failRep = new OriginExecuteReply(req.ExecutionId, "failed", null, fail.Reason);
-                    _executionLedger[req.ExecutionId] = failRep;
+                    StoreLedgerReply(failRep);
                     shouldSync = true;
                     return failRep;
                 case EffectInvocationResult.StartedExecuting exec:
                     _inFlightSteps[req.ExecutionId] = exec.CancelFn;
                     var execRep = new OriginExecuteReply(req.ExecutionId, "executing");
-                    _executionLedger[req.ExecutionId] = execRep;
+                    StoreLedgerReply(execRep);
                     return execRep;
                 default:
                     throw new G2AOriginException("invalid_request", 400, "Unknown EffectInvocationResult");
@@ -246,13 +248,29 @@ public sealed class OriginSdk
         return reply;
     }
 
+    private void StoreLedgerReply(OriginExecuteReply rep)
+    {
+        if (!_executionLedger.ContainsKey(rep.ExecutionId))
+            _ledgerOrder.Enqueue(rep.ExecutionId);
+        _executionLedger[rep.ExecutionId] = rep;
+        int guard = _ledgerOrder.Count;
+        while (_executionLedger.Count > MaxExecutionLedgerEntries && guard-- > 0)
+        {
+            string oldest = _ledgerOrder.Dequeue();
+            if (_inFlightSteps.ContainsKey(oldest))
+                _ledgerOrder.Enqueue(oldest);
+            else
+                _executionLedger.Remove(oldest);
+        }
+    }
+
     public void CompleteStep(string executionId, bool succeeded, Dictionary<string, object?>? summary = null, string? reason = null)
     {
         bool queued = _dispatcher.RunOnGameThread(() =>
         {
             if (!_inFlightSteps.Remove(executionId)) return false;
             var rep = new OriginExecuteReply(executionId, succeeded ? "succeeded" : "failed", summary, reason);
-            _executionLedger[executionId] = rep;
+            StoreLedgerReply(rep);
             _pendingSettled.Add(rep);
             return true;
         });
@@ -268,7 +286,7 @@ public sealed class OriginSdk
             {
                 cancelFn();
                 var cancelled = new OriginExecuteReply(executionId, "cancelled", null, "cancelled_by_hub");
-                _executionLedger[executionId] = cancelled;
+                StoreLedgerReply(cancelled);
                 _pendingSettled.Add(cancelled);
                 queued = true;
                 return cancelled;
@@ -339,23 +357,42 @@ public sealed class OriginSdk
         return (brief, grants);
     }
 
+    private static double ParseAnchorMeters(string? anchor)
+    {
+        if (string.IsNullOrWhiteSpace(anchor)) return 1e9;
+        string s = anchor.Trim();
+        if (!s.EndsWith('m')) return 1e9;
+        string core = s[..^1];
+        int sp = core.LastIndexOf(' ');
+        if (sp >= 0) core = core[(sp + 1)..];
+        return double.TryParse(core, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double d) ? d : 1e9;
+    }
+
+    private static List<TargetCandidate> PrioritizeTargets(IEnumerable<TargetCandidate> items) =>
+        items
+            .GroupBy(t => t.TargetId)
+            .Select(grp => grp.FirstOrDefault(x => x.Readiness == "ready") ?? grp.First())
+            .OrderBy(t => string.IsNullOrEmpty(t.AlertTag) ? 1 : 0)
+            .ThenBy(t => t.PlayerAnchor != null && t.PlayerAnchor.Contains("pointed", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+            .ThenBy(t => t.Readiness == "ready" ? 0 : 1)
+            .ThenBy(t => ParseAnchorMeters(t.ActorAnchor))
+            .ThenBy(t => t.TargetId, StringComparer.Ordinal)
+            .Take(MaxCandidateTargetsPerMethod)
+            .ToList();
+
     private static void MergeGrant(Dictionary<(string MethodId, string Actor), ActiveMethodGrant> grants, ActiveMethodGrant incoming)
     {
         var key = (incoming.MethodId, incoming.Actor);
         if (grants.TryGetValue(key, out var existing))
         {
-            var mergedTargets = existing.Targets.Concat(incoming.Targets)
-                .GroupBy(t => t.TargetId)
-                .Select(grp => grp.FirstOrDefault(x => x.Readiness == "ready") ?? grp.First())
-                .Take(MaxCandidateTargetsPerMethod)
-                .ToList();
+            var mergedTargets = PrioritizeTargets(existing.Targets.Concat(incoming.Targets));
             string overall = (existing.Readiness == "ready" || incoming.Readiness == "ready" || mergedTargets.Any(t => t.Readiness == "ready"))
                 ? "ready" : "staged";
             grants[key] = new ActiveMethodGrant(incoming.MethodId, incoming.Actor, overall, mergedTargets);
         }
         else
         {
-            grants[key] = incoming with { Targets = incoming.Targets.Take(MaxCandidateTargetsPerMethod).ToList() };
+            grants[key] = incoming with { Targets = PrioritizeTargets(incoming.Targets) };
         }
     }
 }

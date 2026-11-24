@@ -1,7 +1,10 @@
 package hub_test
 
 import (
+	"encoding/json"
+	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -318,5 +321,153 @@ func TestPolicyOverrideRealMoneyGuardAndLeaseReaperResume(t *testing.T) {
 	sessions := st["sessions"].([]map[string]any)
 	if sessions[0]["state"] != "active" {
 		t.Fatalf("expected session active after trusted resume approval, got %v", sessions[0]["state"])
+	}
+}
+
+func TestCrashRecoverySanitizerAndBoundedPruner(t *testing.T) {
+	ledgerPath := filepath.Join(t.TempDir(), "crashed_hub.json")
+
+	// Simulate an uncleanly terminated Hub ledger with an "active" session and a mid-flight "running" queue
+	crashed := store.NewHubStoreData()
+	crashed.Slots["slot-crash"] = &store.SlotRecord{
+		SlotID: "slot-crash", RoleKind: "companion", BillingMode: "player_metered",
+		PlayerID: "p1", GameInstanceID: "g1", PlayerOnline: true,
+		CapabilityTableDigest: "sha256:dummy",
+	}
+	qID := "Q-in-flight"
+	execID := "exec-99"
+	crashed.Sessions["sess-crash"] = &store.SessionRecord{
+		SessionID:       "sess-crash",
+		CallerCoreID:    "core-1",
+		Scope:           model.FrozenScope{SlotID: "slot-crash", RoleKind: "companion", BillingMode: "player_metered", AllowChat: true},
+		State:           "active",
+		PlayerOnline:    true,
+		LeaseDeadlineMs: time.Now().UnixMilli() + 60000,
+		ActiveQueueID:   &qID,
+	}
+	crashed.Queues[store.QueueKey("sess-crash", qID)] = &store.QueueLedgerRecord{
+		SessionID:          "sess-crash",
+		QueueID:            qID,
+		State:              "running",
+		CurrentExecutionID: &execID,
+		StepReceipts: []model.StepReceipt{
+			{StepIndex: 0, MethodID: "#01", Actor: "companion", State: "executing"},
+			{StepIndex: 1, MethodID: "#02", Actor: "companion", State: "pending"},
+		},
+	}
+	raw, _ := json.Marshal(crashed)
+	if err := os.WriteFile(ledgerPath, raw, 0o600); err != nil {
+		t.Fatalf("write crashed ledger: %v", err)
+	}
+
+	p, err := store.NewPersistencePort(ledgerPath)
+	if err != nil {
+		t.Fatalf("reload persistence: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	eng := hub.NewEngine(hub.DefaultConfig(), p, &fakeOrigin{}, nil, nil)
+	resRep, gErr := eng.HandleSessionResume("core-1", "sess-crash")
+	if gErr != nil || !resRep.ActionsPaused {
+		t.Fatalf("expected crashed active session to require paused resume, got rep=%+v err=%v", resRep, gErr)
+	}
+	qRep, qErr := eng.HandleQueueQuery("core-1", "sess-crash", qID)
+	if qErr != nil || qRep.QueueState != "aborted" {
+		t.Fatalf("expected interrupted running queue to be sanitized to aborted, got rep=%+v err=%v", qRep, qErr)
+	}
+	if qRep.StepReceipts[0].FailureReason == nil || *qRep.StepReceipts[0].FailureReason != "hub_restarted_mid_execution" {
+		t.Fatalf("unexpected step failure reason after crash sanitizer: %+v", qRep.StepReceipts[0])
+	}
+
+	// Verify bounded ChatDedup and terminal Queue pruning
+	_, _ = store.MutateVolatile(p, func(d *store.HubStoreData) (struct{}, *model.G2AError) {
+		for i := 0; i < 2400; i++ {
+			d.RecordChatDedup(fmt.Sprintf("sess-crash|msg-%d", i))
+		}
+		for i := 0; i < 600; i++ {
+			qk := store.QueueKey("sess-crash", fmt.Sprintf("Q-done-%d", i))
+			d.RegisterQueue(qk, &store.QueueLedgerRecord{
+				SessionID: "sess-crash",
+				QueueID:   fmt.Sprintf("Q-done-%d", i),
+				State:     "completed",
+			})
+		}
+		if len(d.ChatDedup) > store.MaxChatDedupEntries {
+			t.Fatalf("ChatDedup exceeded bound: %d > %d", len(d.ChatDedup), store.MaxChatDedupEntries)
+		}
+		if len(d.Queues) > store.MaxTerminalQueuesStored {
+			t.Fatalf("Queues exceeded bound: %d > %d", len(d.Queues), store.MaxTerminalQueuesStored)
+		}
+		return struct{}{}, nil
+	})
+}
+
+func TestConcurrentHighFrequencyDeltaSyncAndReadOnlyQueries(t *testing.T) {
+	ledgerPath := filepath.Join(t.TempDir(), "fast_hub.json")
+	p, err := store.NewPersistencePort(ledgerPath)
+	if err != nil {
+		t.Fatalf("new persistence: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	cfg := hub.DefaultConfig()
+	cfg.AutoApproveScope = true
+	eng := hub.NewEngine(cfg, p, &fakeOrigin{}, nil, nil)
+
+	caps := []model.CapabilityEntry{
+		{
+			MethodID: "#01", Name: "ping", Description: "Ping",
+			PermittedActors: []string{"companion"}, ParamsSchema: map[string]any{"type": "object"},
+			DefaultPolicy: "allow",
+		},
+	}
+	capDigest, _ := jcs.DigestSHA256("g2a.cap.v1", caps)
+	_ = eng.HandleOriginCapabilities(model.OriginCapabilitiesPayload{
+		SlotID: "slot-perf", RoleKind: "companion", BillingMode: "player_metered",
+		CapabilityTableDigest: capDigest, Capabilities: caps, OriginExecuteURL: "mem://perf",
+	})
+	_ = eng.HandleOriginSync(model.OriginSyncFrame{
+		SlotID: "slot-perf", Epoch: 1, Rev: 1, Mode: "full", SignificantEvent: true,
+		StateBrief: map[string]any{"tick": 0},
+		UpsertedMethods: []model.ActiveMethodGrant{
+			{MethodID: "#01", Actor: "companion", Readiness: "ready", Targets: []model.TargetCandidate{}},
+		},
+	})
+	authRep, aErr := eng.HandleSessionAuthorize("0.0.1", "core-perf", model.AuthorizeRequest{SlotID: "slot-perf"})
+	if aErr != nil {
+		t.Fatalf("authorize err: %v", aErr)
+	}
+
+	start := time.Now()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for rev := int64(2); rev <= 250; rev++ {
+			prev := rev - 1
+			if sErr := eng.HandleOriginSync(model.OriginSyncFrame{
+				SlotID: "slot-perf", Epoch: 1, Rev: rev, BaseRev: &prev, Mode: "delta",
+				SignificantEvent: rev%50 == 0,
+				StateBrief:       map[string]any{"tick": rev},
+			}); sErr != nil {
+				t.Errorf("delta sync %d failed: %v", rev, sErr)
+				return
+			}
+		}
+	}()
+
+	for r := 0; r < 6; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 80; i++ {
+				_ = eng.SnapshotDashboardStatus()
+				_, _ = eng.HandleSessionHeartbeat("core-perf", authRep.SessionID)
+			}
+		}()
+	}
+	wg.Wait()
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("high-frequency delta sync + concurrent readers took too long: %v", elapsed)
 	}
 }

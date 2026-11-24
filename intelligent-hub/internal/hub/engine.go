@@ -125,17 +125,19 @@ func (c *HTTPOriginClient) Execute(targetURL string, req model.OriginExecuteRequ
 	return out, nil
 }
 
-// EventStreamHub manages SSE / push subscribers per session_id.
+// EventStreamHub manages SSE / push subscribers per session_id with bounded session history.
 type EventStreamHub struct {
-	mu          sync.Mutex
-	subscribers map[string]map[chan model.EventEnvelope]struct{}
-	history     map[string][]model.EventEnvelope
+	mu           sync.Mutex
+	subscribers  map[string]map[chan model.EventEnvelope]struct{}
+	history      map[string][]model.EventEnvelope
+	historyOrder []string
 }
 
 func NewEventStreamHub() *EventStreamHub {
 	return &EventStreamHub{
-		subscribers: make(map[string]map[chan model.EventEnvelope]struct{}),
-		history:     make(map[string][]model.EventEnvelope),
+		subscribers:  make(map[string]map[chan model.EventEnvelope]struct{}),
+		history:      make(map[string][]model.EventEnvelope),
+		historyOrder: make([]string, 0),
 	}
 }
 
@@ -150,9 +152,20 @@ func (b *EventStreamHub) PushEvent(sessionID, eventName string, payload any) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if _, tracked := b.history[sessionID]; !tracked {
+		b.historyOrder = append(b.historyOrder, sessionID)
+		if len(b.historyOrder) > 256 {
+			evict := b.historyOrder[0]
+			b.historyOrder = append([]string(nil), b.historyOrder[1:]...)
+			if len(b.subscribers[evict]) == 0 {
+				delete(b.history, evict)
+				delete(b.subscribers, evict)
+			}
+		}
+	}
 	hist := append(b.history[sessionID], ev)
 	if len(hist) > 64 {
-		hist = hist[len(hist)-64:]
+		hist = append([]model.EventEnvelope(nil), hist[len(hist)-64:]...)
 	}
 	b.history[sessionID] = hist
 	for ch := range b.subscribers[sessionID] {
@@ -476,9 +489,12 @@ func (e *Engine) HandleOriginSync(frame model.OriginSyncFrame) *model.G2AError {
 		sessionID string
 		ctx       model.ProjectedContext
 	}
-	pushes, gErr := store.Atomic(e.persistence, func(d *store.HubStoreData) ([]pendingPush, *model.G2AError) {
+	txFn := func(d *store.HubStoreData) ([]pendingPush, *model.G2AError) {
 		view, ok := d.SlotViews[frame.SlotID]
 		if !ok {
+			if frame.Mode != "full" {
+				return nil, model.NewError(model.ErrStaleContext, 409, "Origin slot view uninitialized; resend full frame")
+			}
 			view = &store.SlotView{
 				SlotID:            frame.SlotID,
 				Epoch:             frame.Epoch,
@@ -522,7 +538,7 @@ func (e *Engine) HandleOriginSync(frame model.OriginSyncFrame) *model.G2AError {
 			}
 		}
 
-		// Atomically record optional multimodal frames, timeline tags, and settled sustained-step executions!
+		// Atomically record optional multimodal frames, timeline tags, and bounded settled sustained-step executions!
 		if frame.VisualRef != nil {
 			view.LatestVisual = frame.VisualRef
 		}
@@ -533,7 +549,7 @@ func (e *Engine) HandleOriginSync(frame model.OriginSyncFrame) *model.G2AError {
 			view.AllowedTimelineTags = append([]string(nil), frame.AllowedTimelineTags...)
 		}
 		for _, settled := range frame.SettledExecutions {
-			view.SettledExecutions[settled.ExecutionID] = settled
+			view.RecordSettledExecution(settled)
 		}
 
 		// Adaptive quiet-period sleep throttling
@@ -541,6 +557,7 @@ func (e *Engine) HandleOriginSync(frame model.OriginSyncFrame) *model.G2AError {
 		for _, sess := range d.ActiveSessionsForSlot(frame.SlotID) {
 			if frame.SignificantEvent {
 				sess.IdleBackoffMs = e.cfg.MinSyncIntervalMs
+				sess.NextAllowedPullMs = 0
 				outPushes = append(outPushes, pendingPush{
 					sessionID: sess.SessionID,
 					ctx:       e.projectContextInTx(d, sess, nil),
@@ -557,7 +574,17 @@ func (e *Engine) HandleOriginSync(frame model.OriginSyncFrame) *model.G2AError {
 			}
 		}
 		return outPushes, nil
-	})
+	}
+
+	var (
+		pushes []pendingPush
+		gErr   *model.G2AError
+	)
+	if frame.Mode == "full" {
+		pushes, gErr = store.Atomic(e.persistence, txFn)
+	} else {
+		pushes, gErr = store.MutateVolatile(e.persistence, txFn)
+	}
 	if gErr != nil {
 		return gErr
 	}
@@ -606,7 +633,7 @@ func (e *Engine) HandleOriginPlayerEvent(ev model.OriginPlayerEvent) *model.G2AE
 			sessionID string
 			ctx       model.ProjectedContext
 		}
-		pushes, gErr := store.Atomic(e.persistence, func(d *store.HubStoreData) ([]cmdPush, *model.G2AError) {
+		pushes, gErr := store.ReadOnly(e.persistence, func(d *store.HubStoreData) ([]cmdPush, *model.G2AError) {
 			cmd := ev.Text
 			var list []cmdPush
 			for _, sess := range d.ActiveSessionsForSlot(ev.SlotID) {
@@ -626,7 +653,7 @@ func (e *Engine) HandleOriginPlayerEvent(ev model.OriginPlayerEvent) *model.G2AE
 		return nil
 
 	case "queue_approval":
-		_, gErr := store.Atomic(e.persistence, func(d *store.HubStoreData) (struct{}, *model.G2AError) {
+		_, gErr := store.ReadOnly(e.persistence, func(d *store.HubStoreData) (struct{}, *model.G2AError) {
 			rec, ok := d.Queues[store.QueueKey(ev.SessionID, ev.QueueID)]
 			if !ok || rec.RequiresRealMoneyUI {
 				return struct{}{}, model.NewError(model.ErrPermissionDenied, 403, "Real-money confirmation requires native platform security UI")
@@ -723,7 +750,7 @@ func (e *Engine) HandleSessionAuthorize(g2aVersion, callerCoreID string, req mod
 		caps          []model.CapabilityEntry
 	}
 
-	prep, gErr := store.Atomic(e.persistence, func(d *store.HubStoreData) (prepInfo, *model.G2AError) {
+	prep, gErr := store.ReadOnly(e.persistence, func(d *store.HubStoreData) (prepInfo, *model.G2AError) {
 		var zp prepInfo
 		slot, ok := d.Slots[req.SlotID]
 		if !ok {
@@ -812,7 +839,7 @@ func (e *Engine) HandleSessionAuthorize(g2aVersion, callerCoreID string, req mod
 }
 
 func (e *Engine) HandleSessionHeartbeat(callerCoreID, sessionID string) (model.HeartbeatReply, *model.G2AError) {
-	return store.Atomic(e.persistence, func(d *store.HubStoreData) (model.HeartbeatReply, *model.G2AError) {
+	return store.MutateVolatile(e.persistence, func(d *store.HubStoreData) (model.HeartbeatReply, *model.G2AError) {
 		var zero model.HeartbeatReply
 		sess, gErr := d.GetSessionForCaller(sessionID, callerCoreID)
 		if gErr != nil {
@@ -912,7 +939,7 @@ func (e *Engine) HandleSessionClose(callerCoreID, sessionID string) *model.G2AEr
 }
 
 func (e *Engine) HandleContextPull(callerCoreID, sessionID string) (model.ProjectedContext, *model.G2AError) {
-	return store.Atomic(e.persistence, func(d *store.HubStoreData) (model.ProjectedContext, *model.G2AError) {
+	return store.MutateVolatile(e.persistence, func(d *store.HubStoreData) (model.ProjectedContext, *model.G2AError) {
 		var zero model.ProjectedContext
 		sess, gErr := d.GetSessionForCaller(sessionID, callerCoreID)
 		if gErr != nil {
@@ -947,10 +974,9 @@ func (e *Engine) HandleChatSend(callerCoreID, sessionID string, msg model.ChatMe
 			return nil, model.NewError(model.ErrPermissionDenied, 403, "Chat not authorized or player offline")
 		}
 		dedupKey := sessionID + "|" + msg.MessageID
-		if d.ChatDedup[dedupKey] {
+		if d.RecordChatDedup(dedupKey) {
 			return nil, nil
 		}
-		d.ChatDedup[dedupKey] = true
 		slot := d.Slots[sess.Scope.SlotID]
 		view := d.SlotViews[sess.Scope.SlotID]
 		return &chatDispatch{
@@ -1077,6 +1103,7 @@ func (e *Engine) HandleQueueSubmit(callerCoreID, sessionID string, q model.Metho
 		requiresRealMoneyUI := false
 		fp := computeTargetFingerprint(q.Steps)
 		now := e.cfg.ClockNowMs()
+		d.SweepExpiredCooldowns(now)
 		cdKey := sessionID + "|" + fp
 		if until, inCd := d.ConfirmCooldowns[cdKey]; inCd && now < until {
 			wait := until - now
@@ -1171,7 +1198,7 @@ func (e *Engine) HandleQueueSubmit(callerCoreID, sessionID string, q model.Metho
 			RequiresRealMoneyUI: requiresRealMoneyUI,
 			StepReceipts:        receipts,
 		}
-		d.Queues[qKey] = rec
+		d.RegisterQueue(qKey, rec)
 
 		if needsConfirm {
 			d.AppendAudit(now, "queue.confirm_hold", sess.Scope.SlotID, sessionID, q.QueueID, q.IntentSummary)
@@ -1320,7 +1347,7 @@ func (e *Engine) waitUntilStepReadyOrAbort(sessionID, queueID string, stepIndex 
 	deadlineMs := e.cfg.ClockNowMs() + grace
 
 	for {
-		out, _ := store.Atomic(e.persistence, func(d *store.HubStoreData) (stepPrepOutcome, *model.G2AError) {
+		out, _ := store.MutateVolatile(e.persistence, func(d *store.HubStoreData) (stepPrepOutcome, *model.G2AError) {
 			sess := d.Sessions[sessionID]
 			rec := d.Queues[store.QueueKey(sessionID, queueID)]
 			view := d.SlotViews[sess.Scope.SlotID]
@@ -1380,7 +1407,7 @@ func (e *Engine) awaitStepSettlementOrCancel(sessionID, queueID, executionID str
 	deadlineMs := e.cfg.ClockNowMs() + e.cfg.SustainedStepTimeoutMs
 	for {
 		settled, done := func() (model.OriginExecuteReply, bool) {
-			res, _ := store.Atomic(e.persistence, func(d *store.HubStoreData) (*model.OriginExecuteReply, *model.G2AError) {
+			res, _ := store.MutateVolatile(e.persistence, func(d *store.HubStoreData) (*model.OriginExecuteReply, *model.G2AError) {
 				sess := d.Sessions[sessionID]
 				rec := d.Queues[store.QueueKey(sessionID, queueID)]
 				view := d.SlotViews[sess.Scope.SlotID]
@@ -1424,7 +1451,7 @@ func (e *Engine) dispatchQueueSteps(sessionID, queueID string) (model.QueueRecei
 		return zero, gErr
 	}
 
-	stepCount, _ := store.Atomic(e.persistence, func(d *store.HubStoreData) (int, *model.G2AError) {
+	stepCount, _ := store.ReadOnly(e.persistence, func(d *store.HubStoreData) (int, *model.G2AError) {
 		return len(d.Queues[store.QueueKey(sessionID, queueID)].Queue.Steps), nil
 	})
 
@@ -1488,6 +1515,7 @@ func (e *Engine) abortRemainingSteps(sessionID, queueID string, fromIndex int, r
 		if sess.ActiveQueueID != nil && *sess.ActiveQueueID == queueID {
 			sess.ActiveQueueID = nil
 		}
+		d.PruneTerminalQueues()
 		return e.toReceiptInTx(d, sess, rec), nil
 	})
 	return receipt
@@ -1504,6 +1532,7 @@ func (e *Engine) finalizeCompletedQueue(sessionID, queueID string) model.QueueRe
 		if sess.ActiveQueueID != nil && *sess.ActiveQueueID == queueID {
 			sess.ActiveQueueID = nil
 		}
+		d.PruneTerminalQueues()
 		return e.toReceiptInTx(d, sess, rec), nil
 	})
 	return receipt
@@ -1559,7 +1588,7 @@ func (e *Engine) HandleQueueCancel(callerCoreID, sessionID, queueID string) (mod
 }
 
 func (e *Engine) HandleQueueQuery(callerCoreID, sessionID, queueID string) (model.QueueReceipt, *model.G2AError) {
-	return store.Atomic(e.persistence, func(d *store.HubStoreData) (model.QueueReceipt, *model.G2AError) {
+	return store.ReadOnly(e.persistence, func(d *store.HubStoreData) (model.QueueReceipt, *model.G2AError) {
 		var zero model.QueueReceipt
 		sess, err := d.GetSessionForCaller(sessionID, callerCoreID)
 		if err != nil {
@@ -1661,6 +1690,8 @@ func (e *Engine) ToggleSessionModality(sessionID string, allowVisual, allowAudio
 		}
 		sess.Scope.AllowVisual = allowVisual
 		sess.Scope.AllowAudio = allowAudio
+		sess.IdleBackoffMs = e.cfg.MinSyncIntervalMs
+		sess.NextAllowedPullMs = 0
 		d.AppendAudit(e.cfg.ClockNowMs(), "session.modality_toggled", sess.Scope.SlotID, sessionID, "",
 			fmt.Sprintf("visual=%v audio=%v", allowVisual, allowAudio))
 		return struct{}{}, nil
@@ -1672,7 +1703,7 @@ func (e *Engine) CheckSessionRateLimit(sessionID string) *model.G2AError {
 	if e.cfg.RateLimitPerWindow <= 0 || e.cfg.RateLimitWindowMs <= 0 {
 		return nil
 	}
-	_, gErr := store.Atomic(e.persistence, func(d *store.HubStoreData) (struct{}, *model.G2AError) {
+	_, gErr := store.MutateVolatile(e.persistence, func(d *store.HubStoreData) (struct{}, *model.G2AError) {
 		sess, ok := d.Sessions[sessionID]
 		if !ok {
 			return struct{}{}, nil
@@ -1699,7 +1730,7 @@ func (e *Engine) CheckSessionRateLimit(sessionID string) *model.G2AError {
 }
 
 func (e *Engine) ReapExpiredSessionLeasesOnce() int {
-	reaped, _ := store.Atomic(e.persistence, func(d *store.HubStoreData) (int, *model.G2AError) {
+	reaped, _ := store.MutateVolatile(e.persistence, func(d *store.HubStoreData) (int, *model.G2AError) {
 		now := e.cfg.ClockNowMs()
 		count := 0
 		for _, sess := range d.Sessions {
@@ -1734,7 +1765,7 @@ func (e *Engine) StartBackgroundLeaseReaper(stopCh <-chan struct{}, interval tim
 }
 
 func (e *Engine) SnapshotDashboardStatus() map[string]any {
-	res, _ := store.Atomic(e.persistence, func(d *store.HubStoreData) (map[string]any, *model.G2AError) {
+	res, _ := store.ReadOnly(e.persistence, func(d *store.HubStoreData) (map[string]any, *model.G2AError) {
 		slotsOut := make([]map[string]any, 0, len(d.Slots))
 		for _, sl := range d.Slots {
 			v := d.SlotViews[sl.SlotID]
