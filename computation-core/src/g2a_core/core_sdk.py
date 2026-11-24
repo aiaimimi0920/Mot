@@ -121,6 +121,10 @@ class CoreSDK:
         self._sse_thread: Optional[threading.Thread] = None
         self.on_receipt_callback: Optional[Callable[[QueueReceipt], None]] = None
 
+    @property
+    def is_stream_ready(self) -> bool:
+        return self._stream_ready.is_set()
+
     def connect(
         self,
         hub_endpoint: str,

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
+import http.client
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -9,6 +12,7 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 ORIGIN_PY_SRC = os.path.join(ROOT_DIR, "interaction-origin", "python", "src")
@@ -20,6 +24,7 @@ for p in (ORIGIN_PY_SRC, CORE_PY_SRC):
 from g2a_core.core_sdk import CoreSDK
 from g2a_core.llm_planner import OpenAICompatibleLLMPlanner
 from g2a_core.memory import MemoryRecord, SpoilerGuard
+from g2a_core.memory_server import MemoryHTTPServer
 from g2a_core.playground import resolve_hub_binary
 from g2a_core.relay_server import CloudRelayServer
 from g2a_core.schemas import (
@@ -389,6 +394,156 @@ class TestOptimizationsAndStress(unittest.TestCase):
                         hub_proc.stderr.close()
         finally:
             relay.stop()
+
+    def test_dns_rebinding_shield_unmasked_ws_rejection_and_memory_server_hardening(self) -> None:
+        hub_bin = resolve_hub_binary(ROOT_DIR)
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_path = os.path.join(tmp, "sec_ledger.json")
+            runtime_path = os.path.join(tmp, "sec_runtime.json")
+            db_path = os.path.join(tmp, "sec_mem.db")
+
+            hub_proc = subprocess.Popen(
+                [
+                    hub_bin,
+                    "-origin-addr", "127.0.0.1:0",
+                    "-core-addr", "127.0.0.1:0",
+                    "-consent-addr", "127.0.0.1:0",
+                    "-ledger", ledger_path,
+                    "-runtime-file", runtime_path,
+                    "-auto-approve-scope",
+                    "-print-ports-json",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert hub_proc.stdout is not None
+                ports = json.loads(hub_proc.stdout.readline().strip())
+                c_host, c_port_str = ports["consent_addr"].split(":")
+                core_host, core_port_str = ports["core_addr"].split(":")
+
+                # 1. DNS Rebinding protection on Trusted Security Dashboard (:consent)
+                conn = http.client.HTTPConnection(c_host, int(c_port_str), timeout=3.0)
+                try:
+                    conn.putrequest("GET", "/", skip_host=True)
+                    conn.putheader("Host", "evil-rebind.attacker.example")
+                    conn.endheaders()
+                    resp_evil = conn.getresponse()
+                    _ = resp_evil.read()
+                    self.assertEqual(resp_evil.status, 403)
+                finally:
+                    conn.close()
+
+                # Valid loopback Host succeeds and serves zero inline onclick= handlers
+                conn_ok = http.client.HTTPConnection(c_host, int(c_port_str), timeout=3.0)
+                try:
+                    conn_ok.request("GET", "/")
+                    resp_ok = conn_ok.getresponse()
+                    dash_html = resp_ok.read().decode("utf-8")
+                    self.assertEqual(resp_ok.status, 200)
+                    self.assertNotIn("onclick=", dash_html)
+                    self.assertIn("data-action=", dash_html)
+                finally:
+                    conn_ok.close()
+
+                # 2. RFC 6455 §5.1: Unmasked client WebSocket frame MUST be closed with 0x8 Close frame
+                orig_sdk, _, _ = build_spatial_demo_sdk(f"http://{ports['origin_addr']}", slot_id="slot-ws-sec")
+                core_sdk = CoreSDK(planner=_NoOpPlanner(), allow_loopback=True)
+                try:
+                    core_sdk.connect(ports["core_url"], "core-ws-sec", "slot-ws-sec", start_background_loops=False)
+                    ws_sock = socket.create_connection((core_host, int(core_port_str)), timeout=3.0)
+                    try:
+                        ws_key = base64.b64encode(os.urandom(16)).decode("ascii")
+                        hs = (
+                            f"GET /g2a/v1/core/ws?session_id={core_sdk.session_id} HTTP/1.1\r\n"
+                            f"Host: {ports['core_addr']}\r\n"
+                            "Upgrade: websocket\r\n"
+                            "Connection: Upgrade\r\n"
+                            f"Sec-WebSocket-Key: {ws_key}\r\n"
+                            "Sec-WebSocket-Version: 13\r\n"
+                            "Authorization: Bearer core-ws-sec\r\n\r\n"
+                        )
+                        ws_sock.sendall(hs.encode("ascii"))
+                        head = b""
+                        while b"\r\n\r\n" not in head:
+                            head += ws_sock.recv(1)
+                        self.assertIn(b" 101 ", head)
+
+                        # Send UNMASKED text frame (0x81, length=2, "hi") -> server must send Close (0x88) and close!
+                        ws_sock.sendall(b"\x81\x02hi")
+                        close_frame = ws_sock.recv(4)
+                        self.assertTrue(len(close_frame) >= 2 and (close_frame[0] & 0x0F) == 0x8)
+                    finally:
+                        ws_sock.close()
+                finally:
+                    core_sdk.shutdown_session_cleanly(notify_hub=True)
+                    orig_sdk.stop_loopback_execute_listener()
+            finally:
+                hub_proc.terminate()
+                hub_proc.wait(timeout=3)
+                if hub_proc.stdout:
+                    hub_proc.stdout.close()
+                if hub_proc.stderr:
+                    hub_proc.stderr.close()
+
+            # 3. Hardened MemoryHTTPServer strict JSON, 413 cap, & URL-encoded record IDs
+            mem_store = SQLiteCompanionStore(db_path)
+            mem_srv = MemoryHTTPServer(mem_store, player_tokens={"tok-alice": "alice"})
+            mem_url = mem_srv.start()
+            m_host, m_port = mem_url.replace("http://", "").split(":")
+            try:
+                def _mem_req(method: str, path: str, body: bytes = b"", headers: dict | None = None) -> tuple[int, dict]:
+                    c = http.client.HTTPConnection(m_host, int(m_port), timeout=3.0)
+                    try:
+                        hdrs = {"Authorization": "Bearer tok-alice", "Content-Type": "application/json"}
+                        if headers:
+                            hdrs.update(headers)
+                        c.request(method, path, body=body, headers=hdrs)
+                        r = c.getresponse()
+                        raw_b = r.read()
+                        return r.status, json.loads(raw_b.decode("utf-8")) if raw_b else {}
+                    finally:
+                        c.close()
+
+                # Duplicate JSON key -> 400
+                st_dup, _ = _mem_req("POST", "/g2a/v1/memory/records", b'{"content":"a","content":"b"}')
+                self.assertEqual(st_dup, 400)
+
+                # Oversized Content-Length (> 4 MiB) -> 413
+                st_big, _ = _mem_req(
+                    "POST", "/g2a/v1/memory/records", b"", headers={"Content-Length": str(5 * 1024 * 1024)}
+                )
+                self.assertEqual(st_big, 413)
+
+                # Malformed bundle format -> 400 (never unhandled 500)
+                st_bad_b, _ = _mem_req(
+                    "POST", "/g2a/v1/memory/import", json.dumps({"bundle": {"format": "wrong"}}).encode("utf-8")
+                )
+                self.assertEqual(st_bad_b, 400)
+
+                # URL-encoded special memory_id create + PATCH + DELETE
+                special_id = "mem:slot#1 space"
+                st_add, _ = _mem_req(
+                    "POST",
+                    "/g2a/v1/memory/records",
+                    json.dumps({"memory_id": special_id, "content": "Initial"}).encode("utf-8"),
+                )
+                self.assertEqual(st_add, 200)
+
+                enc_id = quote(special_id, safe="")
+                st_patch, _ = _mem_req(
+                    "PATCH",
+                    f"/g2a/v1/memory/records/{enc_id}",
+                    json.dumps({"content": "Updated", "pinned_by_player": True}).encode("utf-8"),
+                )
+                self.assertEqual(st_patch, 200)
+
+                st_del, _ = _mem_req("DELETE", f"/g2a/v1/memory/records/{enc_id}")
+                self.assertEqual(st_del, 200)
+            finally:
+                mem_srv.stop()
+                mem_store.close()
 
 
 if __name__ == "__main__":

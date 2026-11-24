@@ -12,9 +12,14 @@ public static class JcsDigest
 {
     public static byte[] CanonicalizeUtf8(object? value)
     {
-        string rawJson = JsonSerializer.Serialize(value);
-        using var doc = ParseStrictDocument(rawJson);
-        var sb = new StringBuilder();
+        byte[] rawUtf8 = JsonSerializer.SerializeToUtf8Bytes(value);
+        ValidateNoDuplicateKeysOrNonFinite(rawUtf8);
+        using var doc = JsonDocument.Parse(rawUtf8, new JsonDocumentOptions
+        {
+            AllowTrailingCommas = false,
+            CommentHandling = JsonCommentHandling.Disallow
+        });
+        var sb = new StringBuilder(rawUtf8.Length);
         WriteCanonicalElement(sb, doc.RootElement);
         return Encoding.UTF8.GetBytes(sb.ToString());
     }
@@ -22,18 +27,21 @@ public static class JcsDigest
     public static string ComputeSha256(string domainTag, object? value)
     {
         byte[] canon = CanonicalizeUtf8(value);
-        byte[] prefix = Encoding.UTF8.GetBytes(domainTag + "\0");
-        byte[] combined = new byte[prefix.Length + canon.Length];
-        Buffer.BlockCopy(prefix, 0, combined, 0, prefix.Length);
-        Buffer.BlockCopy(canon, 0, combined, prefix.Length, canon.Length);
-        byte[] digest = SHA256.HashData(combined);
+        using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        hasher.AppendData(Encoding.UTF8.GetBytes(domainTag));
+        ReadOnlySpan<byte> sep = stackalloc byte[1] { 0 };
+        hasher.AppendData(sep);
+        hasher.AppendData(canon);
+        Span<byte> digest = stackalloc byte[32];
+        hasher.GetHashAndReset(digest);
         return "sha256:" + Convert.ToHexString(digest).ToLowerInvariant();
     }
 
     public static JsonDocument ParseStrictDocument(string rawJson)
     {
-        ValidateNoDuplicateKeysOrNonFinite(Encoding.UTF8.GetBytes(rawJson));
-        return JsonDocument.Parse(rawJson, new JsonDocumentOptions
+        byte[] utf8 = Encoding.UTF8.GetBytes(rawJson);
+        ValidateNoDuplicateKeysOrNonFinite(utf8);
+        return JsonDocument.Parse(utf8, new JsonDocumentOptions
         {
             AllowTrailingCommas = false,
             CommentHandling = JsonCommentHandling.Disallow

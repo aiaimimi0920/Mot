@@ -239,7 +239,7 @@ class LivePlaygroundStack:
                             "g2a_version": "0.0.1",
                             "slot_id": stack_ref.slot_id,
                             "session_id": sdk.session_id if sdk else None,
-                            "attached": bool(sdk and sdk.session_id and not sdk.closed),
+                            "attached": bool(sdk and sdk.session_id and sdk.is_stream_ready and not sdk.closed),
                             "pending_confirm_queues": list(sdk.pending_confirm_queues.keys()) if sdk else [],
                             "hub_origin_url": stack_ref.hub_origin_url,
                             "hub_core_url": stack_ref.hub_core_url,

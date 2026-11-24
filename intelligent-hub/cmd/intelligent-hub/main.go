@@ -106,12 +106,27 @@ func main() {
 	}
 
 	coreHandler := server.NewCoreHandler(engine, auth)
-	go func() { _ = http.Serve(originLn, server.NewOriginHandler(engine, auth)) }()
+	originSrv := &http.Server{
+		Handler:           server.NewOriginHandler(engine, auth),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
+	coreSrv := &http.Server{
+		Handler:           coreHandler,
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
+	consentSrv := &http.Server{
+		Handler:           server.NewTrustedConsentHandler(engine, auth),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
+	go func() { _ = originSrv.Serve(originLn) }()
 	go func() {
-		coreSrv := &http.Server{
-			Handler:   coreHandler,
-			TLSConfig: tlsConfig,
-		}
 		if *tlsCert != "" && *tlsKey != "" {
 			_ = coreSrv.ServeTLS(coreLn, *tlsCert, *tlsKey)
 		} else if *tlsSelfSigned {
@@ -121,7 +136,7 @@ func main() {
 			_ = coreSrv.Serve(coreLn)
 		}
 	}()
-	go func() { _ = http.Serve(consentLn, server.NewTrustedConsentHandler(engine, auth)) }()
+	go func() { _ = consentSrv.Serve(consentLn) }()
 
 	tunnelCtx, cancelTunnel := context.WithCancel(context.Background())
 	defer cancelTunnel()
@@ -173,6 +188,12 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
+
+	shutCtx, cancelShut := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelShut()
+	_ = originSrv.Shutdown(shutCtx)
+	_ = coreSrv.Shutdown(shutCtx)
+	_ = consentSrv.Shutdown(shutCtx)
 }
 
 func openBrowser(url string) {

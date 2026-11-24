@@ -39,6 +39,7 @@ func Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	_ = netConn.SetDeadline(time.Time{})
 
 	sum := sha1.Sum([]byte(key + wsGUID))
 	accept := base64.StdEncoding.EncodeToString(sum[:])

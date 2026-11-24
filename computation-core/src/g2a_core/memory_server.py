@@ -1,14 +1,28 @@
 from __future__ import annotations
 
+import hmac
 import json
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
+from urllib.parse import unquote
 
+from .jcs import parse_strict_json
 from .memory import MemoryBundleV1, MemoryRecord, MemoryService
+from .schemas import G2AError
 from .sqlite_memory import SQLiteCompanionStore
+
+MAX_MEMORY_HTTP_BODY_BYTES = 4 * 1024 * 1024
+
+
+class _QuietMemoryHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        return
 
 
 class MemoryHTTPServer:
@@ -59,7 +73,32 @@ class MemoryHTTPServer:
                     return None
                 if not srv_ref.player_tokens:
                     return tok
-                return srv_ref.player_tokens.get(tok)
+                for expected_tok, pid in srv_ref.player_tokens.items():
+                    if hmac.compare_digest(tok, expected_tok):
+                        return pid
+                return None
+
+            def _read_strict_body(self) -> Optional[Dict[str, Any]]:
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    self._send_json(400, {"error": "invalid_content_length"})
+                    return None
+                if length < 0 or length > MAX_MEMORY_HTTP_BODY_BYTES:
+                    self._send_json(413, {"error": "payload_too_large"})
+                    return None
+                if length == 0:
+                    return {}
+                raw = self.rfile.read(length)
+                try:
+                    parsed = parse_strict_json(raw)
+                except G2AError as gerr:
+                    self._send_json(400, {"error": gerr.code, "message": gerr.message})
+                    return None
+                if not isinstance(parsed, dict):
+                    self._send_json(400, {"error": "invalid_request", "message": "Expected JSON object"})
+                    return None
+                return parsed
 
             def do_GET(self) -> None:
                 pid = self._auth_player()
@@ -81,13 +120,18 @@ class MemoryHTTPServer:
                 if not pid:
                     self._send_json(401, {"error": "unauthenticated"})
                     return
-                raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-                body = json.loads(raw.decode("utf-8")) if raw else {}
+                body = self._read_strict_body()
+                if body is None:
+                    return
 
                 if self.path == "/g2a/v1/memory/import":
-                    bundle = MemoryBundleV1.from_dict(body["bundle"])
-                    selected = body.get("selected_ids") or [r.memory_id for r in bundle.records]
-                    receipt = srv_ref.service.import_bundle(pid, bundle, list(selected))
+                    try:
+                        bundle = MemoryBundleV1.from_dict(body["bundle"])
+                        selected = body.get("selected_ids") or [r.memory_id for r in bundle.records]
+                        receipt = srv_ref.service.import_bundle(pid, bundle, list(selected))
+                    except (KeyError, ValueError, TypeError) as exc:
+                        self._send_json(400, {"error": "invalid_arguments", "message": str(exc)})
+                        return
                     self._send_json(200, {
                         "record_statuses": receipt.record_statuses,
                         "applied_settings": receipt.applied_settings,
@@ -96,6 +140,9 @@ class MemoryHTTPServer:
                     return
 
                 if self.path == "/g2a/v1/memory/records":
+                    if "content" not in body:
+                        self._send_json(400, {"error": "invalid_arguments", "message": "Missing content"})
+                        return
                     mid = body.get("memory_id") or f"mem-{uuid.uuid4().hex[:8]}"
                     rec = MemoryRecord(
                         memory_id=str(mid),
@@ -119,9 +166,10 @@ class MemoryHTTPServer:
                     self._send_json(401, {"error": "unauthenticated"})
                     return
                 if self.path.startswith("/g2a/v1/memory/records/"):
-                    mid = self.path.rsplit("/", 1)[-1]
-                    raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-                    body = json.loads(raw.decode("utf-8")) if raw else {}
+                    mid = unquote(self.path.rsplit("/", 1)[-1])
+                    body = self._read_strict_body()
+                    if body is None:
+                        return
                     ok = False
                     if "content" in body:
                         ok = srv_ref.store.edit_player_record(pid, mid, str(body["content"])) or ok
@@ -137,7 +185,7 @@ class MemoryHTTPServer:
                     self._send_json(401, {"error": "unauthenticated"})
                     return
                 if self.path.startswith("/g2a/v1/memory/records/"):
-                    mid = self.path.rsplit("/", 1)[-1]
+                    mid = unquote(self.path.rsplit("/", 1)[-1])
                     ok = srv_ref.store.delete_player_record(pid, mid)
                     self._send_json(200 if ok else 404, {"deleted": ok})
                     return
@@ -148,10 +196,11 @@ class MemoryHTTPServer:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(out)))
+                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(out)
 
-        self._httpd = ThreadingHTTPServer((self.host, self.port), _Handler)
+        self._httpd = _QuietMemoryHTTPServer((self.host, self.port), _Handler)
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
         return self.base_url
 

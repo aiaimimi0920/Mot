@@ -2,10 +2,12 @@ package server
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -37,7 +39,7 @@ func NewOriginHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
 			writeReplyError(w, "", nil, model.NewError(model.ErrInvalidRequest, 400, "POST required"))
 			return
 		}
-		if auth.OriginToken != "" && extractBearer(r) != auth.OriginToken {
+		if auth.OriginToken != "" && !secureTokenEquals(extractBearer(r), auth.OriginToken) {
 			writeReplyError(w, "", nil, model.NewError(model.ErrUnauthenticated, 401, "Invalid Origin bearer token"))
 			return
 		}
@@ -95,7 +97,7 @@ func NewOriginHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
 
 	// Zero-inbound-port Outbound Origin Execute Stream (GET /g2a/v1/origin/execute-stream?slot_id=...)
 	mux.HandleFunc("/g2a/v1/origin/execute-stream", func(w http.ResponseWriter, r *http.Request) {
-		if auth.OriginToken != "" && extractStreamToken(r) != auth.OriginToken {
+		if auth.OriginToken != "" && !secureTokenEquals(extractStreamToken(r), auth.OriginToken) {
 			writeReplyError(w, "", nil, model.NewError(model.ErrUnauthenticated, 401, "Invalid Origin bearer token"))
 			return
 		}
@@ -138,7 +140,7 @@ func NewOriginHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
 			writeReplyError(w, "", nil, model.NewError(model.ErrInvalidRequest, 400, "POST required"))
 			return
 		}
-		if auth.OriginToken != "" && extractBearer(r) != auth.OriginToken {
+		if auth.OriginToken != "" && !secureTokenEquals(extractBearer(r), auth.OriginToken) {
 			writeReplyError(w, "", nil, model.NewError(model.ErrUnauthenticated, 401, "Invalid Origin bearer token"))
 			return
 		}
@@ -435,13 +437,13 @@ func NewTrustedConsentHandler(engine *hub.Engine, auth AuthRegistry) http.Handle
 	}
 
 	checkTrustedAuth := func(r *http.Request) bool {
-		if r.Header.Get("X-G2A-CSRF") == csrfToken {
+		if secureTokenEquals(r.Header.Get("X-G2A-CSRF"), csrfToken) {
 			return true
 		}
 		if auth.ConsentToken == "" {
 			return true
 		}
-		return extractBearer(r) == auth.ConsentToken
+		return secureTokenEquals(extractBearer(r), auth.ConsentToken)
 	}
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -449,7 +451,9 @@ func NewTrustedConsentHandler(engine *hub.Engine, auth AuthRegistry) http.Handle
 			http.NotFound(w, r)
 			return
 		}
-		if auth.ConsentToken != "" && extractBearer(r) != auth.ConsentToken && r.URL.Query().Get("token") != auth.ConsentToken {
+		if auth.ConsentToken != "" &&
+			!secureTokenEquals(extractBearer(r), auth.ConsentToken) &&
+			!secureTokenEquals(r.URL.Query().Get("token"), auth.ConsentToken) {
 			http.Error(w, "Unauthorized: supply local consent token", http.StatusUnauthorized)
 			return
 		}
@@ -623,7 +627,31 @@ func NewTrustedConsentHandler(engine *hub.Engine, auth AuthRegistry) http.Handle
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
 
-	return mux
+	return withLoopbackHostGuard(mux)
+}
+
+func secureTokenEquals(a, b string) bool {
+	if len(a) != len(b) || len(a) == 0 {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+// withLoopbackHostGuard blocks DNS-rebinding attacks against the local Trusted Security Dashboard
+// by accepting only loopback Host headers (127.0.0.1, localhost, ::1).
+func withLoopbackHostGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(r.Host); err == nil {
+			host = h
+		}
+		host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]")
+		if host != "" && host != "127.0.0.1" && host != "localhost" && host != "::1" {
+			http.Error(w, "Forbidden Host header (DNS rebinding protection)", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func authenticateCore(r *http.Request, auth AuthRegistry) (string, *model.G2AError) {

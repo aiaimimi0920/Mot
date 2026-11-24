@@ -3,7 +3,7 @@ package ui
 import "strings"
 
 // RenderDashboardHTML returns the self-contained Trusted Player Security & Control Web UI.
-// Served strictly on the loopback-isolated Trusted Consent port with anti-clickjacking & CSRF protection.
+// Served strictly on the loopback-isolated Trusted Consent port with anti-clickjacking, DNS-rebinding, & CSRF protection.
 func RenderDashboardHTML(csrfToken string, coreAddr string, originAddr string) string {
 	html := strings.ReplaceAll(dashboardTemplate, "__CSRF_TOKEN__", csrfToken)
 	html = strings.ReplaceAll(html, "__CORE_ADDR__", coreAddr)
@@ -91,12 +91,67 @@ async function apiPost(path, body) {
     headers: { "Content-Type": "application/json", "X-G2A-CSRF": CSRF },
     body: JSON.stringify(body)
   });
-  await refresh();
+  await refresh(true);
 }
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
-async function refresh() {
+
+// Event delegation eliminates inline JS string interpolation vulnerabilities
+document.addEventListener("click", ev => {
+  const btn = ev.target.closest("button[data-action]");
+  if (!btn) return;
+  const act = btn.dataset.action;
+  if (act === "decide-scope") {
+    apiPost("/trusted/decide-scope", {
+      prompt_id: btn.dataset.promptId,
+      approved: btn.dataset.approved === "true",
+      remember_auto_join: btn.dataset.remember === "true"
+    });
+  } else if (act === "decide-queue") {
+    apiPost("/trusted/decide-queue", {
+      session_id: btn.dataset.sessionId,
+      queue_id: btn.dataset.queueId,
+      queue_digest: btn.dataset.queueDigest,
+      fingerprint: btn.dataset.fingerprint,
+      approved: btn.dataset.approved === "true"
+    });
+  } else if (act === "decide-resume") {
+    apiPost("/trusted/decide-resume", {
+      session_id: btn.dataset.sessionId,
+      approved: btn.dataset.approved === "true"
+    });
+  } else if (act === "emergency-stop") {
+    apiPost("/trusted/emergency-stop", { slot_id: btn.dataset.slotId });
+  } else if (act === "revoke-session") {
+    apiPost("/trusted/revoke-session", { session_id: btn.dataset.sessionId });
+  } else if (act === "revoke-auto-scope") {
+    apiPost("/trusted/revoke-auto-scope", { scope_digest: btn.dataset.scopeDigest, close_matching_sessions: true });
+  }
+});
+
+document.addEventListener("change", ev => {
+  const el = ev.target;
+  if (el.matches("select[data-action='policy-override']")) {
+    apiPost("/trusted/policy-override", {
+      slot_id: el.dataset.slotId,
+      method_id: el.dataset.methodId,
+      actor: el.dataset.actor,
+      policy: el.value
+    });
+  } else if (el.matches("input[data-action='toggle-modality']")) {
+    const sid = el.dataset.sessionId;
+    const kind = el.dataset.modKind;
+    apiPost("/trusted/toggle-modality", {
+      session_id: sid,
+      allow_visual: kind === "visual" ? el.checked : el.dataset.curVisual === "true",
+      allow_audio: kind === "audio" ? el.checked : el.dataset.curAudio === "true"
+    });
+  }
+});
+
+async function refresh(force = false) {
+  if (!force && document.activeElement && document.activeElement.tagName === "SELECT") return;
   const res = await fetch("/trusted/status", { headers: { "X-G2A-CSRF": CSRF } });
   if (!res.ok) return;
   const st = await res.json();
@@ -112,26 +167,27 @@ async function refresh() {
     pHtml += '<div class="prompt-box"><div><strong>新会话授权请求</strong> · 中枢 <code>' + esc(sp.scope.core_id) + '</code> 请求接入槽位 <code>' + esc(sp.scope.slot_id) + '</code></div>' +
       '<div style="font-size:12px;color:var(--muted)">Scope 摘要: <code>' + esc(sp.scope_digest) + '</code></div>' +
       '<div class="btn-row">' +
-      '<button class="approve" onclick="apiPost(\'/trusted/decide-scope\',{prompt_id:\'' + esc(sp.prompt_id) + '\',approved:true,remember_auto_join:false})">仅本次批准</button>' +
-      '<button class="secondary" onclick="apiPost(\'/trusted/decide-scope\',{prompt_id:\'' + esc(sp.prompt_id) + '\',approved:true,remember_auto_join:true})">批准并记住精确 Scope</button>' +
-      '<button class="decline" onclick="apiPost(\'/trusted/decide-scope\',{prompt_id:\'' + esc(sp.prompt_id) + '\',approved:false})">拒绝</button></div></div>';
+      '<button class="approve" data-action="decide-scope" data-prompt-id="' + esc(sp.prompt_id) + '" data-approved="true" data-remember="false">仅本次批准</button>' +
+      '<button class="secondary" data-action="decide-scope" data-prompt-id="' + esc(sp.prompt_id) + '" data-approved="true" data-remember="true">批准并记住精确 Scope</button>' +
+      '<button class="decline" data-action="decide-scope" data-prompt-id="' + esc(sp.prompt_id) + '" data-approved="false" data-remember="false">拒绝</button></div></div>';
   }
   for (const qp of queues) {
     const cls = qp.require_native_real_money_ui ? "prompt-box money" : "prompt-box";
     const stepsHtml = (qp.steps || []).map(s => '<li><code>' + esc(s.method_id) + '</code> [actor=<code>' + esc(s.actor) + '</code>] args=' + esc(JSON.stringify(s.args)) + '</li>').join("");
+    const qAttrs = 'data-action="decide-queue" data-session-id="' + esc(qp.session_id) + '" data-queue-id="' + esc(qp.queue_id) + '" data-queue-digest="' + esc(qp.queue_digest) + '" data-fingerprint="' + esc(qp.fingerprint) + '"';
     pHtml += '<div class="' + cls + '"><div><strong>整队单次确认门禁</strong> · <code>' + esc(qp.queue_id) + '</code> — ' + esc(qp.intent_summary) + '</div>' +
       (qp.require_native_real_money_ui ? '<div style="color:#fca5a5;font-size:12px;font-weight:700">⚠️ 含真实资金风险标记，仅限本原生安全界面真人确认</div>' : '') +
       '<ol class="steps">' + stepsHtml + '</ol>' +
       '<div style="font-size:12px;color:var(--muted)">防篡改摘要: <code>' + esc(qp.queue_digest) + '</code></div>' +
       '<div class="btn-row">' +
-      '<button class="approve" onclick="apiPost(\'/trusted/decide-queue\',{session_id:\'' + esc(qp.session_id) + '\',queue_id:\'' + esc(qp.queue_id) + '\',queue_digest:\'' + esc(qp.queue_digest) + '\',fingerprint:\'' + esc(qp.fingerprint) + '\',approved:true})">批准整队执行</button>' +
-      '<button class="decline" onclick="apiPost(\'/trusted/decide-queue\',{session_id:\'' + esc(qp.session_id) + '\',queue_id:\'' + esc(qp.queue_id) + '\',queue_digest:\'' + esc(qp.queue_digest) + '\',fingerprint:\'' + esc(qp.fingerprint) + '\',approved:false})">拒绝并冷却</button></div></div>';
+      '<button class="approve" ' + qAttrs + ' data-approved="true">批准整队执行</button>' +
+      '<button class="decline" ' + qAttrs + ' data-approved="false">拒绝并冷却</button></div></div>';
   }
   for (const rp of resumes) {
     pHtml += '<div class="prompt-box"><div><strong>长时断线恢复确认</strong> · 会话 <code>' + esc(rp.session_id) + '</code> 请求恢复行动</div>' +
       '<div class="btn-row">' +
-      '<button class="approve" onclick="apiPost(\'/trusted/decide-resume\',{session_id:\'' + esc(rp.session_id) + '\',approved:true})">允许恢复</button>' +
-      '<button class="decline" onclick="apiPost(\'/trusted/decide-resume\',{session_id:\'' + esc(rp.session_id) + '\',approved:false})">关闭会话</button></div></div>';
+      '<button class="approve" data-action="decide-resume" data-session-id="' + esc(rp.session_id) + '" data-approved="true">允许恢复</button>' +
+      '<button class="decline" data-action="decide-resume" data-session-id="' + esc(rp.session_id) + '" data-approved="false">关闭会话</button></div></div>';
   }
   document.getElementById("pending-list").innerHTML = pHtml || '<span class="empty">当前无挂起的审批请求。</span>';
 
@@ -147,7 +203,7 @@ async function refresh() {
         return (c.permitted_actors || []).map(act => {
           const pk = sl.slot_id + "|" + c.method_id + "|" + act;
           const cur = overrides[pk] || c.default_policy || "allow";
-          const sel = '<select onchange="apiPost(\'/trusted/policy-override\',{slot_id:\'' + esc(sl.slot_id) + '\',method_id:\'' + esc(c.method_id) + '\',actor:\'' + esc(act) + '\',policy:this.value})">' +
+          const sel = '<select data-action="policy-override" data-slot-id="' + esc(sl.slot_id) + '" data-method-id="' + esc(c.method_id) + '" data-actor="' + esc(act) + '">' +
             (isMoney ? '' : '<option value="allow"' + (cur==='allow'?' selected':'') + '>allow</option>') +
             '<option value="confirm"' + (cur==='confirm'?' selected':'') + '>confirm</option>' +
             '<option value="prohibit"' + (cur==='prohibit'?' selected':'') + '>prohibit</option></select>';
@@ -156,7 +212,7 @@ async function refresh() {
       }).join("");
       sRows += '<tr><td><code>' + esc(sl.slot_id) + '</code>' + capHtml + '</td><td>' + esc(sl.role_kind) + ' / ' + esc(sl.billing_mode) + '</td>' +
         '<td>' + (sl.player_online ? '<span class="badge ok">在线</span>' : '<span class="badge danger">离线</span>') + ' epoch=' + sl.epoch + ' rev=' + sl.rev + '</td>' +
-        '<td><button class="decline" onclick="apiPost(\'/trusted/emergency-stop\',{slot_id:\'' + esc(sl.slot_id) + '\'})">紧急叫停</button></td></tr>';
+        '<td><button class="decline" data-action="emergency-stop" data-slot-id="' + esc(sl.slot_id) + '">紧急叫停</button></td></tr>';
     }
     document.getElementById("slots-list").innerHTML = sRows + '</table>';
   }
@@ -167,14 +223,15 @@ async function refresh() {
   } else {
     let cRows = '<table><tr><th>会话 ID</th><th>中枢 / 槽位</th><th>状态 / 多模态隐私</th><th>操作</th></tr>';
     for (const se of sessions) {
+      const baseMod = 'data-action="toggle-modality" data-session-id="' + esc(se.session_id) + '" data-cur-visual="' + Boolean(se.allow_visual) + '" data-cur-audio="' + Boolean(se.allow_audio) + '"';
       const modHtml = se.state !== 'closed' ? (
         '<div style="margin-top:4px;font-size:12px">' +
-        '<label><input type="checkbox" ' + (se.allow_visual?'checked':'') + ' onchange="apiPost(\'/trusted/toggle-modality\',{session_id:\'' + esc(se.session_id) + '\',allow_visual:this.checked,allow_audio:' + Boolean(se.allow_audio) + '})"> 画面(visual)</label> ' +
-        '<label><input type="checkbox" ' + (se.allow_audio?'checked':'') + ' onchange="apiPost(\'/trusted/toggle-modality\',{session_id:\'' + esc(se.session_id) + '\',allow_visual:' + Boolean(se.allow_visual) + ',allow_audio:this.checked})"> 音频(audio)</label></div>'
+        '<label><input type="checkbox" ' + baseMod + ' data-mod-kind="visual" ' + (se.allow_visual?'checked':'') + '> 画面(visual)</label> ' +
+        '<label><input type="checkbox" ' + baseMod + ' data-mod-kind="audio" ' + (se.allow_audio?'checked':'') + '> 音频(audio)</label></div>'
       ) : '';
       cRows += '<tr><td><code>' + esc(se.session_id) + '</code></td><td><code>' + esc(se.core_id) + '</code> → <code>' + esc(se.slot_id) + '</code></td>' +
         '<td><code>' + esc(se.state) + '</code> · 已执行 ' + se.consumption_used + (se.consumption_cap ? '/' + se.consumption_cap : '') + ' 步' + modHtml + '</td>' +
-        '<td>' + (se.state !== 'closed' ? '<button class="decline" onclick="apiPost(\'/trusted/revoke-session\',{session_id:\'' + esc(se.session_id) + '\'})">撤权断开</button>' : '-') + '</td></tr>';
+        '<td>' + (se.state !== 'closed' ? '<button class="decline" data-action="revoke-session" data-session-id="' + esc(se.session_id) + '">撤权断开</button>' : '-') + '</td></tr>';
     }
     document.getElementById("sessions-list").innerHTML = cRows + '</table>';
   }
@@ -182,7 +239,7 @@ async function refresh() {
   const autoScopes = st.auto_join_scopes || [];
   document.getElementById("auto-scopes-list").innerHTML = autoScopes.length
     ? '<div style="font-size:12px;color:var(--muted);margin-bottom:4px">已保存自动加入 Scope 规则：</div>' +
-      autoScopes.map(sd => '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><code>' + esc(sd.slice(0,26)) + '...</code><button class="decline" onclick="apiPost(\'/trusted/revoke-auto-scope\',{scope_digest:\'' + esc(sd) + '\',close_matching_sessions:true})">撤销自动加入</button></div>').join("")
+      autoScopes.map(sd => '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><code>' + esc(sd.slice(0,26)) + '...</code><button class="decline" data-action="revoke-auto-scope" data-scope-digest="' + esc(sd) + '">撤销自动加入</button></div>').join("")
     : '';
 
   const dir = st.core_directory || {};
@@ -197,8 +254,7 @@ async function refresh() {
     : '<span class="empty">暂无审计事件。</span>';
 }
 refresh();
-setInterval(refresh, 1000);
+setInterval(() => refresh(false), 1000);
 </script>
 </body>
-</html>
-`
+</html>`
