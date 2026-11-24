@@ -66,8 +66,14 @@ class CloudRelayServer:
                         self._send_json(400, {"error": "missing_hub_id"})
                         return
 
-                    q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue()
+                    q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=256)
                     with relay_ref._lock:
+                        old_q = relay_ref._hub_downlinks.get(hub_id)
+                        if old_q is not None:
+                            try:
+                                old_q.put_nowait(None)
+                            except queue.Full:
+                                pass
                         relay_ref._hub_downlinks[hub_id] = q
                     try:
                         self.send_response(200)
@@ -98,7 +104,7 @@ class CloudRelayServer:
                     if not session_id:
                         self._send_json(400, {"error": "missing_session_id"})
                         return
-                    ev_q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue()
+                    ev_q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=256)
                     with relay_ref._lock:
                         relay_ref._sse_subscribers.setdefault(session_id, set()).add(ev_q)
                     try:
@@ -154,7 +160,10 @@ class CloudRelayServer:
                             with relay_ref._lock:
                                 subs = list(relay_ref._sse_subscribers.get(sid, set()))
                             for sub_q in subs:
-                                sub_q.put(ev_env)
+                                try:
+                                    sub_q.put_nowait(ev_env)
+                                except queue.Full:
+                                    pass
                     self._send_json(200, {"ok": True})
                     return
 
@@ -162,11 +171,13 @@ class CloudRelayServer:
                 if parsed.path.startswith("/hubs/") and parsed.path.endswith("/g2a/v1/core"):
                     parts = parsed.path.strip("/").split("/")
                     hub_id = parts[1]
+                    body_obj = json.loads(raw_body.decode("utf-8"))
+                    orig_req_id = str(body_obj.get("request_id", ""))
                     with relay_ref._lock:
                         down_q = relay_ref._hub_downlinks.get(hub_id)
                     if down_q is None:
                         self._send_json(503, {
-                            "g2a_version": "0.0.1", "request_id": "", "timestamp_ms": 0,
+                            "g2a_version": "0.0.1", "request_id": orig_req_id, "timestamp_ms": 0,
                             "acceptance": "not_accepted", "result": None,
                             "error": {"code": "unavailable", "http_status": 503, "message": "Target Hub tunnel offline"}
                         })
@@ -180,19 +191,25 @@ class CloudRelayServer:
                     with relay_ref._lock:
                         relay_ref._pending_replies[t_id] = (done_ev, holder)
                     try:
-                        down_q.put({
+                        down_q.put_nowait({
                             "tunnel_req_id": t_id,
                             "core_bearer": core_bearer,
-                            "body": json.loads(raw_body.decode("utf-8")),
+                            "body": body_obj,
                         })
-                        if not done_ev.wait(timeout=8.0):
+                        if not done_ev.wait(timeout=12.0):
                             self._send_json(504, {
-                                "g2a_version": "0.0.1", "request_id": "", "timestamp_ms": 0,
+                                "g2a_version": "0.0.1", "request_id": orig_req_id, "timestamp_ms": 0,
                                 "acceptance": "unknown", "result": None,
                                 "error": {"code": "outcome_unknown", "http_status": 504, "message": "Hub tunnel reply timeout"}
                             })
                             return
                         self._send_json(holder["status"], holder["reply"])
+                    except queue.Full:
+                        self._send_json(429, {
+                            "g2a_version": "0.0.1", "request_id": orig_req_id, "timestamp_ms": 0,
+                            "acceptance": "not_accepted", "result": None,
+                            "error": {"code": "resource_limit", "http_status": 429, "message": "Relay downlink buffer full"}
+                        })
                     finally:
                         with relay_ref._lock:
                             relay_ref._pending_replies.pop(t_id, None)

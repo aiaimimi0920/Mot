@@ -114,7 +114,8 @@ def _serialize_jcs(val: Any) -> str:
     if isinstance(val, (list, tuple)):
         return "[" + ",".join(_serialize_jcs(v) for v in val) + "]"
     if isinstance(val, dict):
-        keys = sorted(val.keys(), key=lambda k: k.encode("utf-16-be"))
+        raw_keys = val.keys()
+        keys = sorted(raw_keys) if all(k.isascii() for k in raw_keys) else sorted(raw_keys, key=lambda k: k.encode("utf-16-be"))
         return "{" + ",".join(f"{_escape_jcs_str(k)}:{_serialize_jcs(val[k])}" for k in keys) + "}"
     raise StrictJSONError(f"Cannot canonicalize {type(val).__name__}")
 

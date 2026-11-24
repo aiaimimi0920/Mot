@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aiaimimi0920/g2a-intelligent-hub/internal/hub"
@@ -32,7 +33,8 @@ type UplinkFrame struct {
 
 // OutboundCloudTunnel implements G2A Section 2.2 Row 3 ("NAT Outbound Connection Mode"):
 // A client Intelligent Hub behind a home firewall dials outbound to a Cloud Relay / Computation Core,
-// forwarding Core Interface calls and SSE events without opening ANY inbound port on the player's network.
+// forwarding Core Interface calls concurrently (zero head-of-line blocking on sustained steps) and
+// streaming SSE events without opening ANY inbound port on the player's network.
 type OutboundCloudTunnel struct {
 	relayBaseURL string
 	hubID        string
@@ -41,18 +43,29 @@ type OutboundCloudTunnel struct {
 	engine       *hub.Engine
 	httpClient   *http.Client
 	streamClient *http.Client
+	sem          chan struct{}
+
+	subMu              sync.Mutex
+	subscribedSessions map[string]context.CancelFunc
 }
 
 func NewOutboundCloudTunnel(relayBaseURL, hubID, relayToken string, coreHandler http.Handler, engine *hub.Engine) *OutboundCloudTunnel {
-	noProxyTransport := &http.Transport{Proxy: nil}
+	pooledTransport := &http.Transport{
+		Proxy:               nil,
+		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 32,
+		IdleConnTimeout:     90 * time.Second,
+	}
 	return &OutboundCloudTunnel{
-		relayBaseURL: strings.TrimRight(relayBaseURL, "/"),
-		hubID:        hubID,
-		relayToken:   relayToken,
-		coreHandler:  coreHandler,
-		engine:       engine,
-		httpClient:   &http.Client{Timeout: 10 * time.Second, Transport: noProxyTransport},
-		streamClient: &http.Client{Timeout: 0, Transport: noProxyTransport},
+		relayBaseURL:       strings.TrimRight(relayBaseURL, "/"),
+		hubID:              hubID,
+		relayToken:         relayToken,
+		coreHandler:        coreHandler,
+		engine:             engine,
+		httpClient:         &http.Client{Timeout: 10 * time.Second, Transport: pooledTransport},
+		streamClient:       &http.Client{Timeout: 0, Transport: &http.Transport{Proxy: nil}},
+		sem:                make(chan struct{}, 64),
+		subscribedSessions: make(map[string]context.CancelFunc),
 	}
 }
 
@@ -60,13 +73,17 @@ func (t *OutboundCloudTunnel) Start(ctx context.Context) {
 	go t.downlinkLoop(ctx)
 }
 
+func (t *OutboundCloudTunnel) cancelAllSessionForwarders() {
+	t.subMu.Lock()
+	defer t.subMu.Unlock()
+	for sid, cancel := range t.subscribedSessions {
+		cancel()
+		delete(t.subscribedSessions, sid)
+	}
+}
+
 func (t *OutboundCloudTunnel) downlinkLoop(ctx context.Context) {
-	subscribedSessions := make(map[string]context.CancelFunc)
-	defer func() {
-		for _, cancel := range subscribedSessions {
-			cancel()
-		}
-	}()
+	defer t.cancelAllSessionForwarders()
 
 	url := fmt.Sprintf("%s/g2a/v1/relay/down?hub_id=%s", t.relayBaseURL, t.hubID)
 	for {
@@ -105,7 +122,12 @@ func (t *OutboundCloudTunnel) downlinkLoop(ctx context.Context) {
 				if len(dataLines) > 0 {
 					joined := strings.Join(dataLines, "\n")
 					dataLines = dataLines[:0]
-					t.handleDownlinkFrame(ctx, joined, subscribedSessions)
+					// Dispatch concurrently so sustained queue.submit never blocks session.heartbeat or queue.cancel!
+					t.sem <- struct{}{}
+					go func(payload string) {
+						defer func() { <-t.sem }()
+						t.handleDownlinkFrame(ctx, payload)
+					}(joined)
 				}
 			} else if strings.HasPrefix(line, "data:") {
 				dataLines = append(dataLines, strings.TrimLeft(line[5:], " "))
@@ -114,11 +136,7 @@ func (t *OutboundCloudTunnel) downlinkLoop(ctx context.Context) {
 	}
 }
 
-func (t *OutboundCloudTunnel) handleDownlinkFrame(
-	ctx context.Context,
-	rawJSON string,
-	subscribedSessions map[string]context.CancelFunc,
-) {
+func (t *OutboundCloudTunnel) handleDownlinkFrame(ctx context.Context, rawJSON string) {
 	var frame DownlinkRequestFrame
 	if err := json.Unmarshal([]byte(rawJSON), &frame); err != nil || frame.TunnelReqID == "" {
 		return
@@ -136,16 +154,17 @@ func (t *OutboundCloudTunnel) handleDownlinkFrame(
 	t.coreHandler.ServeHTTP(rec, httpReq)
 
 	respBytes := rec.Body.Bytes()
-	// If a new session was authorized over the tunnel, automatically forward its push events uplink!
 	var replyEnv model.ReplyEnvelope
 	if err := json.Unmarshal(respBytes, &replyEnv); err == nil && replyEnv.SessionID != nil {
 		sid := *replyEnv.SessionID
 		if sid != "" {
-			if _, exists := subscribedSessions[sid]; !exists {
+			t.subMu.Lock()
+			if _, exists := t.subscribedSessions[sid]; !exists {
 				subCtx, cancel := context.WithCancel(ctx)
-				subscribedSessions[sid] = cancel
+				t.subscribedSessions[sid] = cancel
 				go t.forwardSessionEventsUplink(subCtx, sid)
 			}
+			t.subMu.Unlock()
 		}
 	}
 
@@ -159,7 +178,12 @@ func (t *OutboundCloudTunnel) handleDownlinkFrame(
 
 func (t *OutboundCloudTunnel) forwardSessionEventsUplink(ctx context.Context, sessionID string) {
 	ch, unsub := t.engine.PushStream().Subscribe(sessionID, false)
-	defer unsub()
+	defer func() {
+		unsub()
+		t.subMu.Lock()
+		delete(t.subscribedSessions, sessionID)
+		t.subMu.Unlock()
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -170,6 +194,9 @@ func (t *OutboundCloudTunnel) forwardSessionEventsUplink(ctx context.Context, se
 				Kind:  "event",
 				Event: &evCopy,
 			})
+			if ev.Event == "session.closed" {
+				return
+			}
 		}
 	}
 }

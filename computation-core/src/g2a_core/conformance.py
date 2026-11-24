@@ -184,7 +184,17 @@ def verify_all_14_error_codes_live(core_base_url: str, origin_base_url: str) -> 
     }).encode("utf-8"))
     assert _record(st, env) == "conflict" and st == 409
 
-    # 12. resource_limit (429): rapid double context.pull within adaptive idle backoff window
+    # 12. resource_limit (429): quiet delta frames double IdleBackoffMs (100->200->400->800ms), then double context.pull triggers 429
+    for quiet_rev in (11, 12, 13):
+        _raw_post(origin_ep, json.dumps({
+            "g2a_version": G2A_WIRE_VERSION, "request_id": f"r-quiet-{quiet_rev}", "timestamp_ms": 1,
+            "operation": "origin.sync",
+            "payload": {
+                "slot_id": "slot-conf", "epoch": 1, "rev": quiet_rev, "base_rev": quiet_rev - 1,
+                "mode": "delta", "significant_event": False,
+                "state_brief": {}, "upserted_methods": [], "removed_methods": [], "settled_executions": []
+            }
+        }).encode("utf-8"), token="")
     _raw_post(core_ep, json.dumps({
         "g2a_version": G2A_WIRE_VERSION, "request_id": "r14a", "session_id": sid, "timestamp_ms": 1,
         "operation": "context.pull", "payload": {}

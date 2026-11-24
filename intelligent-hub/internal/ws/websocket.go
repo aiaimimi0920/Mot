@@ -6,10 +6,12 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -64,6 +66,7 @@ func (c *Conn) writeFrame(opcode byte, payload []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
+	_ = c.netConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	var hdr [10]byte
 	hdr[0] = 0x80 | (opcode & 0x0F) // FIN=1
 	hdrLen := 2
@@ -92,7 +95,9 @@ func (c *Conn) writeFrame(opcode byte, payload []byte) error {
 }
 
 // ReadLoop drains client control frames (ping -> pong, close -> return) until the peer disconnects.
+// Enforces RFC 6455 client masking, TCP-fragment-safe io.ReadFull headers, and 64-bit overflow bounds.
 func (c *Conn) ReadLoop() {
+	const maxClientFrameBytes = 1 << 20
 	for {
 		b0, err := c.bufrw.ReadByte()
 		if err != nil {
@@ -104,41 +109,40 @@ func (c *Conn) ReadLoop() {
 		}
 		opcode := b0 & 0x0F
 		masked := (b1 & 0x80) != 0
-		length := int64(b1 & 0x7F)
-		if length == 126 {
-			var ext [2]byte
-			if _, err := c.bufrw.Read(ext[:]); err != nil {
-				return
-			}
-			length = int64(binary.BigEndian.Uint16(ext[:]))
-		} else if length == 127 {
-			var ext [8]byte
-			if _, err := c.bufrw.Read(ext[:]); err != nil {
-				return
-			}
-			length = int64(binary.BigEndian.Uint64(ext[:]))
-		}
-		var maskKey [4]byte
-		if masked {
-			if _, err := c.bufrw.Read(maskKey[:]); err != nil {
-				return
-			}
-		}
-		if length > (1 << 20) {
+		if !masked {
+			// RFC 6455 Section 5.1: server MUST close connection upon receiving an unmasked client frame.
+			_ = c.writeFrame(0x8, nil)
 			return
 		}
-		data := make([]byte, length)
-		readOff := int64(0)
-		for readOff < length {
-			nr, rErr := c.bufrw.Read(data[readOff:])
-			if rErr != nil {
+		uLen := uint64(b1 & 0x7F)
+		if uLen == 126 {
+			var ext [2]byte
+			if _, err := io.ReadFull(c.bufrw, ext[:]); err != nil {
 				return
 			}
-			readOff += int64(nr)
+			uLen = uint64(binary.BigEndian.Uint16(ext[:]))
+		} else if uLen == 127 {
+			var ext [8]byte
+			if _, err := io.ReadFull(c.bufrw, ext[:]); err != nil {
+				return
+			}
+			uLen = binary.BigEndian.Uint64(ext[:])
 		}
-		if masked {
+		if uLen > maxClientFrameBytes {
+			_ = c.writeFrame(0x8, nil)
+			return
+		}
+		var maskKey [4]byte
+		if _, err := io.ReadFull(c.bufrw, maskKey[:]); err != nil {
+			return
+		}
+		data := make([]byte, int(uLen))
+		if uLen > 0 {
+			if _, err := io.ReadFull(c.bufrw, data); err != nil {
+				return
+			}
 			for i := range data {
-				data[i] ^= maskKey[i%4]
+				data[i] ^= maskKey[i&3]
 			}
 		}
 		if opcode == 0x8 { // Close

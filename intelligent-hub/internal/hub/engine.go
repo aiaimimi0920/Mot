@@ -65,9 +65,21 @@ type HTTPOriginClient struct {
 	SharedToken string
 }
 
+type rawOriginReplyEnvelope struct {
+	Acceptance model.AcceptanceState `json:"acceptance"`
+	Result     json.RawMessage       `json:"result"`
+	Error      *model.G2AError       `json:"error"`
+}
+
 func NewHTTPOriginClient(sharedToken string) *HTTPOriginClient {
+	transport := &http.Transport{
+		Proxy:               nil,
+		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 32,
+		IdleConnTimeout:     90 * time.Second,
+	}
 	return &HTTPOriginClient{
-		Client:      &http.Client{Timeout: 10 * time.Second},
+		Client:      &http.Client{Timeout: 10 * time.Second, Transport: transport},
 		SharedToken: sharedToken,
 	}
 }
@@ -103,11 +115,11 @@ func (c *HTTPOriginClient) Execute(targetURL string, req model.OriginExecuteRequ
 		return zero, model.NewError(model.ErrUnavailable, 503, "Origin unreachable: "+err.Error())
 	}
 	defer resp.Body.Close()
-	respBytes, err := io.ReadAll(resp.Body)
+	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return zero, model.NewError(model.ErrOutcomeUnknown, 504, "Failed reading Origin response")
 	}
-	var replyEnv model.ReplyEnvelope
+	var replyEnv rawOriginReplyEnvelope
 	if err := json.Unmarshal(respBytes, &replyEnv); err != nil {
 		return zero, model.NewError(model.ErrUnavailable, 503, "Malformed Origin reply envelope")
 	}
@@ -117,9 +129,8 @@ func (c *HTTPOriginClient) Execute(targetURL string, req model.OriginExecuteRequ
 		}
 		return zero, model.NewError(model.ErrUnavailable, 503, "Origin rejected execution")
 	}
-	rawRes, _ := json.Marshal(replyEnv.Result)
 	var out model.OriginExecuteReply
-	if err := json.Unmarshal(rawRes, &out); err != nil {
+	if err := json.Unmarshal(replyEnv.Result, &out); err != nil {
 		return zero, model.NewError(model.ErrUnavailable, 503, "Malformed OriginExecuteReply")
 	}
 	return out, nil

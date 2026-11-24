@@ -41,7 +41,8 @@ def validate_outbound_url_against_ssrf(url: str, allow_loopback: bool = False) -
         except socket.gaierror as exc:
             raise G2AError("unavailable", 503, f"Unable to resolve Hub host {host!r}: {exc}") from exc
 
-    for ip in resolved_ips:
+    for raw_ip in resolved_ips:
+        ip = raw_ip.ipv4_mapped if isinstance(raw_ip, ipaddress.IPv6Address) and raw_ip.ipv4_mapped is not None else raw_ip
         if ip.is_loopback:
             if not allow_loopback:
                 raise G2AError("permission_denied", 403, "Loopback Hub address blocked by remote SSRF policy")

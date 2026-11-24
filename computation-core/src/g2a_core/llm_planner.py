@@ -87,10 +87,15 @@ class OpenAICompatibleLLMPlanner:
             '{"intent_summary": "...", "reply_text": null, "audience": "player_only", '
             '"steps": [{"method_id": "#01", "actor": "companion", "args": {...}}]}'
         )
+        untrusted_json = (
+            json.dumps(untrusted_data, ensure_ascii=False)
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+        )
         user_prompt = (
             f"TRUSTED_CAPABILITIES:\n{json.dumps(trusted_catalog, ensure_ascii=False)}\n\n"
             f"TRUSTED_ACTIVE_GRANTS:\n{json.dumps(trusted_grants, ensure_ascii=False)}\n\n"
-            f"<UNTRUSTED_GAME_DATA>\n{json.dumps(untrusted_data, ensure_ascii=False)}\n</UNTRUSTED_GAME_DATA>"
+            f"<UNTRUSTED_GAME_DATA>\n{untrusted_json}\n</UNTRUSTED_GAME_DATA>"
         )
 
         user_content: Any = user_prompt
@@ -174,6 +179,26 @@ class OpenAICompatibleLLMPlanner:
                 for req_field in cap.params_schema.get("required", []):
                     if req_field not in args:
                         return PlanDecision()
+
+                props = cap.params_schema.get("properties")
+                if isinstance(props, dict):
+                    if cap.params_schema.get("additionalProperties") is False:
+                        for arg_k in args:
+                            if arg_k not in props:
+                                return PlanDecision()
+                    for arg_k, arg_v in args.items():
+                        prop_spec = props.get(arg_k)
+                        if not isinstance(prop_spec, dict):
+                            continue
+                        ptype = prop_spec.get("type")
+                        if ptype == "string" and not isinstance(arg_v, str):
+                            return PlanDecision()
+                        if ptype == "boolean" and not isinstance(arg_v, bool):
+                            return PlanDecision()
+                        if ptype == "integer" and (isinstance(arg_v, bool) or not isinstance(arg_v, int)):
+                            return PlanDecision()
+                        if ptype == "number" and (isinstance(arg_v, bool) or not isinstance(arg_v, (int, float))):
+                            return PlanDecision()
 
                 step_readiness = grant.readiness
                 if grant.targets and "target_id" in args:

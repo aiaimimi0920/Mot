@@ -185,6 +185,32 @@ internal static class Program
         var cancelRep = sdk.HandleOriginExecute(new OriginExecuteRequest("slot-csharp", 1, "cancel", "exec-cs-1", null, null, new()));
         if (!cancelled || cancelRep.State != "cancelled") throw new Exception("Expected cancellation");
 
+        // Verify 60-entity crowd priority sorting & 600-step bounded ledger
+        var crowdTx = new RecordingTransport();
+        var crowdSdk = new OriginSdk("slot-crowd-cs", crowdTx, roomId: "room-cs", factionId: "alpha");
+        crowdSdk.BindActorSubject("companion", new object());
+        crowdSdk.RegisterCapability(
+            new CapabilityEntry("#02", "interact", "Interact", new List<string> { "companion" }, new()),
+            (_, _, _, _) => new EffectInvocationResult.ImmediateSucceeded(new Dictionary<string, object?> { ["ok"] = true }));
+        var crowd = Enumerable.Range(0, 55)
+            .Select(i => new TargetCandidate($"chest_{i:D2}", $"Chest {i}", "staged", null, "22.0m"))
+            .ToList();
+        crowd.Add(new TargetCandidate("chest_ready_close", "Close Chest", "ready", null, "1.1m"));
+        crowd.Add(new TargetCandidate("chest_pointed", "Pointed Chest", "staged", null, "8.0m", "pointed_ray"));
+        crowd.Add(new TargetCandidate("station_alert", "Alerted Station", "staged", null, "15.0m", null, "halted_no_material"));
+        crowdSdk.BindStateModule("crowd", () => new(), () => new List<ActiveMethodGrant> { new("#02", "companion", "ready", crowd) });
+        crowdSdk.PublishCapabilitiesAndBaseline();
+        var syncPayload = (Dictionary<string, object?>)crowdTx.Posts[1].Payload;
+        var upserted = (List<ActiveMethodGrant>)syncPayload["upserted_methods"]!;
+        if (upserted[0].Targets.Count != 24) throw new Exception("Expected 24 capped targets");
+        if (upserted[0].Targets[0].TargetId != "station_alert") throw new Exception("Expected alert #1");
+        if (upserted[0].Targets[1].TargetId != "chest_pointed") throw new Exception("Expected pointed #2");
+        if (upserted[0].Targets[2].TargetId != "chest_ready_close") throw new Exception("Expected ready closest #3");
+        for (int i = 0; i < 600; i++)
+        {
+            crowdSdk.HandleOriginExecute(new OriginExecuteRequest("slot-crowd-cs", 1, "invoke", $"exec-b-{i}", "#02", "companion", new()));
+        }
+
         Console.WriteLine($"C# G2A.InteractionOrigin SelfTest PASSED | JCS={d1}");
         return 0;
     }

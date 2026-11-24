@@ -172,7 +172,7 @@ public sealed class LoopbackExecuteListener : IDisposable
         if (p.TryGetProperty("args", out var argsEl) && argsEl.ValueKind == JsonValueKind.Object)
         {
             foreach (var prop in argsEl.EnumerateObject())
-                args[prop.Name] = ConvertElement(prop.Value);
+                args[prop.Name] = ConvertJsonElement(prop.Value);
         }
         return new OriginExecuteRequest(
             SlotId: p.GetProperty("slot_id").GetString() ?? "",
@@ -185,7 +185,7 @@ public sealed class LoopbackExecuteListener : IDisposable
         );
     }
 
-    private static object? ConvertElement(JsonElement el) => el.ValueKind switch
+    internal static object? ConvertJsonElement(JsonElement el) => el.ValueKind switch
     {
         JsonValueKind.String => el.GetString(),
         JsonValueKind.Number => el.TryGetInt64(out long l) ? l : el.GetDouble(),
@@ -264,6 +264,7 @@ public sealed class LoopbackExecuteListener : IDisposable
 public sealed class OutboundExecuteStreamClient : IDisposable
 {
     public const string PullExecuteUrl = "pull://origin.execute";
+    public const string PullSentinelUrl = PullExecuteUrl;
 
     private readonly OriginSdk _sdk;
     private readonly string _baseUrl;
@@ -271,6 +272,7 @@ public sealed class OutboundExecuteStreamClient : IDisposable
     private readonly string _sharedToken;
     private readonly HttpClient _http;
     private readonly CancellationTokenSource _cts = new();
+    private readonly ManualResetEventSlim _connected = new(false);
 
     public OutboundExecuteStreamClient(OriginSdk sdk, string hubOriginBaseUrl, string slotId, string sharedToken = "")
     {
@@ -280,6 +282,7 @@ public sealed class OutboundExecuteStreamClient : IDisposable
         _sharedToken = sharedToken;
         _http = new HttpClient(new SocketsHttpHandler { UseProxy = false }) { Timeout = Timeout.InfiniteTimeSpan };
         _ = Task.Run(() => StreamLoopAsync(_cts.Token));
+        _connected.Wait(TimeSpan.FromSeconds(2));
     }
 
     private async Task StreamLoopAsync(CancellationToken ct)
@@ -296,6 +299,7 @@ public sealed class OutboundExecuteStreamClient : IDisposable
 
                 using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
                 resp.EnsureSuccessStatusCode();
+                _connected.Set();
                 await using var stream = await resp.Content.ReadAsStreamAsync(ct);
                 using var reader = new StreamReader(stream, Encoding.UTF8);
 
@@ -329,35 +333,64 @@ public sealed class OutboundExecuteStreamClient : IDisposable
 
     private async Task ProcessStreamedEnvelopeAsync(string rawJson, CancellationToken ct)
     {
-        using var doc = JcsDigest.ParseStrictDocument(rawJson);
-        var root = doc.RootElement;
-        string reqId = root.GetProperty("request_id").GetString() ?? "";
-        var p = root.GetProperty("payload");
-        var args = new Dictionary<string, object?>();
-        if (p.TryGetProperty("args", out var argsEl) && argsEl.ValueKind == JsonValueKind.Object)
+        string reqId = "";
+        Dictionary<string, object?> replyEnv;
+        try
         {
-            foreach (var prop in argsEl.EnumerateObject())
-                args[prop.Name] = prop.Value.ValueKind == JsonValueKind.String ? prop.Value.GetString() : prop.Value.GetRawText();
-        }
-        var execReq = new OriginExecuteRequest(
-            SlotId: p.GetProperty("slot_id").GetString() ?? "",
-            Epoch: p.GetProperty("epoch").GetInt64(),
-            Kind: p.GetProperty("kind").GetString() ?? "invoke",
-            ExecutionId: p.GetProperty("execution_id").GetString() ?? "",
-            MethodId: p.TryGetProperty("method_id", out var m) && m.ValueKind == JsonValueKind.String ? m.GetString() : null,
-            Actor: p.TryGetProperty("actor", out var a) && a.ValueKind == JsonValueKind.String ? a.GetString() : null,
-            Args: args);
+            using var doc = JcsDigest.ParseStrictDocument(rawJson);
+            var root = doc.RootElement;
+            reqId = root.TryGetProperty("request_id", out var ridEl) ? ridEl.GetString() ?? "" : "";
+            var p = root.GetProperty("payload");
+            var args = new Dictionary<string, object?>();
+            if (p.TryGetProperty("args", out var argsEl) && argsEl.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var prop in argsEl.EnumerateObject())
+                    args[prop.Name] = LoopbackExecuteListener.ConvertJsonElement(prop.Value);
+            }
+            var execReq = new OriginExecuteRequest(
+                SlotId: p.GetProperty("slot_id").GetString() ?? "",
+                Epoch: p.GetProperty("epoch").GetInt64(),
+                Kind: p.GetProperty("kind").GetString() ?? "invoke",
+                ExecutionId: p.GetProperty("execution_id").GetString() ?? "",
+                MethodId: p.TryGetProperty("method_id", out var m) && m.ValueKind == JsonValueKind.String ? m.GetString() : null,
+                Actor: p.TryGetProperty("actor", out var a) && a.ValueKind == JsonValueKind.String ? a.GetString() : null,
+                Args: args);
 
-        var execRep = _sdk.HandleOriginExecute(execReq);
-        var replyEnv = new Dictionary<string, object?>
+            var execRep = _sdk.HandleOriginExecute(execReq);
+            replyEnv = new Dictionary<string, object?>
+            {
+                ["g2a_version"] = OriginSdk.WireVersion,
+                ["request_id"] = reqId,
+                ["timestamp_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                ["acceptance"] = "accepted",
+                ["result"] = execRep,
+                ["error"] = null
+            };
+        }
+        catch (G2AOriginException gex)
         {
-            ["g2a_version"] = OriginSdk.WireVersion,
-            ["request_id"] = reqId,
-            ["timestamp_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            ["acceptance"] = "accepted",
-            ["result"] = execRep,
-            ["error"] = null
-        };
+            replyEnv = new Dictionary<string, object?>
+            {
+                ["g2a_version"] = OriginSdk.WireVersion,
+                ["request_id"] = reqId,
+                ["timestamp_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                ["acceptance"] = "not_accepted",
+                ["result"] = null,
+                ["error"] = new Dictionary<string, object?> { ["code"] = gex.Code, ["http_status"] = gex.HttpStatus, ["message"] = gex.Message }
+            };
+        }
+        catch (Exception ex)
+        {
+            replyEnv = new Dictionary<string, object?>
+            {
+                ["g2a_version"] = OriginSdk.WireVersion,
+                ["request_id"] = reqId,
+                ["timestamp_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                ["acceptance"] = "not_accepted",
+                ["result"] = null,
+                ["error"] = new Dictionary<string, object?> { ["code"] = "invalid_request", ["http_status"] = 400, ["message"] = ex.Message }
+            };
+        }
         using var postReq = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/g2a/v1/origin/execute-reply")
         {
             Content = new StringContent(JsonSerializer.Serialize(replyEnv), Encoding.UTF8, "application/json")
@@ -371,6 +404,7 @@ public sealed class OutboundExecuteStreamClient : IDisposable
     {
         _cts.Cancel();
         _http.Dispose();
+        _connected.Dispose();
         _cts.Dispose();
     }
 }

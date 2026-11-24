@@ -129,7 +129,8 @@ def _serialize_jcs(val: Any) -> str:
     if isinstance(val, (list, tuple)):
         return "[" + ",".join(_serialize_jcs(item) for item in val) + "]"
     if isinstance(val, dict):
-        sorted_keys = sorted(val.keys(), key=_utf16_sort_key)
+        keys = val.keys()
+        sorted_keys = sorted(keys) if all(k.isascii() for k in keys) else sorted(keys, key=_utf16_sort_key)
         return "{" + ",".join(f"{_escape_jcs_string(k)}:{_serialize_jcs(val[k])}" for k in sorted_keys) + "}"
     raise G2AError("invalid_request", 400, f"Cannot canonicalize value of type {type(val).__name__}")
 

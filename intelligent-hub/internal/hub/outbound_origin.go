@@ -44,6 +44,9 @@ func (b *OriginOutboundStreamBroker) SubscribeSlot(slotID string) (chan model.Re
 		b.mu.Lock()
 		if set, ok := b.slotStreams[slotID]; ok {
 			delete(set, ch)
+			if len(set) == 0 {
+				delete(b.slotStreams, slotID)
+			}
 		}
 		b.mu.Unlock()
 	}
