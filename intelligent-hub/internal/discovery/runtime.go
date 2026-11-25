@@ -61,7 +61,16 @@ func WriteRuntimeManifest(path string, originAddr, coreAddr, consentAddr string,
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		if err := os.Rename(tmp, path); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	return lastErr
 }
 
 func RemoveRuntimeManifestIfOwned(path string) {

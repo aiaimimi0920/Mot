@@ -471,3 +471,102 @@ func TestConcurrentHighFrequencyDeltaSyncAndReadOnlyQueries(t *testing.T) {
 		t.Fatalf("high-frequency delta sync + concurrent readers took too long: %v", elapsed)
 	}
 }
+
+func TestOutboundOriginNewestSubscriberPriorityAndEventStreamLRU(t *testing.T) {
+	// 1. Verify OriginOutboundStreamBroker routes to the newest connected subscriber first (avoiding half-open stale socket shadowing)
+	broker := hub.NewOriginOutboundStreamBroker(2 * time.Second)
+	oldCh, unsubOld := broker.SubscribeSlot("slot-reconn")
+	defer unsubOld()
+	newCh, unsubNew := broker.SubscribeSlot("slot-reconn")
+	defer unsubNew()
+
+	doneCh := make(chan model.OriginExecuteReply, 1)
+	errCh := make(chan *model.G2AError, 1)
+	go func() {
+		mID := "#02"
+		act := "companion"
+		rep, gErr := broker.DispatchOverStream(model.OriginExecuteRequest{
+			SlotID:      "slot-reconn",
+			Epoch:       1,
+			Kind:        "invoke",
+			ExecutionID: "exec-reconn-1",
+			MethodID:    &mID,
+			Actor:       &act,
+			Args:        map[string]any{"target_id": "chest_1"},
+		})
+		if gErr != nil {
+			errCh <- gErr
+			return
+		}
+		doneCh <- rep
+	}()
+
+	select {
+	case env := <-newCh:
+		select {
+		case <-oldCh:
+			t.Fatal("stale oldCh should not have received the request when newCh is healthy")
+		default:
+		}
+		rawRes, _ := json.Marshal(model.OriginExecuteReply{
+			ExecutionID:   "exec-reconn-1",
+			State:         "succeeded",
+			EffectSummary: map[string]any{"opened": true},
+		})
+		if !broker.DeliverReply(hub.OutboundReplyEnvelope{
+			G2AVersion: "0.0.1",
+			RequestID:  env.RequestID,
+			Acceptance: model.AcceptanceAccepted,
+			Result:     rawRes,
+		}) {
+			t.Fatal("expected DeliverReply to match pending waiter")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for newCh to receive origin.execute")
+	}
+
+	select {
+	case gErr := <-errCh:
+		t.Fatalf("unexpected DispatchOverStream error: %v", gErr)
+	case rep := <-doneCh:
+		if rep.State != "succeeded" || rep.EffectSummary["opened"] != true {
+			t.Fatalf("unexpected execute reply: %+v", rep)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for DispatchOverStream completion")
+	}
+
+	// 2. Verify EventStreamHub rotates active subscriber sessions in historyOrder instead of orphaning them
+	esHub := hub.NewEventStreamHub()
+	liveCh, unsubLive := esHub.Subscribe("sess-live-0", false)
+	esHub.PushEvent("sess-live-0", "context.push", map[string]any{"rev": 1})
+	<-liveCh
+
+	for i := 1; i <= 310; i++ {
+		esHub.PushEvent(fmt.Sprintf("sess-idle-%d", i), "context.push", map[string]any{"rev": i})
+	}
+	// While sess-live-0 still has an active subscriber, replay=true on a second subscriber MUST still find its history!
+	replayCh, unsubReplay := esHub.Subscribe("sess-live-0", true)
+	select {
+	case ev := <-replayCh:
+		if ev.SessionID != "sess-live-0" {
+			t.Fatalf("unexpected replayed session: %s", ev.SessionID)
+		}
+	default:
+		t.Fatal("expected active session history to survive LRU sweeps")
+	}
+	unsubReplay()
+	unsubLive()
+
+	// Once sess-live-0 has zero subscribers, subsequent 300 idle sessions must cleanly evict its history too!
+	for i := 400; i <= 700; i++ {
+		esHub.PushEvent(fmt.Sprintf("sess-idle-%d", i), "context.push", map[string]any{"rev": i})
+	}
+	afterEvictCh, unsubAfter := esHub.Subscribe("sess-live-0", true)
+	defer unsubAfter()
+	select {
+	case <-afterEvictCh:
+		t.Fatal("expected unsubscribed old session history to be evicted instead of leaked")
+	default:
+	}
+}

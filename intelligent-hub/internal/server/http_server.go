@@ -170,7 +170,7 @@ func NewOriginHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
 			writeReplyError(w, "", nil, model.NewError(model.ErrInvalidRequest, 400, errStrict.Error()))
 			return
 		}
-		var replyEnv model.ReplyEnvelope
+		var replyEnv hub.OutboundReplyEnvelope
 		if err := json.Unmarshal(raw, &replyEnv); err != nil || replyEnv.RequestID == "" {
 			writeReplyError(w, "", nil, model.NewError(model.ErrInvalidRequest, 400, "Invalid ReplyEnvelope"))
 			return

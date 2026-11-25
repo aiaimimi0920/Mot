@@ -235,15 +235,19 @@ class TestOptimizationsAndStress(unittest.TestCase):
             validate_outbound_url_against_ssrf("https://[::ffff:169.254.169.254]/", allow_loopback=True)
         self.assertEqual(ctx_meta.exception.code, "permission_denied")
 
-        # 2. Tag-breakout escaping & parameter type validation in OpenAICompatibleLLMPlanner
+        # 2. Tag-breakout escaping, persistent Keep-Alive reuse, & numeric/enum bounds in OpenAICompatibleLLMPlanner
         captured_prompts = []
+        accepted_client_ports: set[int] = set()
         mock_reply_holder = {"json": {"intent_summary": "Bad type", "steps": [{"method_id": "#05", "actor": "player", "args": {"qty": "twenty"}}]}}
 
         class _MockLLMHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def log_message(self, fmt, *args):
                 return
 
             def do_POST(self):
+                accepted_client_ports.add(self.client_address[1])
                 ln = int(self.headers.get("Content-Length", "0"))
                 body = json.loads(self.rfile.read(ln).decode("utf-8"))
                 captured_prompts.append(body["messages"][1]["content"])
@@ -252,12 +256,13 @@ class TestOptimizationsAndStress(unittest.TestCase):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(raw)))
-                self.send_header("Connection", "close")
+                self.send_header("Connection", "keep-alive")
                 self.end_headers()
                 self.wfile.write(raw)
 
         srv = ThreadingHTTPServer(("127.0.0.1", 0), _MockLLMHandler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
+        planner = None
         try:
             _, port = srv.server_address
             planner = OpenAICompatibleLLMPlanner(base_url=f"http://127.0.0.1:{port}/v1", model="mock-llm", allow_loopback=True)
@@ -271,7 +276,10 @@ class TestOptimizationsAndStress(unittest.TestCase):
                         "type": "object",
                         "required": ["qty"],
                         "additionalProperties": False,
-                        "properties": {"qty": {"type": "integer"}},
+                        "properties": {
+                            "qty": {"type": "integer", "minimum": 1, "maximum": 50},
+                            "tier": {"type": "string", "enum": ["standard", "express"]},
+                        },
                     },
                 )
             ]
@@ -291,15 +299,31 @@ class TestOptimizationsAndStress(unittest.TestCase):
             self.assertEqual(captured_prompts[0].count("</UNTRUSTED_GAME_DATA>"), 1)
             self.assertIn("\\u003c/UNTRUSTED_GAME_DATA\\u003e", captured_prompts[0])
 
-            # Valid integer arg passes cleanly
+            # Out-of-bounds integer (9999 > maximum 50) & invalid enum MUST also be dropped!
+            mock_reply_holder["json"] = {
+                "intent_summary": "Injected 9999",
+                "steps": [{"method_id": "#05", "actor": "player", "args": {"qty": 9999}}],
+            }
+            self.assertEqual(planner.plan(caps, ctx, []).planned_steps, [])
+
+            mock_reply_holder["json"] = {
+                "intent_summary": "Invalid enum",
+                "steps": [{"method_id": "#05", "actor": "player", "args": {"qty": 5, "tier": "vip_hack"}}],
+            }
+            self.assertEqual(planner.plan(caps, ctx, []).planned_steps, [])
+
+            # Valid integer + enum arg passes cleanly on the SAME Keep-Alive socket!
             mock_reply_holder["json"] = {
                 "intent_summary": "Buy 5 items",
-                "steps": [{"method_id": "#05", "actor": "player", "args": {"qty": 5}}],
+                "steps": [{"method_id": "#05", "actor": "player", "args": {"qty": 5, "tier": "standard"}}],
             }
             decision_ok = planner.plan(caps, ctx, [])
             self.assertEqual(len(decision_ok.planned_steps), 1)
             self.assertEqual(decision_ok.planned_steps[0].args["qty"], 5)
+            self.assertEqual(len(accepted_client_ports), 1)  # All 4 LLM calls reused 1 Keep-Alive TCP socket!
         finally:
+            if planner is not None:
+                planner.close()
             srv.shutdown()
             srv.server_close()
 
@@ -717,6 +741,105 @@ class TestOptimizationsAndStress(unittest.TestCase):
             self.assertNotIn("sess-clean-1", relay._sse_subscribers)
         finally:
             relay.stop()
+
+    def test_sqlite_single_tx_batch_import_keepalive_memory_http_and_godot_mirror(self) -> None:
+        from g2a_core.memory import MemoryBundleV1, MemoryService
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "batch_mem.db")
+            store = SQLiteCompanionStore(db_path)
+            mem_srv = MemoryHTTPServer(store, platform_ceiling="same_game_companion", player_tokens={"tok-bob": "bob"})
+            mem_url = mem_srv.start()
+            m_host, m_port_s = mem_url.replace("http://", "").split(":")
+            m_port = int(m_port_s)
+            try:
+                # 1. Seed a player-pinned record that MUST survive a 200-record batch bundle import!
+                store.upsert_player_record(
+                    "bob",
+                    MemoryRecord(
+                        memory_id="mem-005",
+                        created_at_ms=100,
+                        epistemic_source="player_stated",
+                        pinned_by_player=True,
+                        max_disclosure_scope="same_game_companion",
+                        content="Bob's pinned tactical note",
+                    ),
+                )
+                incoming_recs = [
+                    MemoryRecord(
+                        memory_id=f"mem-{i:03d}",
+                        created_at_ms=1000 + i,
+                        epistemic_source="agent_summary",
+                        pinned_by_player=False,
+                        max_disclosure_scope="cross_game_companion",
+                        content=f"Imported summary {i}",
+                    )
+                    for i in range(200)
+                ]
+                bundle = MemoryBundleV1(
+                    exported_at_ms=5000,
+                    persona_settings={"tone": "concise", "unsupported_vendor_knob": 42},
+                    autonomy_preferences={"#05": "confirm"},
+                    records=incoming_recs,
+                )
+                svc = MemoryService(store, platform_ceiling="same_game_companion")
+                t0 = time.perf_counter()
+                receipt = svc.import_bundle("bob", bundle, [r.memory_id for r in incoming_recs])
+                elapsed = time.perf_counter() - t0
+
+                self.assertLess(elapsed, 0.6)  # Single SQLite WAL transaction instead of 202 fsync commits!
+                self.assertEqual(len(receipt.record_statuses), 200)
+                self.assertEqual(receipt.applied_settings, ["tone"])
+                self.assertEqual(receipt.unsupported_settings, ["unsupported_vendor_knob"])
+
+                by_id = {r.memory_id: r for r in store.list_records("bob")}
+                self.assertEqual(len(by_id), 200)
+                self.assertEqual(by_id["mem-005"].content, "Bob's pinned tactical note")
+                self.assertTrue(by_id["mem-005"].pinned_by_player)
+                self.assertEqual(by_id["mem-199"].max_disclosure_scope, "same_game_companion")
+
+                # 2. Verify MemoryHTTPServer HTTP/1.1 Keep-Alive + query-param path tolerance on ONE persistent socket
+                ka_conn = http.client.HTTPConnection(m_host, m_port, timeout=3.0)
+                try:
+                    hdrs = {"Authorization": "Bearer tok-bob", "Connection": "keep-alive"}
+                    for path in (
+                        "/g2a/v1/memory/records?view=summary",
+                        "/g2a/v1/memory/export?format=v1",
+                    ):
+                        ka_conn.request("GET", path, headers=hdrs)
+                        resp = ka_conn.getresponse()
+                        data = json.loads(resp.read().decode("utf-8"))
+                        self.assertEqual(resp.status, 200)
+                        self.assertEqual(resp.getheader("Connection"), "keep-alive")
+                        self.assertIn("records", data)
+                finally:
+                    ka_conn.close()
+            finally:
+                mem_srv.stop()
+                store.close()
+
+        # 3. Verify Godot 4 addon & demo_project mirror stay byte-for-byte identical + Unity UPM static registry
+        addon_dir = os.path.join(ROOT_DIR, "interaction-origin", "gdscript", "addons", "g2a_origin")
+        mirror_dir = os.path.join(ROOT_DIR, "interaction-origin", "gdscript", "demo_project", "addons", "g2a_origin")
+        addon_files = sorted(os.listdir(addon_dir))
+        self.assertEqual(addon_files, sorted(os.listdir(mirror_dir)))
+        for fn in addon_files:
+            with open(os.path.join(addon_dir, fn), "rb") as fa, open(os.path.join(mirror_dir, fn), "rb") as fm:
+                self.assertEqual(fa.read(), fm.read(), f"Godot addon mirror drift in {fn}")
+
+        unity_bridge_path = os.path.join(
+            ROOT_DIR,
+            "interaction-origin",
+            "csharp",
+            "UnityPackage",
+            "com.g2a.interaction-origin",
+            "Runtime",
+            "G2AUnityOriginBridge.cs",
+        )
+        with open(unity_bridge_path, "r", encoding="utf-8") as fu:
+            unity_src = fu.read()
+        self.assertIn("G2ASpatialInteractable.ActiveInstances", unity_src)
+        self.assertNotIn("FindObjectsByType", unity_src)
 
 
 if __name__ == "__main__":

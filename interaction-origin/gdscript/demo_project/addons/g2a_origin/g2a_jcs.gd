@@ -36,7 +36,7 @@ static func canonicalize(val: Variant) -> String:
 			return "[" + ",".join(parts) + "]"
 		TYPE_DICTIONARY:
 			var keys: Array = val.keys()
-			keys.sort_custom(func(a, b): return str(a) < str(b))
+			keys.sort_custom(_less_utf16)
 			var kv_parts: PackedStringArray = []
 			for k in keys:
 				kv_parts.append(_escape_string(str(k)) + ":" + canonicalize(val[k]))
@@ -44,6 +44,29 @@ static func canonicalize(val: Variant) -> String:
 		_:
 			push_error("Unsupported Variant in G2AJcs: %s" % str(val))
 			return "null"
+
+static func _less_utf16(a: Variant, b: Variant) -> bool:
+	var sa := str(a)
+	var sb := str(b)
+	var ua := _to_utf16_units(sa)
+	var ub := _to_utf16_units(sb)
+	var n := mini(ua.size(), ub.size())
+	for i in range(n):
+		if ua[i] != ub[i]:
+			return ua[i] < ub[i]
+	return ua.size() < ub.size()
+
+static func _to_utf16_units(s: String) -> PackedInt32Array:
+	var out := PackedInt32Array()
+	for i in range(s.length()):
+		var cp := s.unicode_at(i)
+		if cp <= 0xFFFF:
+			out.append(cp)
+		else:
+			var adj := cp - 0x10000
+			out.append(0xD800 + (adj >> 10))
+			out.append(0xDC00 + (adj & 0x3FF))
+	return out
 
 static func _escape_string(s: String) -> String:
 	var out := "\""

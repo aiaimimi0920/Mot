@@ -156,6 +156,65 @@ class SQLiteCompanionStore:
                 return
             self.upsert_player_record(player_id, incoming)
 
+    def batch_import_records_and_settings(
+        self,
+        player_id: str,
+        records: List[MemoryRecord],
+        persona_updates: Dict[str, Any],
+        autonomy_updates: Dict[str, str],
+    ) -> None:
+        """Atomically imports an entire MemoryBundleV1 in a single SQLite WAL transaction while preserving pinned/edited records."""
+        with self._lock, self._conn:
+            for incoming in records:
+                self._conn.execute(
+                    """
+                    INSERT INTO memory_records (
+                        player_id, memory_id, created_at_ms, imported_at_ms, epistemic_source,
+                        game_origin_id, timeline_tag, pinned_by_player, max_disclosure_scope, content, observed_epoch
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(player_id, memory_id) DO UPDATE SET
+                        imported_at_ms=excluded.imported_at_ms,
+                        epistemic_source=excluded.epistemic_source,
+                        game_origin_id=excluded.game_origin_id,
+                        timeline_tag=excluded.timeline_tag,
+                        pinned_by_player=excluded.pinned_by_player,
+                        max_disclosure_scope=excluded.max_disclosure_scope,
+                        content=excluded.content,
+                        observed_epoch=excluded.observed_epoch
+                    WHERE memory_records.pinned_by_player = 0
+                      AND memory_records.epistemic_source != 'player_edited';
+                    """,
+                    (
+                        player_id,
+                        incoming.memory_id,
+                        incoming.created_at_ms,
+                        incoming.imported_at_ms,
+                        incoming.epistemic_source,
+                        incoming.game_origin_id,
+                        incoming.timeline_tag,
+                        1 if incoming.pinned_by_player else 0,
+                        incoming.max_disclosure_scope,
+                        incoming.content,
+                        incoming.observed_epoch,
+                    ),
+                )
+            for pk, pv in persona_updates.items():
+                self._conn.execute(
+                    """
+                    INSERT INTO persona_settings (player_id, key, value_json) VALUES (?, ?, ?)
+                    ON CONFLICT(player_id, key) DO UPDATE SET value_json = excluded.value_json;
+                    """,
+                    (player_id, pk, json.dumps(pv, ensure_ascii=False)),
+                )
+            for ak, av in autonomy_updates.items():
+                self._conn.execute(
+                    """
+                    INSERT INTO autonomy_preferences (player_id, key, policy_mode) VALUES (?, ?, ?)
+                    ON CONFLICT(player_id, key) DO UPDATE SET policy_mode = excluded.policy_mode;
+                    """,
+                    (player_id, ak, str(av)),
+                )
+
     def autonomous_compact(self, player_id: str, summary_record: MemoryRecord) -> None:
         """Deletes only unpinned, non-player-edited records before storing the compacted summary."""
         with self._lock:

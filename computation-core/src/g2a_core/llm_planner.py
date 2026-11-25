@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import http.client
 import json
-import urllib.request
+import math
+import ssl
+import threading
+import urllib.parse
 from typing import Any, Dict, List, Optional
 
+from .jcs import parse_strict_json
 from .memory import MemoryRecord
 from .schemas import ActiveMethodGrant, CapabilityEntry, PlanDecision, ProjectedContext, QueueStep
 from .ssrf import validate_outbound_url_against_ssrf
+
+MAX_PLANNER_QUEUE_STEPS = 32
 
 
 class OpenAICompatibleLLMPlanner:
@@ -14,8 +21,9 @@ class OpenAICompatibleLLMPlanner:
     Production CognitivePlannerPort adapter for OpenAI / Ollama / vLLM / Gemini OpenAI-compatible endpoints.
     Enforces Section 7.1 Prompt-Injection Isolation:
       1. Untrusted in-game labels, briefs, and recalled memories are fenced as data-only JSON;
-      2. A strict post-LLM structural firewall drops any hallucinated or injected step outside
-         the active (method_id, actor) grant set or violating step-0 readiness / schema rules!
+      2. Persistent HTTP/1.1 Keep-Alive connection pool avoids per-turn TCP/TLS handshake latency;
+      3. A strict post-LLM structural firewall drops any hallucinated or injected step outside
+         the active (method_id, actor) grant set or violating step-0 readiness / schema / numeric bounds!
     """
 
     def __init__(
@@ -26,6 +34,7 @@ class OpenAICompatibleLLMPlanner:
         allow_loopback: bool = True,
         timeout_sec: float = 15.0,
         fallback_planner: Optional[Any] = None,
+        ssl_context: Optional[ssl.SSLContext] = None,
     ) -> None:
         validate_outbound_url_against_ssrf(base_url, allow_loopback=allow_loopback)
         self.base_url = base_url.rstrip("/")
@@ -34,6 +43,61 @@ class OpenAICompatibleLLMPlanner:
         self.allow_loopback = allow_loopback
         self.timeout_sec = timeout_sec
         self.fallback_planner = fallback_planner
+        self.ssl_context = ssl_context
+
+        parsed = urllib.parse.urlparse(f"{self.base_url}/chat/completions")
+        self._is_https = parsed.scheme == "https"
+        self._host = parsed.hostname or "127.0.0.1"
+        self._port = parsed.port or (443 if self._is_https else 80)
+        self._path = parsed.path or "/v1/chat/completions"
+        if parsed.query:
+            self._path = f"{self._path}?{parsed.query}"
+
+        self._tls = threading.local()
+        self._pool_lock = threading.Lock()
+        self._pooled_conns: List[http.client.HTTPConnection] = []
+
+    def _get_conn(self) -> http.client.HTTPConnection:
+        conn = getattr(self._tls, "conn", None)
+        if conn is None:
+            if self._is_https:
+                ctx = self.ssl_context or ssl.create_default_context()
+                conn = http.client.HTTPSConnection(self._host, self._port, timeout=self.timeout_sec, context=ctx)
+            else:
+                conn = http.client.HTTPConnection(self._host, self._port, timeout=self.timeout_sec)
+            with self._pool_lock:
+                self._pooled_conns.append(conn)
+            self._tls.conn = conn
+        return conn
+
+    def _reset_conn(self) -> None:
+        conn = getattr(self._tls, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._pool_lock:
+                if conn in self._pooled_conns:
+                    self._pooled_conns.remove(conn)
+            self._tls.conn = None
+
+    def close(self) -> None:
+        with self._pool_lock:
+            conns = list(self._pooled_conns)
+            self._pooled_conns.clear()
+        for c in conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+        self._tls.conn = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def plan(
         self,
@@ -118,22 +182,39 @@ class OpenAICompatibleLLMPlanner:
             ensure_ascii=False,
         ).encode("utf-8")
 
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "Connection": "keep-alive"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        url = f"{self.base_url}/chat/completions"
-        opener = (
-            urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            if ("127.0.0.1" in url or "localhost" in url)
-            else urllib.request.build_opener()
-        )
-        req = urllib.request.Request(url, data=req_body, method="POST", headers=headers)
         try:
-            with opener.open(req, timeout=self.timeout_sec) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
+            raw_resp = b""
+            for attempt in range(2):
+                conn = self._get_conn()
+                try:
+                    conn.request("POST", self._path, body=req_body, headers=headers)
+                    resp = conn.getresponse()
+                    raw_resp = resp.read()
+                    if resp.status >= 400:
+                        raise RuntimeError(f"LLM HTTP {resp.status}")
+                    break
+                except (
+                    http.client.RemoteDisconnected,
+                    http.client.CannotSendRequest,
+                    ConnectionResetError,
+                    BrokenPipeError,
+                ):
+                    self._reset_conn()
+                    if attempt == 1:
+                        raise
+                except Exception:
+                    self._reset_conn()
+                    raise
+
+            payload = json.loads(raw_resp.decode("utf-8"))
             content = payload["choices"][0]["message"]["content"]
-            parsed = json.loads(self._strip_markdown_fences(content))
+            parsed = parse_strict_json(self._strip_markdown_fences(content))
+            if not isinstance(parsed, dict):
+                return PlanDecision()
             return self._sanitize_llm_plan(parsed, cap_by_id, context)
         except Exception:
             if self.fallback_planner is not None:
@@ -163,6 +244,8 @@ class OpenAICompatibleLLMPlanner:
         validated_steps: List[QueueStep] = []
 
         if isinstance(raw_steps, list):
+            if len(raw_steps) > MAX_PLANNER_QUEUE_STEPS:
+                return PlanDecision()
             for s in raw_steps:
                 if not isinstance(s, dict):
                     return PlanDecision()
@@ -191,13 +274,32 @@ class OpenAICompatibleLLMPlanner:
                         if not isinstance(prop_spec, dict):
                             continue
                         ptype = prop_spec.get("type")
-                        if ptype == "string" and not isinstance(arg_v, str):
+                        if ptype == "string":
+                            if not isinstance(arg_v, str):
+                                return PlanDecision()
+                            enums = prop_spec.get("enum")
+                            if isinstance(enums, list) and arg_v not in enums:
+                                return PlanDecision()
+                        elif ptype == "boolean":
+                            if not isinstance(arg_v, bool):
+                                return PlanDecision()
+                        elif ptype == "integer":
+                            if isinstance(arg_v, bool) or not isinstance(arg_v, int):
+                                return PlanDecision()
+                            if "minimum" in prop_spec and arg_v < prop_spec["minimum"]:
+                                return PlanDecision()
+                            if "maximum" in prop_spec and arg_v > prop_spec["maximum"]:
+                                return PlanDecision()
+                        elif ptype == "number":
+                            if isinstance(arg_v, bool) or not isinstance(arg_v, (int, float)) or not math.isfinite(float(arg_v)):
+                                return PlanDecision()
+                            if "minimum" in prop_spec and float(arg_v) < float(prop_spec["minimum"]):
+                                return PlanDecision()
+                            if "maximum" in prop_spec and float(arg_v) > float(prop_spec["maximum"]):
+                                return PlanDecision()
+                        elif ptype == "array" and not isinstance(arg_v, list):
                             return PlanDecision()
-                        if ptype == "boolean" and not isinstance(arg_v, bool):
-                            return PlanDecision()
-                        if ptype == "integer" and (isinstance(arg_v, bool) or not isinstance(arg_v, int)):
-                            return PlanDecision()
-                        if ptype == "number" and (isinstance(arg_v, bool) or not isinstance(arg_v, (int, float))):
+                        elif ptype == "object" and not isinstance(arg_v, dict):
                             return PlanDecision()
 
                 step_readiness = grant.readiness

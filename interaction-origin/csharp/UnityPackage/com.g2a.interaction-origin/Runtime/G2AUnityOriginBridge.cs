@@ -126,13 +126,23 @@ namespace G2A.InteractionOrigin.Unity
         private void RegisterSpatialCapabilities()
         {
             if (_sdk == null) return;
+            var targetIdSchema = new Dictionary<string, object?>
+            {
+                ["type"] = "object",
+                ["required"] = new[] { "target_id" },
+                ["properties"] = new Dictionary<string, object?>
+                {
+                    ["target_id"] = new Dictionary<string, object?> { ["type"] = "string" }
+                }
+            };
+
             _sdk.RegisterCapability(
                 new CapabilityEntry(
                     MethodId: "#01",
                     Name: "move_to",
                     Description: "Navigate companion toward a visible scene target.",
                     PermittedActors: new List<string> { "companion" },
-                    ParamsSchema: new Dictionary<string, object?> { ["target_id"] = "string" },
+                    ParamsSchema: targetIdSchema,
                     Sustained: true,
                     RiskFlags: new List<string>(),
                     DefaultPolicy: "allow"
@@ -160,7 +170,7 @@ namespace G2A.InteractionOrigin.Unity
                     Name: "interact",
                     Description: "Interact with an in-range visible prop without locking player input.",
                     PermittedActors: new List<string> { "companion" },
-                    ParamsSchema: new Dictionary<string, object?> { ["target_id"] = "string" },
+                    ParamsSchema: targetIdSchema,
                     Sustained: false,
                     RiskFlags: new List<string>(),
                     DefaultPolicy: "allow"
@@ -181,9 +191,9 @@ namespace G2A.InteractionOrigin.Unity
 
         private G2ASpatialInteractable? FindVisibleProp(string targetId)
         {
-            foreach (var p in FindObjectsByType<G2ASpatialInteractable>(FindObjectsSortMode.None))
+            foreach (var p in G2ASpatialInteractable.ActiveInstances)
             {
-                if (!p.isHiddenSecret && p.targetId == targetId) return p;
+                if (p != null && !p.isHiddenSecret && p.targetId == targetId) return p;
             }
             return null;
         }
@@ -193,9 +203,9 @@ namespace G2A.InteractionOrigin.Unity
             var visible = new List<Dictionary<string, object?>>();
             if (companionTransform != null)
             {
-                foreach (var p in FindObjectsByType<G2ASpatialInteractable>(FindObjectsSortMode.None))
+                foreach (var p in G2ASpatialInteractable.ActiveInstances)
                 {
-                    if (p.isHiddenSecret) continue;
+                    if (p == null || p.isHiddenSecret) continue;
                     float dist = Vector3.Distance(companionTransform.position, p.transform.position);
                     if (dist <= perceptionRadius)
                     {
@@ -222,13 +232,14 @@ namespace G2A.InteractionOrigin.Unity
             var interactTargets = new List<TargetCandidate>();
             if (companionTransform != null)
             {
-                foreach (var p in FindObjectsByType<G2ASpatialInteractable>(FindObjectsSortMode.None))
+                foreach (var p in G2ASpatialInteractable.ActiveInstances)
                 {
-                    if (p.isHiddenSecret || p.isOpened) continue;
+                    if (p == null || p.isHiddenSecret || p.isOpened) continue;
                     float dist = Vector3.Distance(companionTransform.position, p.transform.position);
                     if (dist > perceptionRadius) continue;
                     string? pAnchor = string.IsNullOrEmpty(p.currentPlayerAnchor) ? null : p.currentPlayerAnchor;
-                    moveTargets.Add(new TargetCandidate(p.targetId, p.displayLabel, "ready", null, $"{dist:F1}m", pAnchor));
+                    string? alert = string.IsNullOrEmpty(p.alertTag) ? null : p.alertTag;
+                    moveTargets.Add(new TargetCandidate(p.targetId, p.displayLabel, "ready", null, $"{dist:F1}m", pAnchor, alert));
                     bool inRange = dist <= p.interactRadius;
                     interactTargets.Add(new TargetCandidate(
                         p.targetId,
@@ -236,7 +247,8 @@ namespace G2A.InteractionOrigin.Unity
                         inRange ? "ready" : "staged",
                         inRange ? null : "move_within_interact_range",
                         $"{dist:F1}m",
-                        pAnchor
+                        pAnchor,
+                        alert
                     ));
                 }
             }

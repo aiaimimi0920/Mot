@@ -10,6 +10,13 @@ namespace G2A.InteractionOrigin.Unity
     /// </summary>
     public sealed class G2ASpatialInteractable : MonoBehaviour
     {
+        private static readonly HashSet<G2ASpatialInteractable> _activeInstances = new();
+
+        /// <summary>
+        /// Zero-hierarchy-scan registry of enabled scene interactables, avoiding per-tick FindObjectsByType overhead.
+        /// </summary>
+        public static IReadOnlyCollection<G2ASpatialInteractable> ActiveInstances => _activeInstances;
+
         [Tooltip("Stable semantic identifier sent in active_methods (never expose raw memory addresses).")]
         public string targetId = "chest_01";
 
@@ -25,9 +32,16 @@ namespace G2A.InteractionOrigin.Unity
         [Tooltip("Optional player anchor hint (e.g., pointed_right) when highlighted by player camera ray.")]
         public string currentPlayerAnchor = "";
 
+        [Tooltip("Optional operational alert tag (e.g., halted_no_material) prioritized in dense scenes.")]
+        public string alertTag = "";
+
         public bool isOpened = false;
 
         public UnityEvent<string>? onInteractedByActor;
+
+        private void OnEnable() => _activeInstances.Add(this);
+
+        private void OnDisable() => _activeInstances.Remove(this);
 
         public Dictionary<string, object?> TriggerInteract(string actor)
         {

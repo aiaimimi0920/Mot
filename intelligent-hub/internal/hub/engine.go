@@ -165,13 +165,20 @@ func (b *EventStreamHub) PushEvent(sessionID, eventName string, payload any) {
 	defer b.mu.Unlock()
 	if _, tracked := b.history[sessionID]; !tracked {
 		b.historyOrder = append(b.historyOrder, sessionID)
-		if len(b.historyOrder) > 256 {
+		guard := len(b.historyOrder)
+		for len(b.history) >= 256 && guard > 0 {
+			guard--
 			evict := b.historyOrder[0]
-			b.historyOrder = append([]string(nil), b.historyOrder[1:]...)
-			if len(b.subscribers[evict]) == 0 {
-				delete(b.history, evict)
-				delete(b.subscribers, evict)
+			b.historyOrder = b.historyOrder[1:]
+			if evict == sessionID || len(b.subscribers[evict]) > 0 {
+				b.historyOrder = append(b.historyOrder, evict)
+				continue
 			}
+			delete(b.history, evict)
+			delete(b.subscribers, evict)
+		}
+		if cap(b.historyOrder) > 1024 && len(b.historyOrder) <= 300 {
+			b.historyOrder = append([]string(nil), b.historyOrder...)
 		}
 	}
 	hist := append(b.history[sessionID], ev)
@@ -1506,8 +1513,12 @@ func (e *Engine) dispatchQueueSteps(sessionID, queueID string) (model.QueueRecei
 }
 
 func (e *Engine) recordStepOutcome(sessionID, queueID string, stepIdx int, rep model.OriginExecuteReply) {
-	_, _ = store.Atomic(e.persistence, func(d *store.HubStoreData) (struct{}, *model.G2AError) {
-		rec := d.Queues[store.QueueKey(sessionID, queueID)]
+	// Volatile in-memory step update coalesced by PersistencePort; terminal queue state is persisted atomically in finalize/abort.
+	_, _ = store.MutateVolatile(e.persistence, func(d *store.HubStoreData) (struct{}, *model.G2AError) {
+		rec, ok := d.Queues[store.QueueKey(sessionID, queueID)]
+		if !ok {
+			return struct{}{}, nil
+		}
 		rec.CurrentExecutionID = nil
 		rec.StepReceipts[stepIdx].State = rep.State
 		rec.StepReceipts[stepIdx].EffectSummary = rep.EffectSummary

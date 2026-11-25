@@ -157,6 +157,17 @@ func report_emergency_stop() -> void:
 		"kind": "emergency_stop",
 	})
 
+func report_queue_approval(session_id: String, queue_id: String, queue_digest: String, fingerprint: String, approved: bool) -> void:
+	_post_to_hub("origin.player_event", {
+		"slot_id": slot_id,
+		"kind": "queue_approval",
+		"session_id": session_id,
+		"queue_id": queue_id,
+		"queue_digest": queue_digest,
+		"fingerprint": fingerprint,
+		"approved": approved,
+	})
+
 func flush_dirty_sync(significant_event: bool = false) -> bool:
 	if not sync_enabled and _pending_settled.is_empty():
 		return false
@@ -262,6 +273,9 @@ func handle_origin_execute(req: Dictionary) -> Dictionary:
 	var reg: Dictionary = _capabilities.get(method_id, {})
 	if reg.is_empty() or not _actors.has(actor):
 		return {"execution_id": exec_id, "state": "failed", "failure_reason": "invalid_method_or_actor"}
+	var permitted: Array = reg["def"].get("permitted_actors", [])
+	if not permitted.has(actor):
+		return {"execution_id": exec_id, "state": "failed", "failure_reason": "permission_denied"}
 
 	var outcome: Dictionary = reg["effect_handler"].call(actor, _actors[actor], req.get("args", {}), exec_id)
 	var state: String = outcome.get("state", "succeeded")
@@ -312,6 +326,72 @@ func cancel_in_flight_step(execution_id: String) -> Dictionary:
 		return rep
 	return _execution_ledger.get(execution_id, {"execution_id": execution_id, "state": "cancelled"})
 
+static func _parse_anchor_meters(anchor: Variant) -> float:
+	var s := str(anchor).strip_edges()
+	if not s.ends_with("m"):
+		return 1e9
+	var core := s.substr(0, s.length() - 1)
+	var sp := core.rfind(" ")
+	if sp >= 0:
+		core = core.substr(sp + 1)
+	return float(core) if core.is_valid_float() else 1e9
+
+static func _prioritize_targets(raw_targets: Array) -> Array:
+	var dedup := {}
+	for t in raw_targets:
+		var tid := str(t.get("target_id", ""))
+		if not dedup.has(tid) or str(t.get("readiness", "")) == "ready":
+			dedup[tid] = t
+	var ordered: Array = dedup.values()
+	ordered.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		var a_alert := 0 if str(a.get("alert_tag", "")) != "" else 1
+		var b_alert := 0 if str(b.get("alert_tag", "")) != "" else 1
+		if a_alert != b_alert:
+			return a_alert < b_alert
+		var a_pt := 0 if str(a.get("player_anchor", "")).to_lower().find("pointed") >= 0 else 1
+		var b_pt := 0 if str(b.get("player_anchor", "")).to_lower().find("pointed") >= 0 else 1
+		if a_pt != b_pt:
+			return a_pt < b_pt
+		var a_rdy := 0 if str(a.get("readiness", "")) == "ready" else 1
+		var b_rdy := 0 if str(b.get("readiness", "")) == "ready" else 1
+		if a_rdy != b_rdy:
+			return a_rdy < b_rdy
+		var d_diff := _parse_anchor_meters(a.get("actor_anchor", "")) - _parse_anchor_meters(b.get("actor_anchor", ""))
+		if abs(d_diff) > 0.001:
+			return d_diff < 0.0
+		return str(a.get("target_id", "")) < str(b.get("target_id", ""))
+	)
+	return ordered.slice(0, MAX_CANDIDATE_TARGETS) if ordered.size() > MAX_CANDIDATE_TARGETS else ordered
+
+static func _merge_grant(grants: Dictionary, incoming: Dictionary) -> void:
+	var key := "%s|%s" % [incoming["method_id"], incoming["actor"]]
+	var inc_targets: Array = incoming.get("targets", [])
+	if grants.has(key):
+		var prev: Dictionary = grants[key]
+		var combined: Array = prev.get("targets", []) + inc_targets
+		var merged_targets := _prioritize_targets(combined)
+		var overall := "staged"
+		if prev.get("readiness", "") == "ready" or incoming.get("readiness", "") == "ready":
+			overall = "ready"
+		else:
+			for t in merged_targets:
+				if str(t.get("readiness", "")) == "ready":
+					overall = "ready"
+					break
+		grants[key] = {
+			"method_id": incoming["method_id"],
+			"actor": incoming["actor"],
+			"readiness": overall,
+			"targets": merged_targets,
+		}
+	else:
+		grants[key] = {
+			"method_id": incoming["method_id"],
+			"actor": incoming["actor"],
+			"readiness": incoming.get("readiness", "ready"),
+			"targets": _prioritize_targets(inc_targets),
+		}
+
 func _collect_current_view() -> Dictionary:
 	var brief := {}
 	var grants := {}
@@ -319,8 +399,7 @@ func _collect_current_view() -> Dictionary:
 		var mod: Dictionary = _signal_modules[mod_name]
 		brief[mod_name] = mod["snapshot_fn"].call()
 		for g in mod["active_methods_fn"].call():
-			var key := "%s|%s" % [g["method_id"], g["actor"]]
-			grants[key] = g
+			_merge_grant(grants, g)
 	return {"brief": brief, "grants": grants}
 
 func _post_to_hub(operation: String, payload: Dictionary) -> void:

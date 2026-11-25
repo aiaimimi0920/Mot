@@ -7,7 +7,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 from .jcs import parse_strict_json
 from .memory import MemoryBundleV1, MemoryRecord, MemoryService
@@ -61,6 +61,8 @@ class MemoryHTTPServer:
         srv_ref = self
 
         class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def log_message(self, fmt: str, *args: Any) -> None:
                 return
 
@@ -105,11 +107,12 @@ class MemoryHTTPServer:
                 if not pid:
                     self._send_json(401, {"error": "unauthenticated"})
                     return
-                if self.path == "/g2a/v1/memory/export":
+                clean_path = urlparse(self.path).path
+                if clean_path == "/g2a/v1/memory/export":
                     bundle = srv_ref.service.export_bundle(pid)
                     self._send_json(200, bundle.to_dict())
                     return
-                if self.path == "/g2a/v1/memory/records":
+                if clean_path == "/g2a/v1/memory/records":
                     recs = [r.to_dict() for r in srv_ref.store.list_records(pid)]
                     self._send_json(200, {"records": recs})
                     return
@@ -123,8 +126,9 @@ class MemoryHTTPServer:
                 body = self._read_strict_body()
                 if body is None:
                     return
+                clean_path = urlparse(self.path).path
 
-                if self.path == "/g2a/v1/memory/import":
+                if clean_path == "/g2a/v1/memory/import":
                     try:
                         bundle = MemoryBundleV1.from_dict(body["bundle"])
                         selected = body.get("selected_ids") or [r.memory_id for r in bundle.records]
@@ -139,7 +143,7 @@ class MemoryHTTPServer:
                     })
                     return
 
-                if self.path == "/g2a/v1/memory/records":
+                if clean_path == "/g2a/v1/memory/records":
                     if "content" not in body:
                         self._send_json(400, {"error": "invalid_arguments", "message": "Missing content"})
                         return
@@ -165,8 +169,9 @@ class MemoryHTTPServer:
                 if not pid:
                     self._send_json(401, {"error": "unauthenticated"})
                     return
-                if self.path.startswith("/g2a/v1/memory/records/"):
-                    mid = unquote(self.path.rsplit("/", 1)[-1])
+                clean_path = urlparse(self.path).path
+                if clean_path.startswith("/g2a/v1/memory/records/"):
+                    mid = unquote(clean_path.rsplit("/", 1)[-1])
                     body = self._read_strict_body()
                     if body is None:
                         return
@@ -184,8 +189,9 @@ class MemoryHTTPServer:
                 if not pid:
                     self._send_json(401, {"error": "unauthenticated"})
                     return
-                if self.path.startswith("/g2a/v1/memory/records/"):
-                    mid = unquote(self.path.rsplit("/", 1)[-1])
+                clean_path = urlparse(self.path).path
+                if clean_path.startswith("/g2a/v1/memory/records/"):
+                    mid = unquote(clean_path.rsplit("/", 1)[-1])
                     ok = srv_ref.store.delete_player_record(pid, mid)
                     self._send_json(200 if ok else 404, {"deleted": ok})
                     return
@@ -193,10 +199,11 @@ class MemoryHTTPServer:
 
             def _send_json(self, status: int, obj: Any) -> None:
                 out = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                want_close = self.headers.get("Connection", "").strip().lower() == "close"
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(out)))
-                self.send_header("Connection", "close")
+                self.send_header("Connection", "close" if want_close else "keep-alive")
                 self.end_headers()
                 self.wfile.write(out)
 

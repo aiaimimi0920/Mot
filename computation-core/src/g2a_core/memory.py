@@ -220,37 +220,47 @@ class MemoryService:
             raise PermissionError("Player authentication required")
         selected = set(selected_ids)
         statuses: Dict[str, str] = {}
+        staged_records: List[MemoryRecord] = []
         now_ms = int(time.time() * 1000)
         for rec in bundle.records:
             if rec.memory_id not in selected:
                 continue
             narrowed_scope = min_disclosure(rec.max_disclosure_scope, self.platform_ceiling)
             transformed = narrowed_scope != rec.max_disclosure_scope
-            imported_copy = MemoryRecord(
-                memory_id=rec.memory_id,
-                created_at_ms=rec.created_at_ms,
-                imported_at_ms=now_ms,
-                epistemic_source=rec.epistemic_source,
-                game_origin_id=rec.game_origin_id,
-                timeline_tag=rec.timeline_tag,
-                pinned_by_player=rec.pinned_by_player,
-                max_disclosure_scope=narrowed_scope,
-                content=rec.content,
-                observed_epoch=rec.observed_epoch,
+            staged_records.append(
+                MemoryRecord(
+                    memory_id=rec.memory_id,
+                    created_at_ms=rec.created_at_ms,
+                    imported_at_ms=now_ms,
+                    epistemic_source=rec.epistemic_source,
+                    game_origin_id=rec.game_origin_id,
+                    timeline_tag=rec.timeline_tag,
+                    pinned_by_player=rec.pinned_by_player,
+                    max_disclosure_scope=narrowed_scope,
+                    content=rec.content,
+                    observed_epoch=rec.observed_epoch,
+                )
             )
-            self.store.upsert_preserving_pins(verified_player_id, imported_copy)
             statuses[rec.memory_id] = "transformed" if transformed else "imported"
 
         applied: List[str] = []
         unsupported: List[str] = []
-        persona_bucket = self.store._persona.setdefault(verified_player_id, {})
+        applied_persona: Dict[str, Any] = {}
         for k, v in bundle.persona_settings.items():
             if k in self.store.supported_persona_keys:
-                persona_bucket[k] = v
+                applied_persona[k] = v
                 applied.append(k)
             else:
                 unsupported.append(k)
-        self.store._autonomy.setdefault(verified_player_id, {}).update(bundle.autonomy_preferences)
+
+        batch_fn = getattr(self.store, "batch_import_records_and_settings", None)
+        if callable(batch_fn):
+            batch_fn(verified_player_id, staged_records, applied_persona, dict(bundle.autonomy_preferences))
+        else:
+            for imp_rec in staged_records:
+                self.store.upsert_preserving_pins(verified_player_id, imp_rec)
+            self.store._persona.setdefault(verified_player_id, {}).update(applied_persona)
+            self.store._autonomy.setdefault(verified_player_id, {}).update(bundle.autonomy_preferences)
         return ImportReceiptV1(
             record_statuses=statuses,
             applied_settings=applied,
