@@ -130,3 +130,43 @@ func BenchmarkDigestSHA256ConfirmVector(b *testing.B) {
 		}
 	}
 }
+
+func TestValidateStrictJSONBytesSecurityAndEdgeCases(t *testing.T) {
+	validEnv := []byte(`{"g2a_version":"0.0.1","request_id":"req-1","timestamp_ms":1700000000,"operation":"origin.sync","payload":{"slot_id":"s1","rev":4,"emoji":"\uD83D\uDE00"},"extensions":{}}`)
+	if err := jcs.ValidateStrictJSONBytes(validEnv); err != nil {
+		t.Fatalf("expected valid envelope to pass, got %v", err)
+	}
+
+	// Escaped vs unescaped duplicate key smuggling ("\u0061" == "a") MUST be rejected!
+	if err := jcs.ValidateStrictJSONBytes([]byte(`{"\u0061":1,"a":2}`)); !errors.Is(err, jcs.ErrDuplicateKey) {
+		t.Fatalf("expected escaped duplicate key rejection, got %v", err)
+	}
+	// Large >12-key object duplicate check
+	if err := jcs.ValidateStrictJSONBytes([]byte(`{"k0":0,"k1":1,"k2":2,"k3":3,"k4":4,"k5":5,"k6":6,"k7":7,"k8":8,"k9":9,"k10":10,"k11":11,"k12":12,"k3":99}`)); !errors.Is(err, jcs.ErrDuplicateKey) {
+		t.Fatalf("expected >12-key duplicate rejection, got %v", err)
+	}
+	// Lone high surrogate, lone low surrogate, leading zero, & trailing token MUST fail
+	for _, bad := range []string{
+		`{"bad":"\uD83D"}`,
+		`{"bad":"\uDE00"}`,
+		`{"bad":"\uD83D\u0041"}`,
+		`{"bad":01}`,
+		`{"bad":"raw` + "\x01" + `ctrl"}`,
+		`{"ok":1} trailing`,
+	} {
+		if err := jcs.ValidateStrictJSONBytes([]byte(bad)); err == nil {
+			t.Fatalf("expected %q to fail strict validation", bad)
+		}
+	}
+}
+
+func BenchmarkValidateStrictJSONBytesEnvelope(b *testing.B) {
+	raw := []byte(`{"g2a_version":"0.0.1","request_id":"req-60hz","timestamp_ms":1700000000,"operation":"origin.sync","payload":{"slot_id":"slot-1","epoch":1,"rev":42,"base_rev":41,"mode":"delta","significant_event":false,"state_brief":{"hp":100,"gold":250},"upserted_methods":[],"removed_methods":[],"settled_executions":[]},"extensions":{}}`)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := jcs.ValidateStrictJSONBytes(raw); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

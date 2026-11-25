@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -15,16 +16,23 @@
 
 namespace g2a {
 
+struct JsonNull {
+    uint64_t pad_ = 0;
+    constexpr bool operator==(const JsonNull&) const noexcept { return true; }
+    constexpr bool operator!=(const JsonNull&) const noexcept { return false; }
+};
+
 struct JsonValue;
 using JsonArray = std::vector<JsonValue>;
 using JsonObject = std::map<std::string, JsonValue>;
 
 struct JsonValue {
-    using Storage = std::variant<std::nullptr_t, bool, int64_t, double, std::string, JsonArray, JsonObject>;
+    using Storage = std::variant<JsonNull, bool, int64_t, double, std::string, JsonArray, JsonObject>;
     Storage data;
 
-    JsonValue() : data(nullptr) {}
-    JsonValue(std::nullptr_t) : data(nullptr) {}
+    JsonValue() : data(JsonNull{}) {}
+    JsonValue(std::nullptr_t) : data(JsonNull{}) {}
+    JsonValue(JsonNull n) : data(n) {}
     JsonValue(bool b) : data(b) {}
     JsonValue(int i) : data(static_cast<int64_t>(i)) {}
     JsonValue(int64_t i) : data(i) {}
@@ -37,6 +45,8 @@ struct JsonValue {
     JsonValue(std::string s) : data(std::move(s)) {}
     JsonValue(JsonArray a) : data(std::move(a)) {}
     JsonValue(JsonObject o) : data(std::move(o)) {}
+
+    bool is_null() const noexcept { return std::holds_alternative<JsonNull>(data); }
 };
 
 namespace jcs {
@@ -98,8 +108,63 @@ inline std::string format_rfc8785_double(double f) {
     return mant + "e" + (exp_val >= 0 ? "+" : "") + std::to_string(exp_val);
 }
 
+inline bool is_ascii_str(const std::string& s) {
+    for (unsigned char c : s) {
+        if (c >= 0x80) return false;
+    }
+    return true;
+}
+
+inline std::vector<uint16_t> utf8_to_utf16_units(const std::string& s) {
+    std::vector<uint16_t> out;
+    out.reserve(s.size());
+    size_t i = 0;
+    const size_t n = s.size();
+    while (i < n) {
+        unsigned char b0 = static_cast<unsigned char>(s[i]);
+        uint32_t cp = 0;
+        if (b0 < 0x80) {
+            cp = b0;
+            i += 1;
+        } else if ((b0 & 0xE0) == 0xC0 && i + 1 < n) {
+            cp = ((b0 & 0x1F) << 6) | (static_cast<unsigned char>(s[i + 1]) & 0x3F);
+            i += 2;
+        } else if ((b0 & 0xF0) == 0xE0 && i + 2 < n) {
+            cp = ((b0 & 0x0F) << 12) |
+                 ((static_cast<unsigned char>(s[i + 1]) & 0x3F) << 6) |
+                 (static_cast<unsigned char>(s[i + 2]) & 0x3F);
+            i += 3;
+        } else if ((b0 & 0xF8) == 0xF0 && i + 3 < n) {
+            cp = ((b0 & 0x07) << 18) |
+                 ((static_cast<unsigned char>(s[i + 1]) & 0x3F) << 12) |
+                 ((static_cast<unsigned char>(s[i + 2]) & 0x3F) << 6) |
+                 (static_cast<unsigned char>(s[i + 3]) & 0x3F);
+            i += 4;
+        } else {
+            throw std::invalid_argument("Invalid UTF-8 sequence in JCS key");
+        }
+        if (cp <= 0xFFFF) {
+            out.push_back(static_cast<uint16_t>(cp));
+        } else {
+            uint32_t adj = cp - 0x10000;
+            out.push_back(static_cast<uint16_t>(0xD800 + (adj >> 10)));
+            out.push_back(static_cast<uint16_t>(0xDC00 + (adj & 0x3FF)));
+        }
+    }
+    return out;
+}
+
+inline bool less_utf16_jcs_key(const std::string& a, const std::string& b) {
+    if (is_ascii_str(a) && is_ascii_str(b)) {
+        return a < b;
+    }
+    auto ua = utf8_to_utf16_units(a);
+    auto ub = utf8_to_utf16_units(b);
+    return std::lexicographical_compare(ua.begin(), ua.end(), ub.begin(), ub.end());
+}
+
 inline void append_canonical(std::string& out, const JsonValue& v) {
-    if (std::holds_alternative<std::nullptr_t>(v.data)) {
+    if (v.is_null()) {
         out += "null";
     } else if (const auto* b = std::get_if<bool>(&v.data)) {
         out += (*b ? "true" : "false");
@@ -117,15 +182,36 @@ inline void append_canonical(std::string& out, const JsonValue& v) {
         }
         out.push_back(']');
     } else if (const auto* obj = std::get_if<JsonObject>(&v.data)) {
-        // std::map orders keys lexicographically by UTF-8 bytes (identical to UTF-16 code units across BMP/ASCII keys).
+        bool all_ascii = true;
+        for (const auto& [k, _] : *obj) {
+            if (!is_ascii_str(k)) {
+                all_ascii = false;
+                break;
+            }
+        }
         out.push_back('{');
-        bool first = true;
-        for (const auto& [k, child] : *obj) {
-            if (!first) out.push_back(',');
-            first = false;
-            append_escaped_string(out, k);
-            out.push_back(':');
-            append_canonical(out, child);
+        if (all_ascii) {
+            bool first = true;
+            for (const auto& [k, child] : *obj) {
+                if (!first) out.push_back(',');
+                first = false;
+                append_escaped_string(out, k);
+                out.push_back(':');
+                append_canonical(out, child);
+            }
+        } else {
+            std::vector<const JsonObject::value_type*> entries;
+            entries.reserve(obj->size());
+            for (const auto& kv : *obj) entries.push_back(&kv);
+            std::sort(entries.begin(), entries.end(), [](const auto* lhs, const auto* rhs) {
+                return less_utf16_jcs_key(lhs->first, rhs->first);
+            });
+            for (size_t idx = 0; idx < entries.size(); ++idx) {
+                if (idx > 0) out.push_back(',');
+                append_escaped_string(out, entries[idx]->first);
+                out.push_back(':');
+                append_canonical(out, entries[idx]->second);
+            }
         }
         out.push_back('}');
     }
@@ -224,28 +310,21 @@ private:
                     case 'r': out.push_back('\r'); break;
                     case 't': out.push_back('\t'); break;
                     case 'u': {
-                        unsigned int code = 0;
-                        for (int i = 0; i < 4; ++i) {
-                            char h = get();
-                            code <<= 4;
-                            if (h >= '0' && h <= '9') code |= static_cast<unsigned int>(h - '0');
-                            else if (h >= 'a' && h <= 'f') code |= static_cast<unsigned int>(h - 'a' + 10);
-                            else if (h >= 'A' && h <= 'F') code |= static_cast<unsigned int>(h - 'A' + 10);
-                            else throw std::invalid_argument("Invalid \\uXXXX hex escape");
+                        uint32_t code = read_hex4();
+                        if (code >= 0xDC00 && code <= 0xDFFF) {
+                            throw std::invalid_argument("Lone low UTF-16 surrogate forbidden in I-JSON");
                         }
-                        if (code >= 0xD800 && code <= 0xDFFF) {
-                            throw std::invalid_argument("Lone UTF-16 surrogate forbidden in I-JSON");
+                        if (code >= 0xD800 && code <= 0xDBFF) {
+                            if (get() != '\\' || get() != 'u') {
+                                throw std::invalid_argument("Lone high UTF-16 surrogate forbidden in I-JSON");
+                            }
+                            uint32_t low = read_hex4();
+                            if (low < 0xDC00 || low > 0xDFFF) {
+                                throw std::invalid_argument("Invalid low UTF-16 surrogate in pair");
+                            }
+                            code = 0x10000u + (((code - 0xD800u) << 10) | (low - 0xDC00u));
                         }
-                        if (code <= 0x7F) {
-                            out.push_back(static_cast<char>(code));
-                        } else if (code <= 0x7FF) {
-                            out.push_back(static_cast<char>(0xC0 | (code >> 6)));
-                            out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
-                        } else {
-                            out.push_back(static_cast<char>(0xE0 | (code >> 12)));
-                            out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
-                            out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
-                        }
+                        append_utf8_codepoint(out, code);
                         break;
                     }
                     default:
@@ -257,6 +336,37 @@ private:
         }
     }
 
+    uint32_t read_hex4() {
+        uint32_t code = 0;
+        for (int i = 0; i < 4; ++i) {
+            char h = get();
+            code <<= 4;
+            if (h >= '0' && h <= '9') code |= static_cast<uint32_t>(h - '0');
+            else if (h >= 'a' && h <= 'f') code |= static_cast<uint32_t>(h - 'a' + 10);
+            else if (h >= 'A' && h <= 'F') code |= static_cast<uint32_t>(h - 'A' + 10);
+            else throw std::invalid_argument("Invalid \\uXXXX hex escape");
+        }
+        return code;
+    }
+
+    static void append_utf8_codepoint(std::string& out, uint32_t code) {
+        if (code <= 0x7F) {
+            out.push_back(static_cast<char>(code));
+        } else if (code <= 0x7FF) {
+            out.push_back(static_cast<char>(0xC0 | (code >> 6)));
+            out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+        } else if (code <= 0xFFFF) {
+            out.push_back(static_cast<char>(0xE0 | (code >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xF0 | (code >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((code >> 12) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+        }
+    }
+
     JsonValue parse_number() {
         size_t start = pos_;
         if (s_[pos_] == '-') ++pos_;
@@ -265,6 +375,9 @@ private:
         }
         if (s_[pos_] == '0') {
             ++pos_;
+            if (pos_ < s_.size() && std::isdigit(static_cast<unsigned char>(s_[pos_]))) {
+                throw std::invalid_argument("Leading zero forbidden in strict JSON number");
+            }
         } else {
             while (pos_ < s_.size() && std::isdigit(static_cast<unsigned char>(s_[pos_]))) ++pos_;
         }

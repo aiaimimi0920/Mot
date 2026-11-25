@@ -166,7 +166,7 @@ func NewOriginHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
 			writeReplyError(w, "", nil, model.NewError(model.ErrInvalidRequest, 400, "Failed reading reply body"))
 			return
 		}
-		if _, errStrict := jcs.ParseStrictJSON(raw); errStrict != nil {
+		if errStrict := jcs.ValidateStrictJSONBytes(raw); errStrict != nil {
 			writeReplyError(w, "", nil, model.NewError(model.ErrInvalidRequest, 400, errStrict.Error()))
 			return
 		}
@@ -773,7 +773,7 @@ func decodeStrictRequestEnvelope(r *http.Request) (model.RequestEnvelope, *model
 	if err != nil {
 		return env, model.NewError(model.ErrInvalidRequest, 400, "Failed reading request body")
 	}
-	if _, errStrict := jcs.ParseStrictJSON(raw); errStrict != nil {
+	if errStrict := jcs.ValidateStrictJSONBytes(raw); errStrict != nil {
 		return env, model.NewError(model.ErrInvalidRequest, 400, errStrict.Error())
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {

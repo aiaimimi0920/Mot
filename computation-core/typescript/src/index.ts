@@ -115,7 +115,14 @@ export function validateOutboundUrlAgainstSsrf(url: string, allowLoopback = fals
   }
   const host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
   const normalized = host.startsWith("::ffff:") ? host.slice(7) : host;
-  const isLoopback = normalized === "127.0.0.1" || normalized === "localhost" || normalized === "::1" || normalized.startsWith("127.");
+  const isLoopback =
+    normalized === "127.0.0.1" ||
+    normalized === "localhost" ||
+    normalized === "::1" ||
+    normalized.startsWith("127.") ||
+    normalized.startsWith("2002:7f") ||
+    normalized.startsWith("64:ff9b::7f") ||
+    normalized.startsWith("64:ff9b::127.");
   if (isLoopback) {
     if (!allowLoopback) {
       throw new G2ACoreError("permission_denied", 403, "Loopback Hub address blocked by remote SSRF policy");
@@ -125,17 +132,26 @@ export function validateOutboundUrlAgainstSsrf(url: string, allowLoopback = fals
     }
     return;
   }
-  const isPrivateOrLinkLocal =
+  const isNonGlobalOrTunnel =
+    normalized === "::" ||
     normalized === "0.0.0.0" ||
+    normalized.startsWith("0.") ||
     normalized.startsWith("10.") ||
     normalized.startsWith("192.168.") ||
     normalized.startsWith("169.254.") ||
     normalized.startsWith("fe80:") ||
     normalized.startsWith("fc") ||
     normalized.startsWith("fd") ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(normalized);
-  if (isPrivateOrLinkLocal) {
-    throw new G2ACoreError("permission_denied", 403, `Private or link-local host ${host} blocked by SSRF guard`);
+    normalized.startsWith("64:ff9b:") ||
+    normalized.startsWith("2002:") ||
+    normalized.startsWith("2001:db8:") ||
+    normalized.startsWith("2001:0:") ||
+    normalized.startsWith("2001::") ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(normalized) ||
+    /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(normalized) ||
+    /^198\.1[89]\./.test(normalized);
+  if (isNonGlobalOrTunnel) {
+    throw new G2ACoreError("permission_denied", 403, `Non-global or transition-tunnel host ${host} blocked by SSRF guard`);
   }
   if (parsed.protocol !== "https:") {
     throw new G2ACoreError("invalid_arguments", 400, "Remote Hub endpoints MUST use https:// (TLS 1.3)");

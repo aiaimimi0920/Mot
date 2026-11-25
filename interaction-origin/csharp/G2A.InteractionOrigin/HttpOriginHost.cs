@@ -170,8 +170,7 @@ public sealed class LoopbackExecuteListener : IDisposable
                 string reqId = "";
                 try
                 {
-                    string rawJson = Encoding.UTF8.GetString(bodyBytes);
-                    using var doc = JcsDigest.ParseStrictDocument(rawJson);
+                    using var doc = JcsDigest.ParseStrictDocument(bodyBytes.AsMemory());
                     var root = doc.RootElement;
                     reqId = root.TryGetProperty("request_id", out var ridEl) ? ridEl.GetString() ?? "" : "";
                     string op = root.TryGetProperty("operation", out var opEl) ? opEl.GetString() ?? "" : "";

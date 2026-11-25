@@ -40,8 +40,13 @@ public static class JcsDigest
     public static JsonDocument ParseStrictDocument(string rawJson)
     {
         byte[] utf8 = Encoding.UTF8.GetBytes(rawJson);
-        ValidateNoDuplicateKeysOrNonFinite(utf8);
-        return JsonDocument.Parse(utf8, new JsonDocumentOptions
+        return ParseStrictDocument(utf8.AsMemory());
+    }
+
+    public static JsonDocument ParseStrictDocument(ReadOnlyMemory<byte> utf8Bytes)
+    {
+        ValidateNoDuplicateKeysOrNonFinite(utf8Bytes.Span);
+        return JsonDocument.Parse(utf8Bytes, new JsonDocumentOptions
         {
             AllowTrailingCommas = false,
             CommentHandling = JsonCommentHandling.Disallow

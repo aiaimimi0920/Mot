@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from json.encoder import encode_basestring as _c_encode_jcs_string
 import math
 from typing import Any, List, Tuple
 
@@ -59,32 +60,6 @@ def _utf16_sort_key(s: str) -> bytes:
     return s.encode("utf-16-be")
 
 
-def _escape_jcs_string(s: str) -> str:
-    out = ['"']
-    for ch in s:
-        code = ord(ch)
-        if ch == '"':
-            out.append('\\"')
-        elif ch == "\\":
-            out.append("\\\\")
-        elif ch == "\b":
-            out.append("\\b")
-        elif ch == "\f":
-            out.append("\\f")
-        elif ch == "\n":
-            out.append("\\n")
-        elif ch == "\r":
-            out.append("\\r")
-        elif ch == "\t":
-            out.append("\\t")
-        elif code <= 0x1F:
-            out.append(f"\\u{code:04x}")
-        else:
-            out.append(ch)
-    out.append('"')
-    return "".join(out)
-
-
 def _format_jcs_float(f: float) -> str:
     if math.isnan(f) or math.isinf(f):
         raise G2AError("invalid_request", 400, "Non-finite float is forbidden")
@@ -99,7 +74,6 @@ def _format_jcs_float(f: float) -> str:
             if "." in s:
                 s = s.rstrip("0").rstrip(".")
             return s
-        # Expand fixed form within [1e-6, 1e21)
         s_fixed = f"{f:.16f}".rstrip("0").rstrip(".")
         return s_fixed
     s = repr(f).lower()
@@ -125,19 +99,24 @@ def _serialize_jcs(val: Any) -> str:
     if isinstance(val, float):
         return _format_jcs_float(val)
     if isinstance(val, str):
-        return _escape_jcs_string(val)
+        return _c_encode_jcs_string(val)
     if isinstance(val, (list, tuple)):
         return "[" + ",".join(_serialize_jcs(item) for item in val) + "]"
     if isinstance(val, dict):
         keys = val.keys()
+        for k in keys:
+            if not isinstance(k, str):
+                raise G2AError("invalid_request", 400, "JSON object keys must be strings")
         sorted_keys = sorted(keys) if all(k.isascii() for k in keys) else sorted(keys, key=_utf16_sort_key)
-        return "{" + ",".join(f"{_escape_jcs_string(k)}:{_serialize_jcs(val[k])}" for k in sorted_keys) + "}"
+        return "{" + ",".join(f"{_c_encode_jcs_string(k)}:{_serialize_jcs(val[k])}" for k in sorted_keys) + "}"
     raise G2AError("invalid_request", 400, f"Cannot canonicalize value of type {type(val).__name__}")
 
 
 def canonicalize_utf8(val: Any) -> bytes:
-    validate_strict_json_value(val)
-    return _serialize_jcs(val).encode("utf-8")
+    try:
+        return _serialize_jcs(val).encode("utf-8")
+    except UnicodeEncodeError as uerr:
+        raise G2AError("invalid_request", 400, f"Lone UTF-16 surrogate forbidden in I-JSON: {uerr}") from uerr
 
 
 def jcs_sha256(domain_tag: str, val: Any) -> str:

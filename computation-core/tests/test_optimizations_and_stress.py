@@ -226,14 +226,34 @@ class TestOptimizationsAndStress(unittest.TestCase):
                     hub_proc.stderr.close()
 
     def test_ipv4_mapped_ipv6_ssrf_guard_and_llm_tag_breakout_firewall(self) -> None:
-        # 1. IPv4-mapped IPv6 loopback & cloud metadata link-local addresses MUST be caught!
-        with self.assertRaises(G2AError) as ctx_loop:
-            validate_outbound_url_against_ssrf("https://[::ffff:127.0.0.1]:19220", allow_loopback=False)
-        self.assertEqual(ctx_loop.exception.code, "permission_denied")
+        # 1. IPv4-mapped IPv6, CGNAT (100.64.0.0/10), 0.0.0.0/8, 6to4, & NAT64 SSRF vectors MUST all be caught!
+        for bad_url in (
+            "https://[::ffff:127.0.0.1]:19220",
+            "https://100.64.0.1:19220",
+            "https://0.1.2.3:19220",
+            "https://[2002:a9fe:a9fe::1]:19220",
+            "https://[64:ff9b::a9fe:a9fe]:19220",
+        ):
+            with self.assertRaises(G2AError, msg=f"Expected SSRF block for {bad_url}") as ctx_ssrf:
+                validate_outbound_url_against_ssrf(bad_url, allow_loopback=False)
+            self.assertEqual(ctx_ssrf.exception.code, "permission_denied")
 
         with self.assertRaises(G2AError) as ctx_meta:
             validate_outbound_url_against_ssrf("https://[::ffff:169.254.169.254]/", allow_loopback=True)
         self.assertEqual(ctx_meta.exception.code, "permission_denied")
+
+        # Verify single-pass C-accelerated JCS preserves unescaped '/', UTF-8 emojis, UTF-16 ordering, & rejects lone surrogates
+        from g2a_core.jcs import canonicalize_utf8 as core_canon
+        from g2a_origin.jcs import StrictJSONError, canonicalize_utf8 as orig_canon
+
+        sample_doc = {"\ue000": "a/b", "😀": "ctrl:\x00\b\n\"\\"}
+        expected_bytes = '{"😀":"ctrl:\\u0000\\b\\n\\"\\\\","\ue000":"a/b"}'.encode("utf-8")
+        self.assertEqual(core_canon(sample_doc), expected_bytes)
+        self.assertEqual(orig_canon(sample_doc), expected_bytes)
+        with self.assertRaises(G2AError):
+            core_canon({"bad": "\ud800"})
+        with self.assertRaises(StrictJSONError):
+            orig_canon({"bad": "\ud800"})
 
         # 2. Tag-breakout escaping, persistent Keep-Alive reuse, & numeric/enum bounds in OpenAICompatibleLLMPlanner
         captured_prompts = []

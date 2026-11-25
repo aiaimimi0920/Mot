@@ -7,6 +7,22 @@ from urllib.parse import urlparse
 from .schemas import G2AError
 
 
+_NAT64_WELL_KNOWN_PREFIX = ipaddress.IPv6Network("64:ff9b::/96")
+
+
+def _unwrap_transition_ip(
+    raw_ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    if isinstance(raw_ip, ipaddress.IPv6Address):
+        if raw_ip.ipv4_mapped is not None:
+            return raw_ip.ipv4_mapped
+        if raw_ip.sixtofour is not None:
+            return raw_ip.sixtofour
+        if raw_ip in _NAT64_WELL_KNOWN_PREFIX:
+            return ipaddress.IPv4Address(raw_ip.packed[12:16])
+    return raw_ip
+
+
 def validate_outbound_url_against_ssrf(url: str, allow_loopback: bool = False) -> None:
     """Enforces Section 7.1 outbound transport & SSRF rules prior to connection."""
     parsed = urlparse(url)
@@ -42,18 +58,19 @@ def validate_outbound_url_against_ssrf(url: str, allow_loopback: bool = False) -
             raise G2AError("unavailable", 503, f"Unable to resolve Hub host {host!r}: {exc}") from exc
 
     for raw_ip in resolved_ips:
-        ip = raw_ip.ipv4_mapped if isinstance(raw_ip, ipaddress.IPv6Address) and raw_ip.ipv4_mapped is not None else raw_ip
+        ip = _unwrap_transition_ip(raw_ip)
         if ip.is_loopback:
             if not allow_loopback:
                 raise G2AError("permission_denied", 403, "Loopback Hub address blocked by remote SSRF policy")
             continue
         if (
-            ip.is_private
+            not ip.is_global
+            or ip.is_private
             or ip.is_link_local
             or ip.is_multicast
             or ip.is_unspecified
             or ip.is_reserved
         ):
-            raise G2AError("permission_denied", 403, f"Private or link-local IP {ip} blocked by SSRF guard")
+            raise G2AError("permission_denied", 403, f"Non-global, private, CGNAT, or link-local IP {ip} blocked by SSRF guard")
         if scheme != "https":
             raise G2AError("invalid_arguments", 400, "Non-loopback Hub connections MUST use https://")

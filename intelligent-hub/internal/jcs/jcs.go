@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf16"
+	"unicode/utf8"
+	"unsafe"
 )
 
 var (
@@ -21,6 +23,333 @@ var (
 	ErrNonFiniteFloat = errors.New("non-finite float (NaN or Infinity) is forbidden")
 	ErrInvalidJSON    = errors.New("invalid strict RFC 8259 JSON")
 )
+
+// ValidateStrictJSONBytes validates that raw UTF-8 bytes form a single strict RFC 8259 / I-JSON document
+// with zero duplicate object keys (including escaped equivalents), zero unescaped control chars or lone surrogates,
+// zero trailing tokens, and finite numbers — without allocating an AST on the hot request path.
+func ValidateStrictJSONBytes(raw []byte) error {
+	s := strictScanner{b: raw}
+	s.skipWS()
+	if err := s.scanValue(0); err != nil {
+		return err
+	}
+	s.skipWS()
+	if s.pos != len(s.b) {
+		return ErrInvalidJSON
+	}
+	return nil
+}
+
+type strictScanner struct {
+	b   []byte
+	pos int
+}
+
+func (s *strictScanner) skipWS() {
+	for s.pos < len(s.b) {
+		switch s.b[s.pos] {
+		case ' ', '\t', '\r', '\n':
+			s.pos++
+		default:
+			return
+		}
+	}
+}
+
+func (s *strictScanner) scanValue(depth int) error {
+	if depth > 64 || s.pos >= len(s.b) {
+		return ErrInvalidJSON
+	}
+	switch s.b[s.pos] {
+	case '{':
+		return s.scanObject(depth + 1)
+	case '[':
+		return s.scanArray(depth + 1)
+	case '"':
+		_, err := s.scanString(false)
+		return err
+	case 't':
+		return s.expectLiteral("true")
+	case 'f':
+		return s.expectLiteral("false")
+	case 'n':
+		return s.expectLiteral("null")
+	default:
+		if s.b[s.pos] == '-' || (s.b[s.pos] >= '0' && s.b[s.pos] <= '9') {
+			return s.scanNumber()
+		}
+		return ErrInvalidJSON
+	}
+}
+
+func (s *strictScanner) expectLiteral(lit string) error {
+	if s.pos+len(lit) > len(s.b) {
+		return ErrInvalidJSON
+	}
+	for i := 0; i < len(lit); i++ {
+		if s.b[s.pos+i] != lit[i] {
+			return ErrInvalidJSON
+		}
+	}
+	s.pos += len(lit)
+	return nil
+}
+
+func (s *strictScanner) scanObject(depth int) error {
+	s.pos++ // consume '{'
+	s.skipWS()
+	if s.pos >= len(s.b) {
+		return ErrInvalidJSON
+	}
+	if s.b[s.pos] == '}' {
+		s.pos++
+		return nil
+	}
+
+	// Stack-allocated fast path for <= 12 keys avoids heap map allocation on typical G2A envelopes!
+	var smallKeys [12]string
+	smallCount := 0
+	var largeSet map[string]struct{}
+
+	for {
+		s.skipWS()
+		if s.pos >= len(s.b) || s.b[s.pos] != '"' {
+			return ErrInvalidJSON
+		}
+		key, err := s.scanString(true)
+		if err != nil {
+			return err
+		}
+		if largeSet != nil {
+			if _, dup := largeSet[key]; dup {
+				return fmt.Errorf("%w: %q", ErrDuplicateKey, key)
+			}
+			largeSet[key] = struct{}{}
+		} else {
+			for i := 0; i < smallCount; i++ {
+				if smallKeys[i] == key {
+					return fmt.Errorf("%w: %q", ErrDuplicateKey, key)
+				}
+			}
+			if smallCount < len(smallKeys) {
+				smallKeys[smallCount] = key
+				smallCount++
+			} else {
+				largeSet = make(map[string]struct{}, 24)
+				for i := 0; i < smallCount; i++ {
+					largeSet[smallKeys[i]] = struct{}{}
+				}
+				largeSet[key] = struct{}{}
+			}
+		}
+
+		s.skipWS()
+		if s.pos >= len(s.b) || s.b[s.pos] != ':' {
+			return ErrInvalidJSON
+		}
+		s.pos++
+		s.skipWS()
+		if err := s.scanValue(depth); err != nil {
+			return err
+		}
+		s.skipWS()
+		if s.pos >= len(s.b) {
+			return ErrInvalidJSON
+		}
+		if s.b[s.pos] == '}' {
+			s.pos++
+			return nil
+		}
+		if s.b[s.pos] != ',' {
+			return ErrInvalidJSON
+		}
+		s.pos++
+	}
+}
+
+func (s *strictScanner) scanArray(depth int) error {
+	s.pos++ // consume '['
+	s.skipWS()
+	if s.pos >= len(s.b) {
+		return ErrInvalidJSON
+	}
+	if s.b[s.pos] == ']' {
+		s.pos++
+		return nil
+	}
+	for {
+		s.skipWS()
+		if err := s.scanValue(depth); err != nil {
+			return err
+		}
+		s.skipWS()
+		if s.pos >= len(s.b) {
+			return ErrInvalidJSON
+		}
+		if s.b[s.pos] == ']' {
+			s.pos++
+			return nil
+		}
+		if s.b[s.pos] != ',' {
+			return ErrInvalidJSON
+		}
+		s.pos++
+	}
+}
+
+func (s *strictScanner) scanString(needKey bool) (string, error) {
+	s.pos++ // consume '"'
+	start := s.pos
+	hasEscape := false
+	for s.pos < len(s.b) {
+		c := s.b[s.pos]
+		if c == '"' {
+			rawSlice := s.b[start:s.pos]
+			s.pos++
+			if !utf8.Valid(rawSlice) {
+				return "", ErrInvalidJSON
+			}
+			if !needKey {
+				return "", nil
+			}
+			if !hasEscape {
+				// Safe zero-copy string view scoped strictly within ValidateStrictJSONBytes!
+				return unsafe.String(unsafe.SliceData(rawSlice), len(rawSlice)), nil
+			}
+			return unescapeValidatedJSONString(rawSlice)
+		}
+		if c < 0x20 {
+			return "", ErrInvalidJSON
+		}
+		if c == '\\' {
+			hasEscape = true
+			s.pos++
+			if s.pos >= len(s.b) {
+				return "", ErrInvalidJSON
+			}
+			esc := s.b[s.pos]
+			switch esc {
+			case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+				s.pos++
+			case 'u':
+				s.pos++
+				u1, err := s.readHex4()
+				if err != nil {
+					return "", err
+				}
+				if u1 >= 0xDC00 && u1 <= 0xDFFF {
+					return "", ErrInvalidJSON // lone low surrogate
+				}
+				if u1 >= 0xD800 && u1 <= 0xDBFF {
+					if s.pos+2 > len(s.b) || s.b[s.pos] != '\\' || s.b[s.pos+1] != 'u' {
+						return "", ErrInvalidJSON // lone high surrogate
+					}
+					s.pos += 2
+					u2, err := s.readHex4()
+					if err != nil || u2 < 0xDC00 || u2 > 0xDFFF {
+						return "", ErrInvalidJSON
+					}
+				}
+			default:
+				return "", ErrInvalidJSON
+			}
+			continue
+		}
+		s.pos++
+	}
+	return "", ErrInvalidJSON
+}
+
+func (s *strictScanner) readHex4() (uint16, error) {
+	if s.pos+4 > len(s.b) {
+		return 0, ErrInvalidJSON
+	}
+	var val uint16
+	for i := 0; i < 4; i++ {
+		c := s.b[s.pos+i]
+		val <<= 4
+		switch {
+		case c >= '0' && c <= '9':
+			val |= uint16(c - '0')
+		case c >= 'a' && c <= 'f':
+			val |= uint16(c - 'a' + 10)
+		case c >= 'A' && c <= 'F':
+			val |= uint16(c - 'A' + 10)
+		default:
+			return 0, ErrInvalidJSON
+		}
+	}
+	s.pos += 4
+	return val, nil
+}
+
+func unescapeValidatedJSONString(escaped []byte) (string, error) {
+	quoted := make([]byte, 0, len(escaped)+2)
+	quoted = append(quoted, '"')
+	quoted = append(quoted, escaped...)
+	quoted = append(quoted, '"')
+	var out string
+	if err := json.Unmarshal(quoted, &out); err != nil {
+		return "", ErrInvalidJSON
+	}
+	return out, nil
+}
+
+func (s *strictScanner) scanNumber() error {
+	start := s.pos
+	if s.b[s.pos] == '-' {
+		s.pos++
+		if s.pos >= len(s.b) {
+			return ErrInvalidJSON
+		}
+	}
+	if s.b[s.pos] == '0' {
+		s.pos++
+		if s.pos < len(s.b) && s.b[s.pos] >= '0' && s.b[s.pos] <= '9' {
+			return ErrInvalidJSON // leading zero forbidden in RFC 8259
+		}
+	} else if s.b[s.pos] >= '1' && s.b[s.pos] <= '9' {
+		for s.pos < len(s.b) && s.b[s.pos] >= '0' && s.b[s.pos] <= '9' {
+			s.pos++
+		}
+	} else {
+		return ErrInvalidJSON
+	}
+
+	hasExpOrFrac := false
+	if s.pos < len(s.b) && s.b[s.pos] == '.' {
+		hasExpOrFrac = true
+		s.pos++
+		if s.pos >= len(s.b) || s.b[s.pos] < '0' || s.b[s.pos] > '9' {
+			return ErrInvalidJSON
+		}
+		for s.pos < len(s.b) && s.b[s.pos] >= '0' && s.b[s.pos] <= '9' {
+			s.pos++
+		}
+	}
+	if s.pos < len(s.b) && (s.b[s.pos] == 'e' || s.b[s.pos] == 'E') {
+		hasExpOrFrac = true
+		s.pos++
+		if s.pos < len(s.b) && (s.b[s.pos] == '+' || s.b[s.pos] == '-') {
+			s.pos++
+		}
+		if s.pos >= len(s.b) || s.b[s.pos] < '0' || s.b[s.pos] > '9' {
+			return ErrInvalidJSON
+		}
+		for s.pos < len(s.b) && s.b[s.pos] >= '0' && s.b[s.pos] <= '9' {
+			s.pos++
+		}
+	}
+	if hasExpOrFrac {
+		numSlice := s.b[start:s.pos]
+		numStr := unsafe.String(unsafe.SliceData(numSlice), len(numSlice))
+		f64, err := strconv.ParseFloat(numStr, 64)
+		if err != nil || math.IsNaN(f64) || math.IsInf(f64, 0) {
+			return ErrNonFiniteFloat
+		}
+	}
+	return nil
+}
 
 // ParseStrictJSON parses UTF-8 JSON bytes while rejecting duplicate keys at any depth,
 // trailing tokens, and non-finite numbers.

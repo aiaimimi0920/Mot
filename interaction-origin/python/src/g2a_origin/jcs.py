@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from json.encoder import encode_basestring as _c_encode_jcs_str
 import math
 from typing import Any, List, Tuple
 
@@ -48,32 +49,6 @@ def _validate_value(val: Any) -> None:
     raise StrictJSONError(f"Unsupported JSON value type: {type(val).__name__}")
 
 
-def _escape_jcs_str(s: str) -> str:
-    out = ['"']
-    for ch in s:
-        c = ord(ch)
-        if ch == '"':
-            out.append('\\"')
-        elif ch == "\\":
-            out.append("\\\\")
-        elif ch == "\b":
-            out.append("\\b")
-        elif ch == "\f":
-            out.append("\\f")
-        elif ch == "\n":
-            out.append("\\n")
-        elif ch == "\r":
-            out.append("\\r")
-        elif ch == "\t":
-            out.append("\\t")
-        elif c <= 0x1F:
-            out.append(f"\\u{c:04x}")
-        else:
-            out.append(ch)
-    out.append('"')
-    return "".join(out)
-
-
 def _format_jcs_float(f: float) -> str:
     if math.isnan(f) or math.isinf(f):
         raise StrictJSONError("Non-finite float is forbidden")
@@ -110,19 +85,24 @@ def _serialize_jcs(val: Any) -> str:
     if isinstance(val, float):
         return _format_jcs_float(val)
     if isinstance(val, str):
-        return _escape_jcs_str(val)
+        return _c_encode_jcs_str(val)
     if isinstance(val, (list, tuple)):
         return "[" + ",".join(_serialize_jcs(v) for v in val) + "]"
     if isinstance(val, dict):
         raw_keys = val.keys()
+        for k in raw_keys:
+            if not isinstance(k, str):
+                raise StrictJSONError("JSON object keys must be strings")
         keys = sorted(raw_keys) if all(k.isascii() for k in raw_keys) else sorted(raw_keys, key=lambda k: k.encode("utf-16-be"))
-        return "{" + ",".join(f"{_escape_jcs_str(k)}:{_serialize_jcs(val[k])}" for k in keys) + "}"
+        return "{" + ",".join(f"{_c_encode_jcs_str(k)}:{_serialize_jcs(val[k])}" for k in keys) + "}"
     raise StrictJSONError(f"Cannot canonicalize {type(val).__name__}")
 
 
 def canonicalize_utf8(val: Any) -> bytes:
-    _validate_value(val)
-    return _serialize_jcs(val).encode("utf-8")
+    try:
+        return _serialize_jcs(val).encode("utf-8")
+    except UnicodeEncodeError as uerr:
+        raise StrictJSONError(f"Lone UTF-16 surrogate forbidden in I-JSON: {uerr}") from uerr
 
 
 def jcs_sha256(domain_tag: str, val: Any) -> str:

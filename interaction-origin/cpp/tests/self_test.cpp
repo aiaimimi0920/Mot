@@ -166,6 +166,26 @@ int main() {
     assert(std::get<int64_t>(ep2_sync.at("epoch").data) == 2);
     assert(std::get<std::string>(ep2_sync.at("mode").data) == "full");
 
+    // 6. Verify RFC 8259 UTF-16 surrogate pair decoding, lone surrogate rejection, & RFC 8785 §3.2.3 UTF-16 key ordering
+    JsonValue parsed_pair = jcs::parse_strict_json(R"({"emoji":"\uD83D\uDE00","\uE000":"bmp","\uD83D\uDE00":"astral"})");
+    const auto& pair_obj = std::get<JsonObject>(parsed_pair.data);
+    assert(std::get<std::string>(pair_obj.at("emoji").data) == "\xF0\x9F\x98\x80");
+
+    JsonValue astral_order = JsonObject{
+        {"\xEE\x80\x80", "bmp"},
+        {"\xF0\x9F\x98\x80", "astral"},
+    };
+    std::string canon_astral = jcs::canonicalize_utf8(astral_order);
+    assert(canon_astral == "{\"😀\":\"astral\",\"\xEE\x80\x80\":\"bmp\"}");
+
+    bool caught_lone = false;
+    try {
+        (void)jcs::parse_strict_json(R"({"bad":"\uD83D"})");
+    } catch (const std::invalid_argument&) {
+        caught_lone = true;
+    }
+    assert(caught_lone);
+
     std::cout << "C++17 G2A OriginSdk SelfTest PASSED | JCS=" << digest << "\n";
     return 0;
 }
