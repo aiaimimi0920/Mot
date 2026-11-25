@@ -200,13 +200,19 @@
     sdk.bindActorSubject("companion", state.companion);
     sdk.bindActorSubject("player", state.player);
 
+    const targetIdSchema = {
+      type: "object",
+      required: ["target_id"],
+      properties: { target_id: { type: "string" } },
+    };
+
     sdk.registerCapability(
       {
         method_id: "#01",
         name: "move_to",
         description: "Navigate companion to a visible scene prop",
         permitted_actors: ["companion"],
-        params_schema: { target_id: "string" },
+        params_schema: targetIdSchema,
         sustained: true,
       },
       (_actor, _sub, args, execId) => {
@@ -230,7 +236,7 @@
         name: "interact",
         description: "Open or interact with an in-range visible prop",
         permitted_actors: ["companion"],
-        params_schema: { target_id: "string" },
+        params_schema: targetIdSchema,
       },
       (_actor, _sub, args) => {
         const prop = state.props.find((p) => !p.secret && p.id === args.target_id);
@@ -248,7 +254,14 @@
         name: "market_buy",
         description: "Purchase raw workshop materials with gold",
         permitted_actors: ["player"],
-        params_schema: { item: "string", qty: "integer" },
+        params_schema: {
+          type: "object",
+          required: ["item", "qty"],
+          properties: {
+            item: { type: "string" },
+            qty: { type: "integer", minimum: 1 },
+          },
+        },
         risk_flags: ["resource_spend"],
         default_policy: "confirm",
       },
@@ -266,7 +279,11 @@
         name: "resume_line",
         description: "Resume halted workshop production line",
         permitted_actors: ["player"],
-        params_schema: { line_id: "string" },
+        params_schema: {
+          type: "object",
+          required: ["line_id"],
+          properties: { line_id: { type: "string" } },
+        },
       },
       () => {
         if (state.workshop.timber < 10) return { kind: "failed", reason: "insufficient_timber" };
@@ -464,11 +481,15 @@
         state.companion.y + 34
       );
 
-      document.getElementById("metrics").textContent =
+      const nextMetrics =
         `epoch=${sdk.currentEpoch} | rev=${sdk.currentRev} | gold=${state.workshop.gold} | timber=${state.workshop.timber}`;
+      if (metricsEl.textContent !== nextMetrics) {
+        metricsEl.textContent = nextMetrics;
+      }
 
       requestAnimationFrame(tick);
     }
+    const metricsEl = document.getElementById("metrics");
 
     document.getElementById("btnSend").onclick = () => {
       const txt = document.getElementById("cmdInput").value.trim();
@@ -487,7 +508,7 @@
       state.workshop.gold = 120;
       state.workshop.timber = 15;
       state.workshop.lineHalted = false;
-      await sdk.flushFullSync();
+      await sdk.advanceEpoch();
     };
 
     tick();

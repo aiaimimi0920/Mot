@@ -368,6 +368,23 @@ export class WebOriginSDK {
     });
   }
 
+  async advanceEpoch() {
+    for (const execId of [...this.inFlight.keys()]) {
+      await this.cancelInFlightStep(execId);
+    }
+    this.currentEpoch += 1;
+    this.currentRev = 0;
+    this.lastSentMethods.clear();
+    await this.flushFullSync();
+  }
+
+  close() {
+    if (this.eventSource) {
+      this.eventSource.close();
+      this.eventSource = null;
+    }
+  }
+
   static parseAnchorMeters(anchor) {
     if (!anchor) return 1e9;
     const s = String(anchor).trim();

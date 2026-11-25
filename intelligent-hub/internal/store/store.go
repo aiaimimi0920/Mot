@@ -134,6 +134,8 @@ type HubStoreData struct {
 	ApprovedScopes   map[string]bool               `json:"approved_scopes"`   // exact scope_digests approved for auto-join
 	PolicyOverrides  map[string]string             `json:"policy_overrides"`  // slot_id|method_id|actor -> allow|confirm|prohibit
 	AuditLog         []AuditEntry                  `json:"audit_log"`
+
+	slotSessions map[string]map[string]struct{} `json:"-"` // in-memory O(1) slot_id -> session_ids index
 }
 
 func NewHubStoreData() *HubStoreData {
@@ -150,14 +152,45 @@ func NewHubStoreData() *HubStoreData {
 		ApprovedScopes:   make(map[string]bool),
 		PolicyOverrides:  make(map[string]string),
 		AuditLog:         make([]AuditEntry, 0),
+		slotSessions:     make(map[string]map[string]struct{}),
+	}
+}
+
+func (d *HubStoreData) indexSessionSlot(sess *SessionRecord) {
+	if sess == nil || sess.Scope.SlotID == "" {
+		return
+	}
+	if d.slotSessions == nil {
+		d.slotSessions = make(map[string]map[string]struct{})
+	}
+	bucket := d.slotSessions[sess.Scope.SlotID]
+	if bucket == nil {
+		bucket = make(map[string]struct{})
+		d.slotSessions[sess.Scope.SlotID] = bucket
+	}
+	bucket[sess.SessionID] = struct{}{}
+}
+
+func (d *HubStoreData) unindexSessionSlot(slotID, sessionID string) {
+	if d.slotSessions == nil {
+		return
+	}
+	if bucket, ok := d.slotSessions[slotID]; ok {
+		delete(bucket, sessionID)
+		if len(bucket) == 0 {
+			delete(d.slotSessions, slotID)
+		}
 	}
 }
 
 func (d *HubStoreData) RegisterSession(sess *SessionRecord) {
-	if _, exists := d.Sessions[sess.SessionID]; !exists {
+	if prev, exists := d.Sessions[sess.SessionID]; !exists {
 		d.SessionOrder = append(d.SessionOrder, sess.SessionID)
+	} else if prev.Scope.SlotID != sess.Scope.SlotID {
+		d.unindexSessionSlot(prev.Scope.SlotID, sess.SessionID)
 	}
 	d.Sessions[sess.SessionID] = sess
+	d.indexSessionSlot(sess)
 	d.PruneClosedSessions()
 }
 
@@ -202,6 +235,7 @@ func (d *HubStoreData) PruneClosedSessions() {
 			continue
 		}
 		if removed < targetRemove && sess.State == "closed" && !hasLiveQueue[sid] {
+			d.unindexSessionSlot(sess.Scope.SlotID, sid)
 			delete(d.Sessions, sid)
 			removed++
 			continue
@@ -342,6 +376,10 @@ func (d *HubStoreData) EnsureMaps() {
 	if d.PolicyOverrides == nil {
 		d.PolicyOverrides = make(map[string]string)
 	}
+	d.slotSessions = make(map[string]map[string]struct{})
+	for _, s := range d.Sessions {
+		d.indexSessionSlot(s)
+	}
 }
 
 func (d *HubStoreData) GetSessionForCaller(sessionID, callerCoreID string) (*SessionRecord, *model.G2AError) {
@@ -356,6 +394,19 @@ func (d *HubStoreData) GetSessionForCaller(sessionID, callerCoreID string) (*Ses
 }
 
 func (d *HubStoreData) SessionsForSlot(slotID string) []*SessionRecord {
+	if d.slotSessions != nil {
+		bucket := d.slotSessions[slotID]
+		if len(bucket) == 0 {
+			return nil
+		}
+		out := make([]*SessionRecord, 0, len(bucket))
+		for sid := range bucket {
+			if s, ok := d.Sessions[sid]; ok && s.Scope.SlotID == slotID {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
 	out := make([]*SessionRecord, 0)
 	for _, s := range d.Sessions {
 		if s.Scope.SlotID == slotID {
@@ -366,6 +417,19 @@ func (d *HubStoreData) SessionsForSlot(slotID string) []*SessionRecord {
 }
 
 func (d *HubStoreData) ActiveSessionsForSlot(slotID string) []*SessionRecord {
+	if d.slotSessions != nil {
+		bucket := d.slotSessions[slotID]
+		if len(bucket) == 0 {
+			return nil
+		}
+		out := make([]*SessionRecord, 0, len(bucket))
+		for sid := range bucket {
+			if s, ok := d.Sessions[sid]; ok && s.Scope.SlotID == slotID && s.PlayerOnline && s.State == "active" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
 	out := make([]*SessionRecord, 0)
 	for _, s := range d.Sessions {
 		if s.Scope.SlotID == slotID && s.PlayerOnline && s.State == "active" {
@@ -517,6 +581,7 @@ func (d *HubStoreData) Clone() *HubStoreData {
 		ApprovedScopes:   make(map[string]bool, len(d.ApprovedScopes)),
 		PolicyOverrides:  make(map[string]string, len(d.PolicyOverrides)),
 		AuditLog:         append([]AuditEntry(nil), d.AuditLog...),
+		slotSessions:     make(map[string]map[string]struct{}, len(d.slotSessions)),
 	}
 	for k, sl := range d.Slots {
 		cp := *sl
@@ -567,6 +632,7 @@ func (d *HubStoreData) Clone() *HubStoreData {
 		}
 		cp.Scope.PermittedMethods = permCopy
 		out.Sessions[k] = &cp
+		out.indexSessionSlot(&cp)
 	}
 	for k, qr := range d.Queues {
 		cp := *qr

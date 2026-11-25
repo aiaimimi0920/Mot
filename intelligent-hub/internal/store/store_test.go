@@ -195,3 +195,65 @@ func BenchmarkStoreAtomicInMemory(b *testing.B) {
 		}
 	}
 }
+
+func TestSlotSessionsSecondaryIndexIsolation(t *testing.T) {
+	d := store.NewHubStoreData()
+	for i := 0; i < 400; i++ {
+		d.RegisterSession(&store.SessionRecord{
+			SessionID:    fmt.Sprintf("closed-%03d", i),
+			State:        "closed",
+			PlayerOnline: false,
+			Scope:        model.FrozenScope{SlotID: fmt.Sprintf("slot-bg-%d", i%10)},
+		})
+	}
+	d.RegisterSession(&store.SessionRecord{
+		SessionID:    "sess-target-active",
+		State:        "active",
+		PlayerOnline: true,
+		Scope:        model.FrozenScope{SlotID: "slot-hot"},
+	})
+	d.RegisterSession(&store.SessionRecord{
+		SessionID:    "sess-target-paused",
+		State:        "paused_awaiting_player",
+		PlayerOnline: true,
+		Scope:        model.FrozenScope{SlotID: "slot-hot"},
+	})
+
+	active := d.ActiveSessionsForSlot("slot-hot")
+	if len(active) != 1 || active[0].SessionID != "sess-target-active" {
+		t.Fatalf("expected exactly 1 active session on slot-hot, got %+v", active)
+	}
+	allHot := d.SessionsForSlot("slot-hot")
+	if len(allHot) != 2 {
+		t.Fatalf("expected 2 total sessions on slot-hot, got %d", len(allHot))
+	}
+	if got := d.ActiveSessionsForSlot("slot-nonexistent"); len(got) != 0 {
+		t.Fatalf("expected 0 sessions on nonexistent slot, got %d", len(got))
+	}
+}
+
+func BenchmarkActiveSessionsForSlot500Closed(b *testing.B) {
+	d := store.NewHubStoreData()
+	for i := 0; i < 500; i++ {
+		d.RegisterSession(&store.SessionRecord{
+			SessionID: fmt.Sprintf("sess-hist-%03d", i),
+			State:     "closed",
+			Scope:     model.FrozenScope{SlotID: fmt.Sprintf("slot-other-%d", i%25)},
+		})
+	}
+	d.RegisterSession(&store.SessionRecord{
+		SessionID:    "sess-live-hot",
+		State:        "active",
+		PlayerOnline: true,
+		Scope:        model.FrozenScope{SlotID: "slot-hot-60hz"},
+	})
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		res := d.ActiveSessionsForSlot("slot-hot-60hz")
+		if len(res) != 1 {
+			b.Fatal("expected 1 active session")
+		}
+	}
+}

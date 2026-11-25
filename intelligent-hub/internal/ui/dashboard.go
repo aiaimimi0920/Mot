@@ -1,14 +1,17 @@
 package ui
 
-import "strings"
+import (
+	"html"
+	"strings"
+)
 
 // RenderDashboardHTML returns the self-contained Trusted Player Security & Control Web UI.
 // Served strictly on the loopback-isolated Trusted Consent port with anti-clickjacking, DNS-rebinding, & CSRF protection.
 func RenderDashboardHTML(csrfToken string, coreAddr string, originAddr string) string {
-	html := strings.ReplaceAll(dashboardTemplate, "__CSRF_TOKEN__", csrfToken)
-	html = strings.ReplaceAll(html, "__CORE_ADDR__", coreAddr)
-	html = strings.ReplaceAll(html, "__ORIGIN_ADDR__", originAddr)
-	return html
+	out := strings.ReplaceAll(dashboardTemplate, "__CSRF_TOKEN__", html.EscapeString(csrfToken))
+	out = strings.ReplaceAll(out, "__CORE_ADDR__", html.EscapeString(coreAddr))
+	out = strings.ReplaceAll(out, "__ORIGIN_ADDR__", html.EscapeString(originAddr))
+	return out
 }
 
 const dashboardTemplate = `<!DOCTYPE html>
@@ -150,6 +153,14 @@ document.addEventListener("change", ev => {
   }
 });
 
+const prevHtmlByPanel = new Map();
+function setHTMLIfChanged(id, nextHtml) {
+  if (prevHtmlByPanel.get(id) === nextHtml) return;
+  prevHtmlByPanel.set(id, nextHtml);
+  const el = document.getElementById(id);
+  if (el) el.innerHTML = nextHtml;
+}
+
 async function refresh(force = false) {
   if (!force && document.activeElement && document.activeElement.tagName === "SELECT") return;
   const res = await fetch("/trusted/status", { headers: { "X-G2A-CSRF": CSRF } });
@@ -159,8 +170,9 @@ async function refresh(force = false) {
   const scopes = pend.scope_prompts || [];
   const queues = pend.queue_prompts || [];
   const resumes = pend.resume_prompts || [];
-  const totalPend = scopes.length + queues.length + resumes.length;
-  document.getElementById("pending-count").textContent = totalPend;
+  const totalPend = String(scopes.length + queues.length + resumes.length);
+  const pendBadge = document.getElementById("pending-count");
+  if (pendBadge && pendBadge.textContent !== totalPend) pendBadge.textContent = totalPend;
 
   let pHtml = "";
   for (const sp of scopes) {
@@ -189,12 +201,12 @@ async function refresh(force = false) {
       '<button class="approve" data-action="decide-resume" data-session-id="' + esc(rp.session_id) + '" data-approved="true">允许恢复</button>' +
       '<button class="decline" data-action="decide-resume" data-session-id="' + esc(rp.session_id) + '" data-approved="false">关闭会话</button></div></div>';
   }
-  document.getElementById("pending-list").innerHTML = pHtml || '<span class="empty">当前无挂起的审批请求。</span>';
+  setHTMLIfChanged("pending-list", pHtml || '<span class="empty">当前无挂起的审批请求。</span>');
 
   const overrides = st.policy_overrides || {};
   const slots = st.slots || [];
   if (!slots.length) {
-    document.getElementById("slots-list").innerHTML = '<div class="empty">尚无游戏接入。</div>';
+    setHTMLIfChanged("slots-list", '<div class="empty">尚无游戏接入。</div>');
   } else {
     let sRows = '<table><tr><th>槽位 / 原语策略</th><th>角色/计费</th><th>在线/修订</th><th>控制</th></tr>';
     for (const sl of slots) {
@@ -214,12 +226,12 @@ async function refresh(force = false) {
         '<td>' + (sl.player_online ? '<span class="badge ok">在线</span>' : '<span class="badge danger">离线</span>') + ' epoch=' + sl.epoch + ' rev=' + sl.rev + '</td>' +
         '<td><button class="decline" data-action="emergency-stop" data-slot-id="' + esc(sl.slot_id) + '">紧急叫停</button></td></tr>';
     }
-    document.getElementById("slots-list").innerHTML = sRows + '</table>';
+    setHTMLIfChanged("slots-list", sRows + '</table>');
   }
 
   const sessions = st.sessions || [];
   if (!sessions.length) {
-    document.getElementById("sessions-list").innerHTML = '<div class="empty">尚无活跃会话。</div>';
+    setHTMLIfChanged("sessions-list", '<div class="empty">尚无活跃会话。</div>');
   } else {
     let cRows = '<table><tr><th>会话 ID</th><th>中枢 / 槽位</th><th>状态 / 多模态隐私</th><th>操作</th></tr>';
     for (const se of sessions) {
@@ -233,28 +245,33 @@ async function refresh(force = false) {
         '<td><code>' + esc(se.state) + '</code> · 已执行 ' + se.consumption_used + (se.consumption_cap ? '/' + se.consumption_cap : '') + ' 步' + modHtml + '</td>' +
         '<td>' + (se.state !== 'closed' ? '<button class="decline" data-action="revoke-session" data-session-id="' + esc(se.session_id) + '">撤权断开</button>' : '-') + '</td></tr>';
     }
-    document.getElementById("sessions-list").innerHTML = cRows + '</table>';
+    setHTMLIfChanged("sessions-list", cRows + '</table>');
   }
 
   const autoScopes = st.auto_join_scopes || [];
-  document.getElementById("auto-scopes-list").innerHTML = autoScopes.length
+  setHTMLIfChanged("auto-scopes-list", autoScopes.length
     ? '<div style="font-size:12px;color:var(--muted);margin-bottom:4px">已保存自动加入 Scope 规则：</div>' +
       autoScopes.map(sd => '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><code>' + esc(sd.slice(0,26)) + '...</code><button class="decline" data-action="revoke-auto-scope" data-scope-digest="' + esc(sd) + '">撤销自动加入</button></div>').join("")
-    : '';
+    : '');
 
   const dir = st.core_directory || {};
-  document.getElementById("directory-box").innerHTML =
+  setHTMLIfChanged("directory-box",
     '<p style="margin-top:0"><strong>自由自定义接入命令：</strong><br><code>g2a-core run --hub http://__CORE_ADDR__ --slot &lt;slot_id&gt; --allow-loopback</code></p>' +
     '<p style="margin-bottom:4px;color:var(--muted)">优选兼容中枢参考目录（明确标识，不排他锁定）：</p><ul>' +
-    (dir.featured || []).map(f => '<li><strong>' + esc(f.name) + '</strong> (' + esc(f.mode) + ') — ' + esc(f.note) + '</li>').join("") + '</ul>';
+    (dir.featured || []).map(f => '<li><strong>' + esc(f.name) + '</strong> (' + esc(f.mode) + ') — ' + esc(f.note) + '</li>').join("") + '</ul>');
 
   const logs = (st.audit_log || []).slice().reverse();
-  document.getElementById("audit-list").innerHTML = logs.length
+  setHTMLIfChanged("audit-list", logs.length
     ? logs.map(l => '<div class="log-item"><span style="color:var(--muted)">[' + new Date(l.timestamp_ms).toLocaleTimeString() + ']</span> <strong>' + esc(l.category) + '</strong> ' + esc(l.summary) + '</div>').join("")
-    : '<span class="empty">暂无审计事件。</span>';
+    : '<span class="empty">暂无审计事件。</span>');
 }
-refresh();
-setInterval(() => refresh(false), 1000);
+
+refresh(true);
+if (typeof EventSource !== "undefined") {
+  const es = new EventSource("/trusted/events?csrf=" + encodeURIComponent(CSRF));
+  es.addEventListener("status.changed", () => refresh(false));
+}
+setInterval(() => refresh(false), 3000);
 </script>
 </body>
 </html>`

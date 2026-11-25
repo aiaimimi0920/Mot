@@ -38,14 +38,29 @@ def copy_clean_tree(src: Path, dst: Path) -> None:
                 d_file.write_text(txt, encoding="utf-8", newline="\n")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Split G2A V0.0.1 three apps into standalone Git repositories")
-    parser.add_argument("--output-dir", required=True, help="Destination parent directory for exported repos")
-    parser.add_argument("--github-org", default="aiaimimi0920")
-    args = parser.parse_args()
+STANDALONE_GITIGNORE = """# Build & runtime artifacts
+bin/
+obj/
+build/
+dist/
+node_modules/
+__pycache__/
+*.egg-info/
+*.pyc
+*.pyo
+*.exe
+*.dll
+*.pdb
+*.db
+*.db-wal
+*.db-shm
+"""
 
-    out_root = Path(args.output_dir).resolve()
+
+def export_standalone_repos(out_root: Path, github_org: str = "aiaimimi0920") -> list[Path]:
+    out_root = out_root.resolve()
     out_root.mkdir(parents=True, exist_ok=True)
+    exported: list[Path] = []
 
     for name in REPOS:
         src = ROOT / name
@@ -53,18 +68,43 @@ def main() -> None:
         if dst.exists():
             shutil.rmtree(dst)
         copy_clean_tree(src, dst)
-        subprocess.run(["git", "init", "-b", "main"], cwd=str(dst), check=True)
+        gitignore_path = dst / ".gitignore"
+        if not gitignore_path.exists():
+            gitignore_path.write_text(STANDALONE_GITIGNORE, encoding="utf-8", newline="\n")
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(dst), check=True, stdout=subprocess.DEVNULL)
         subprocess.run(
-            ["git", "remote", "add", "origin", f"https://github.com/{args.github_org}/{name}.git"],
+            ["git", "remote", "add", "origin", f"https://github.com/{github_org}/{name}.git"],
             cwd=str(dst),
             check=True,
+            stdout=subprocess.DEVNULL,
         )
-        subprocess.run(["git", "add", "-A"], cwd=str(dst), check=True)
+        subprocess.run(["git", "add", "-A"], cwd=str(dst), check=True, stdout=subprocess.DEVNULL)
         subprocess.run(
-            ["git", "commit", "-m", f"feat: release {name} V0.0.1 standalone repository"],
+            [
+                "git",
+                "-c",
+                "user.name=G2A Release Bot",
+                "-c",
+                "user.email=noreply@g2a.local",
+                "commit",
+                "-m",
+                f"feat: release {name} V0.0.1 standalone repository",
+            ],
             cwd=str(dst),
             check=True,
+            stdout=subprocess.DEVNULL,
         )
+        exported.append(dst)
+    return exported
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Split G2A V0.0.1 three apps into standalone Git repositories")
+    parser.add_argument("--output-dir", required=True, help="Destination parent directory for exported repos")
+    parser.add_argument("--github-org", default="aiaimimi0920")
+    args = parser.parse_args()
+
+    for dst in export_standalone_repos(Path(args.output_dir), github_org=args.github_org):
         print(f"Exported standalone Git repo: {dst}")
 
 

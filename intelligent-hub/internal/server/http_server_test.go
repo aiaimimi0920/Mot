@@ -387,3 +387,66 @@ func readServerWSFrame(t *testing.T, br *bufio.Reader) (byte, []byte) {
 	}
 	return b0 & 0x0F, payload
 }
+
+func TestTrustedDashboardSSEPushAndSecurityHeaders(t *testing.T) {
+	eng := newTestHubEngine(t)
+	registerSlotForServerTest(t, eng, "slot-dash")
+
+	dashSrv := httptest.NewServer(server.NewTrustedConsentHandler(eng, server.AuthRegistry{
+		ConsentToken:            "dash-secret",
+		StreamKeepAliveInterval: 50 * time.Millisecond,
+	}))
+	defer dashSrv.Close()
+
+	// 1. Unauthenticated /trusted/events must be rejected with 401
+	unauthResp, err := http.Get(dashSrv.URL + "/trusted/events")
+	if err != nil {
+		t.Fatalf("GET unauth /trusted/events: %v", err)
+	}
+	_ = unauthResp.Body.Close()
+	if unauthResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated /trusted/events, got %d", unauthResp.StatusCode)
+	}
+
+	// 2. Authenticated /trusted/events streams instant status.changed on policy or prompt updates
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, dashSrv.URL+"/trusted/events?access_token=dash-secret", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /trusted/events: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.Header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("expected X-Content-Type-Options: nosniff, got %q", resp.Header.Get("X-Content-Type-Options"))
+	}
+	if resp.Header.Get("Referrer-Policy") != "no-referrer" {
+		t.Fatalf("expected Referrer-Policy: no-referrer, got %q", resp.Header.Get("Referrer-Policy"))
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	readyLine, err := reader.ReadString('\n')
+	if err != nil || !strings.HasPrefix(readyLine, ": g2a-dashboard-stream-ready") {
+		t.Fatalf("expected dashboard stream ready comment, got %q (err=%v)", readyLine, err)
+	}
+
+	// Trigger a live policy override and assert event: status.changed arrives promptly
+	if gErr := eng.SetPolicyOverride("slot-dash", "#01", "companion", "confirm"); gErr != nil {
+		t.Fatalf("SetPolicyOverride: %v", gErr)
+	}
+
+	sawStatusChanged := false
+	for i := 0; i < 12 && !sawStatusChanged; i++ {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("reading /trusted/events: %v", err)
+		}
+		if strings.HasPrefix(line, "event: status.changed") {
+			sawStatusChanged = true
+		}
+	}
+	if !sawStatusChanged {
+		t.Fatal("did not receive event: status.changed over /trusted/events")
+	}
+}

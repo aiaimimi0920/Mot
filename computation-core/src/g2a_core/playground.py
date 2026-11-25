@@ -15,10 +15,13 @@ from typing import Any, Dict, List, Optional
 
 from .cli import HeuristicReferencePlanner
 from .core_sdk import CoreSDK, discover_local_hub_manifest
+from .jcs import parse_strict_json
 from .llm_planner import OpenAICompatibleLLMPlanner
 from .memory import MemoryRecord, MemoryService
 from .schemas import CapabilityEntry, G2AError, PlanDecision, ProjectedContext
 from .sqlite_memory import SQLiteCompanionStore
+
+MAX_CONSOLE_BODY_BYTES = 4 << 20
 
 
 class _QuietThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -110,6 +113,7 @@ class LivePlaygroundStack:
         self._game_httpd: Optional[_QuietThreadingHTTPServer] = None
         self._console_httpd: Optional[_QuietThreadingHTTPServer] = None
         self._store: Optional[SQLiteCompanionStore] = None
+        self._base_planner: Optional[Any] = None
         self._sdk: Optional[CoreSDK] = None
         self._stop_evt = threading.Event()
         self._lock = threading.Lock()
@@ -193,6 +197,7 @@ class LivePlaygroundStack:
                 allow_loopback=True,
                 fallback_planner=base_planner,
             )
+        self._base_planner = base_planner
         tracing_planner = _TracingPlanner(base_planner, self._traces, self._lock)
         self._sdk = CoreSDK(
             planner=tracing_planner,
@@ -208,24 +213,49 @@ class LivePlaygroundStack:
         stack_ref = self
 
         class _ConsoleHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def log_message(self, format: str, *args: Any) -> None:
                 return
 
-            def _send_json(self, status: int, body: Any) -> None:
+            def _check_loopback_host(self) -> bool:
+                raw_host = self.headers.get("Host", "").strip().lower()
+                if raw_host.startswith("["):
+                    host = raw_host.split("]", 1)[0].lstrip("[")
+                else:
+                    host = raw_host.split(":", 1)[0]
+                if host and host not in ("127.0.0.1", "localhost", "::1"):
+                    self._send_json(403, {"error": "forbidden_host_dns_rebinding_guard"}, force_close=True)
+                    return False
+                return True
+
+            def _send_security_headers(self) -> None:
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+
+            def _send_json(self, status: int, body: Any, force_close: bool = False) -> None:
                 raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+                want_close = force_close or self.headers.get("Connection", "").strip().lower() == "close"
                 self.send_response(status)
+                self._send_security_headers()
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(raw)))
-                self.send_header("Connection", "close")
+                self.send_header("Connection", "close" if want_close else "keep-alive")
                 self.end_headers()
                 self.wfile.write(raw)
 
             def do_GET(self) -> None:
+                if not self._check_loopback_host():
+                    return
                 if self.path == "/" or self.path.startswith("/index.html"):
                     html = stack_ref._render_console_html().encode("utf-8")
+                    want_close = self.headers.get("Connection", "").strip().lower() == "close"
                     self.send_response(200)
+                    self._send_security_headers()
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Content-Length", str(len(html)))
+                    self.send_header("Connection", "close" if want_close else "keep-alive")
                     self.end_headers()
                     self.wfile.write(html)
                     return
@@ -233,6 +263,10 @@ class LivePlaygroundStack:
                     with stack_ref._lock:
                         traces = list(stack_ref._traces)
                     sdk = stack_ref._sdk
+                    pending_qids: List[str] = []
+                    if sdk is not None:
+                        with sdk._state_lock:
+                            pending_qids = list(sdk.pending_confirm_queues.keys())
                     self._send_json(
                         200,
                         {
@@ -240,7 +274,7 @@ class LivePlaygroundStack:
                             "slot_id": stack_ref.slot_id,
                             "session_id": sdk.session_id if sdk else None,
                             "attached": bool(sdk and sdk.session_id and sdk.is_stream_ready and not sdk.closed),
-                            "pending_confirm_queues": list(sdk.pending_confirm_queues.keys()) if sdk else [],
+                            "pending_confirm_queues": pending_qids,
                             "hub_origin_url": stack_ref.hub_origin_url,
                             "hub_core_url": stack_ref.hub_core_url,
                             "hub_dashboard_url": stack_ref.hub_dashboard_url,
@@ -260,12 +294,27 @@ class LivePlaygroundStack:
                     bundle = svc.export_bundle("player-local")
                     self._send_json(200, bundle.to_dict())
                     return
-                self.send_error(404)
+                self._send_json(404, {"error": "not_found"})
 
             def do_POST(self) -> None:
-                cl = int(self.headers.get("Content-Length", "0"))
+                if not self._check_loopback_host():
+                    return
+                try:
+                    cl = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    self._send_json(400, {"error": "invalid_content_length"})
+                    return
+                if cl < 0 or cl > MAX_CONSOLE_BODY_BYTES:
+                    self._send_json(413, {"error": "payload_too_large"}, force_close=True)
+                    return
                 raw = self.rfile.read(cl) if cl > 0 else b"{}"
-                data = json.loads(raw.decode("utf-8") or "{}")
+                try:
+                    data = parse_strict_json(raw) if raw.strip() else {}
+                    if not isinstance(data, dict):
+                        raise G2AError("invalid_request", 400, "Expected JSON object")
+                except G2AError as gerr:
+                    self._send_json(400, {"error": gerr.code, "message": gerr.message})
+                    return
                 if self.path == "/api/attach":
                     ok = stack_ref.try_attach_core()
                     self._send_json(200, {"attached": ok, "session_id": stack_ref._sdk.session_id if stack_ref._sdk else None})
@@ -289,7 +338,7 @@ class LivePlaygroundStack:
                     ok = stack_ref._store.delete_player_record("player-local", str(data.get("memory_id", "")))
                     self._send_json(200, {"deleted": ok})
                     return
-                self.send_error(404)
+                self._send_json(404, {"error": "not_found"})
 
         self._console_httpd = _QuietThreadingHTTPServer(("127.0.0.1", self.console_port), _ConsoleHandler)
         console_bound_port = self._console_httpd.server_address[1]
@@ -328,6 +377,12 @@ class LivePlaygroundStack:
         if self._sdk:
             try:
                 self._sdk.shutdown_session_cleanly(notify_hub=True)
+            except Exception:
+                pass
+        close_planner = getattr(self._base_planner, "close", None)
+        if callable(close_planner):
+            try:
+                close_planner()
             except Exception:
                 pass
         if self._console_httpd:
@@ -455,16 +510,24 @@ class LivePlaygroundStack:
     </div>
   </div>
   <script>
+    function setTextIfChanged(id, nextText) {{
+      const el = document.getElementById(id);
+      if (el && el.textContent !== nextText) el.textContent = nextText;
+    }}
     async function refresh() {{
       const s = await (await fetch("/api/status")).json();
-      document.getElementById("statusLine").textContent =
+      setTextIfChanged(
+        "statusLine",
         s.attached
           ? `已挂载 WebSocket 会话: ${{s.session_id}} | 待玩家单次确认队列: ${{s.pending_confirm_queues.join(", ") || "无"}}`
-          : "等待左侧 HTML5 游戏完成源点注册...";
-      document.getElementById("traceBox").textContent =
-        s.traces.length ? JSON.stringify(s.traces, null, 2) : "等待触发玩家指令或工坊告警...";
+          : "等待左侧 HTML5 游戏完成源点注册..."
+      );
+      setTextIfChanged(
+        "traceBox",
+        s.traces.length ? JSON.stringify(s.traces, null, 2) : "等待触发玩家指令或工坊告警..."
+      );
       const m = await (await fetch("/api/memories")).json();
-      document.getElementById("memBox").textContent = JSON.stringify(m.records, null, 2);
+      setTextIfChanged("memBox", JSON.stringify(m.records, null, 2));
     }}
     document.getElementById("btnAddMem").onclick = async () => {{
       const val = document.getElementById("memInput").value.trim();

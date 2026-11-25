@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import subprocess
@@ -9,16 +10,19 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 ORIGIN_PY_SRC = os.path.join(ROOT_DIR, "interaction-origin", "python", "src")
 CORE_PY_SRC = os.path.join(ROOT_DIR, "computation-core", "src")
-for p in (ORIGIN_PY_SRC, CORE_PY_SRC):
+SCRIPTS_DIR = os.path.join(ROOT_DIR, "scripts")
+for p in (ORIGIN_PY_SRC, CORE_PY_SRC, SCRIPTS_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)
 
 from g2a_core.playground import LivePlaygroundStack, resolve_hub_binary
 from g2a_origin.demo_host import build_spatial_demo_sdk
+from split_standalone_repos import export_standalone_repos
 
 
 def _wait_until(pred, timeout_sec: float = 6.0) -> bool:
@@ -161,8 +165,69 @@ class TestWebOriginCorsAndPlayground(unittest.TestCase):
                     bundle = json.loads(r.read().decode("utf-8"))
                     self.assertEqual(bundle["format"], "g2a.memory.bundle.v1")
                     self.assertGreaterEqual(len(bundle["records"]), 2)
+
+                # 6. Verify Playground Console DNS-rebinding shield, strict JSON, 413 body cap, & security headers
+                c_host, c_port_s = stack.core_console_url.replace("http://", "").rstrip("/").split(":")
+                c_port = int(c_port_s)
+
+                rebind_conn = http.client.HTTPConnection(c_host, c_port, timeout=3.0)
+                try:
+                    rebind_conn.putrequest("GET", "/api/status", skip_host=True)
+                    rebind_conn.putheader("Host", "evil.rebind.example")
+                    rebind_conn.endheaders()
+                    r_rebind = rebind_conn.getresponse()
+                    _ = r_rebind.read()
+                    self.assertEqual(r_rebind.status, 403)
+                finally:
+                    rebind_conn.close()
+
+                sec_conn = http.client.HTTPConnection(c_host, c_port, timeout=3.0)
+                try:
+                    sec_conn.request(
+                        "POST",
+                        "/api/memories",
+                        body=b'{"content":"a","content":"b"}',
+                        headers={"Content-Type": "application/json", "Connection": "keep-alive"},
+                    )
+                    r_dup = sec_conn.getresponse()
+                    _ = r_dup.read()
+                    self.assertEqual(r_dup.status, 400)
+                    self.assertEqual(r_dup.getheader("X-Content-Type-Options"), "nosniff")
+                    self.assertEqual(r_dup.getheader("X-Frame-Options"), "DENY")
+                    self.assertEqual(r_dup.getheader("Connection"), "keep-alive")
+
+                    # Reuse SAME Keep-Alive socket for oversized Content-Length check -> 413
+                    sec_conn.request(
+                        "POST",
+                        "/api/memories",
+                        body=b"",
+                        headers={"Content-Type": "application/json", "Content-Length": str(5 * 1024 * 1024)},
+                    )
+                    r_big = sec_conn.getresponse()
+                    _ = r_big.read()
+                    self.assertEqual(r_big.status, 413)
+                finally:
+                    sec_conn.close()
             finally:
                 sdk.stop_loopback_execute_listener()
+
+    def test_standalone_three_repo_splitter_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            exported = export_standalone_repos(Path(tmp), github_org="aiaimimi0920")
+            self.assertEqual(len(exported), 3)
+            for repo_dir in exported:
+                self.assertTrue((repo_dir / ".git").is_dir())
+                self.assertTrue((repo_dir / ".gitignore").is_file())
+                readme_txt = (repo_dir / "README.md").read_text(encoding="utf-8")
+                self.assertNotIn("../G2A/docs/standard/", readme_txt)
+                st = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=str(repo_dir),
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(st.stdout.strip(), "")
 
 
 if __name__ == "__main__":

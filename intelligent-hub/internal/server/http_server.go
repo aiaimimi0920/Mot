@@ -465,17 +465,19 @@ func NewTrustedConsentHandler(engine *hub.Engine, auth AuthRegistry) http.Handle
 
 	setSecurityHeaders := func(w http.ResponseWriter) {
 		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
 	}
 
 	checkTrustedAuth := func(r *http.Request) bool {
-		if secureTokenEquals(r.Header.Get("X-G2A-CSRF"), csrfToken) {
+		if secureTokenEquals(r.Header.Get("X-G2A-CSRF"), csrfToken) || secureTokenEquals(r.URL.Query().Get("csrf"), csrfToken) {
 			return true
 		}
 		if auth.ConsentToken == "" {
 			return true
 		}
-		return secureTokenEquals(extractBearer(r), auth.ConsentToken)
+		return secureTokenEquals(extractStreamToken(r), auth.ConsentToken)
 	}
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -502,6 +504,48 @@ func NewTrustedConsentHandler(engine *hub.Engine, auth AuthRegistry) http.Handle
 		setSecurityHeaders(w)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(engine.SnapshotDashboardStatus())
+	})
+
+	mux.HandleFunc("/trusted/events", func(w http.ResponseWriter, r *http.Request) {
+		if !checkTrustedAuth(r) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		ch, unsub := engine.SubscribeDashboard()
+		defer unsub()
+
+		setSecurityHeaders(w)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, ": g2a-dashboard-stream-ready\n\n")
+		flusher.Flush()
+
+		ctx := r.Context()
+		kaTicker := time.NewTicker(streamKeepAliveInterval(auth))
+		defer kaTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-kaTicker.C:
+				if _, wErr := fmt.Fprint(w, ": g2a-keepalive\n\n"); wErr != nil {
+					return
+				}
+				flusher.Flush()
+			case <-ch:
+				if _, wErr := fmt.Fprint(w, "event: status.changed\ndata: {\"ok\":true}\n\n"); wErr != nil {
+					return
+				}
+				flusher.Flush()
+			}
+		}
 	})
 
 	mux.HandleFunc("/trusted/pending", func(w http.ResponseWriter, r *http.Request) {

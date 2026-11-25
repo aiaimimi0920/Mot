@@ -251,6 +251,7 @@ type TrustedConsentBroker struct {
 	scopePrompts map[string]*PendingScopePrompt
 	queuePrompts map[string]*PendingQueuePrompt  // key: session_id|queue_id
 	resumes      map[string]*PendingResumePrompt // key: session_id
+	onChange     func()
 }
 
 func NewTrustedConsentBroker(autoScope bool) *TrustedConsentBroker {
@@ -259,6 +260,21 @@ func NewTrustedConsentBroker(autoScope bool) *TrustedConsentBroker {
 		scopePrompts: make(map[string]*PendingScopePrompt),
 		queuePrompts: make(map[string]*PendingQueuePrompt),
 		resumes:      make(map[string]*PendingResumePrompt),
+	}
+}
+
+func (c *TrustedConsentBroker) SetOnChange(fn func()) {
+	c.mu.Lock()
+	c.onChange = fn
+	c.mu.Unlock()
+}
+
+func (c *TrustedConsentBroker) notifyChanged() {
+	c.mu.Lock()
+	fn := c.onChange
+	c.mu.Unlock()
+	if fn != nil {
+		fn()
 	}
 }
 
@@ -276,6 +292,7 @@ func (c *TrustedConsentBroker) PromptSessionScope(scope model.FrozenScope, scope
 		replyCh:     ch,
 	}
 	c.mu.Unlock()
+	c.notifyChanged()
 
 	select {
 	case dec := <-ch:
@@ -284,6 +301,7 @@ func (c *TrustedConsentBroker) PromptSessionScope(scope model.FrozenScope, scope
 		c.mu.Lock()
 		delete(c.scopePrompts, pid)
 		c.mu.Unlock()
+		c.notifyChanged()
 		return ScopeDecision{Approved: false}
 	}
 }
@@ -298,6 +316,7 @@ func (c *TrustedConsentBroker) DecideScope(promptID string, approved bool, remem
 	if !ok {
 		return "", false
 	}
+	c.notifyChanged()
 	p.replyCh <- ScopeDecision{Approved: approved, RememberAutoJoin: rememberAutoJoin}
 	return p.ScopeDigest, true
 }
@@ -306,15 +325,19 @@ func (c *TrustedConsentBroker) RegisterQueuePrompt(p PendingQueuePrompt) {
 	c.mu.Lock()
 	c.queuePrompts[store.QueueKey(p.SessionID, p.QueueID)] = &p
 	c.mu.Unlock()
+	c.notifyChanged()
 }
 
 func (c *TrustedConsentBroker) PopQueuePrompt(sessionID, queueID string) (*PendingQueuePrompt, bool) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	k := store.QueueKey(sessionID, queueID)
 	p, ok := c.queuePrompts[k]
 	if ok {
 		delete(c.queuePrompts, k)
+	}
+	c.mu.Unlock()
+	if ok {
+		c.notifyChanged()
 	}
 	return p, ok
 }
@@ -323,14 +346,18 @@ func (c *TrustedConsentBroker) RegisterResumePrompt(sessionID string) {
 	c.mu.Lock()
 	c.resumes[sessionID] = &PendingResumePrompt{SessionID: sessionID}
 	c.mu.Unlock()
+	c.notifyChanged()
 }
 
 func (c *TrustedConsentBroker) PopResumePrompt(sessionID string) bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	_, ok := c.resumes[sessionID]
 	if ok {
 		delete(c.resumes, sessionID)
+	}
+	c.mu.Unlock()
+	if ok {
+		c.notifyChanged()
 	}
 	return ok
 }
@@ -371,6 +398,9 @@ type Engine struct {
 
 	signalMu sync.Mutex
 	signalCh chan struct{}
+
+	dashMu   sync.Mutex
+	dashSubs map[chan struct{}]struct{}
 }
 
 func NewEngine(cfg Config, persistence *store.PersistencePort, originClient OriginClientPort, pushStream *EventStreamHub, consent *TrustedConsentBroker) *Engine {
@@ -387,7 +417,7 @@ func NewEngine(cfg Config, persistence *store.PersistencePort, originClient Orig
 	if consent == nil {
 		consent = NewTrustedConsentBroker(cfg.AutoApproveScope)
 	}
-	return &Engine{
+	eng := &Engine{
 		cfg:            cfg,
 		persistence:    persistence,
 		originClient:   originClient,
@@ -395,7 +425,10 @@ func NewEngine(cfg Config, persistence *store.PersistencePort, originClient Orig
 		pushStream:     pushStream,
 		consent:        consent,
 		signalCh:       make(chan struct{}),
+		dashSubs:       make(map[chan struct{}]struct{}),
 	}
+	consent.SetOnChange(eng.NotifyDashboard)
+	return eng
 }
 
 func (e *Engine) PushStream() *EventStreamHub                 { return e.pushStream }
@@ -403,11 +436,35 @@ func (e *Engine) Consent() *TrustedConsentBroker              { return e.consent
 func (e *Engine) Persistence() *store.PersistencePort         { return e.persistence }
 func (e *Engine) OutboundOrigin() *OriginOutboundStreamBroker { return e.outboundOrigin }
 
+func (e *Engine) SubscribeDashboard() (chan struct{}, func()) {
+	ch := make(chan struct{}, 1)
+	e.dashMu.Lock()
+	e.dashSubs[ch] = struct{}{}
+	e.dashMu.Unlock()
+	return ch, func() {
+		e.dashMu.Lock()
+		delete(e.dashSubs, ch)
+		e.dashMu.Unlock()
+	}
+}
+
+func (e *Engine) NotifyDashboard() {
+	e.dashMu.Lock()
+	defer e.dashMu.Unlock()
+	for ch := range e.dashSubs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
 func (e *Engine) broadcastWakeup() {
 	e.signalMu.Lock()
 	close(e.signalCh)
 	e.signalCh = make(chan struct{})
 	e.signalMu.Unlock()
+	e.NotifyDashboard()
 }
 
 func (e *Engine) waitWakeup(timeout time.Duration) {
@@ -502,6 +559,9 @@ func (e *Engine) HandleOriginCapabilities(payload model.OriginCapabilitiesPayloa
 		}
 		return struct{}{}, nil
 	})
+	if gErr == nil {
+		e.NotifyDashboard()
+	}
 	return gErr
 }
 
@@ -1654,6 +1714,9 @@ func (e *Engine) SetPolicyOverride(slotID, methodID, actor, policy string) *mode
 		d.AppendAudit(e.cfg.ClockNowMs(), "policy.override", slotID, "", "", fmt.Sprintf("%s[%s] -> %s", methodID, actor, policy))
 		return struct{}{}, nil
 	})
+	if gErr == nil {
+		e.NotifyDashboard()
+	}
 	return gErr
 }
 
@@ -1730,6 +1793,9 @@ func (e *Engine) ToggleSessionModality(sessionID string, allowVisual, allowAudio
 			fmt.Sprintf("visual=%v audio=%v", allowVisual, allowAudio))
 		return struct{}{}, nil
 	})
+	if gErr == nil {
+		e.NotifyDashboard()
+	}
 	return gErr
 }
 
