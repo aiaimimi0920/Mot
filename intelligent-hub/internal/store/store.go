@@ -17,6 +17,7 @@ const (
 	MaxChatDedupEntries     = 2048
 	MaxSettledPerSlot       = 256
 	MaxTerminalQueuesStored = 512
+	MaxClosedSessionsStored = 512
 )
 
 type SlotRecord struct {
@@ -124,6 +125,7 @@ type HubStoreData struct {
 	Slots            map[string]*SlotRecord        `json:"slots"`
 	SlotViews        map[string]*SlotView          `json:"slot_views"`
 	Sessions         map[string]*SessionRecord     `json:"sessions"`
+	SessionOrder     []string                      `json:"session_order,omitempty"`
 	Queues           map[string]*QueueLedgerRecord `json:"queues"`
 	QueueOrder       []string                      `json:"queue_order,omitempty"`
 	ChatDedup        map[string]bool               `json:"chat_dedup"`
@@ -139,6 +141,7 @@ func NewHubStoreData() *HubStoreData {
 		Slots:            make(map[string]*SlotRecord),
 		SlotViews:        make(map[string]*SlotView),
 		Sessions:         make(map[string]*SessionRecord),
+		SessionOrder:     make([]string, 0),
 		Queues:           make(map[string]*QueueLedgerRecord),
 		QueueOrder:       make([]string, 0),
 		ChatDedup:        make(map[string]bool),
@@ -148,6 +151,64 @@ func NewHubStoreData() *HubStoreData {
 		PolicyOverrides:  make(map[string]string),
 		AuditLog:         make([]AuditEntry, 0),
 	}
+}
+
+func (d *HubStoreData) RegisterSession(sess *SessionRecord) {
+	if _, exists := d.Sessions[sess.SessionID]; !exists {
+		d.SessionOrder = append(d.SessionOrder, sess.SessionID)
+	}
+	d.Sessions[sess.SessionID] = sess
+	d.PruneClosedSessions()
+}
+
+// PruneClosedSessions bounds retained closed SessionRecords to MaxClosedSessionsStored so long-running
+// Hubs never accumulate unbounded session history or slow down per-slot session scans.
+func (d *HubStoreData) PruneClosedSessions() {
+	if len(d.Sessions) <= MaxClosedSessionsStored {
+		return
+	}
+	if len(d.SessionOrder) < len(d.Sessions) {
+		seen := make(map[string]bool, len(d.SessionOrder))
+		for _, sid := range d.SessionOrder {
+			seen[sid] = true
+		}
+		for sid := range d.Sessions {
+			if !seen[sid] {
+				d.SessionOrder = append(d.SessionOrder, sid)
+			}
+		}
+	}
+	hasLiveQueue := make(map[string]bool)
+	for _, rec := range d.Queues {
+		if rec.State == "running" || rec.State == "awaiting_confirmation" {
+			hasLiveQueue[rec.SessionID] = true
+		}
+	}
+	closedCount := 0
+	for _, s := range d.Sessions {
+		if s.State == "closed" && !hasLiveQueue[s.SessionID] {
+			closedCount++
+		}
+	}
+	if closedCount <= MaxClosedSessionsStored {
+		return
+	}
+	targetRemove := closedCount - MaxClosedSessionsStored
+	removed := 0
+	keptOrder := make([]string, 0, len(d.SessionOrder))
+	for _, sid := range d.SessionOrder {
+		sess, ok := d.Sessions[sid]
+		if !ok {
+			continue
+		}
+		if removed < targetRemove && sess.State == "closed" && !hasLiveQueue[sid] {
+			delete(d.Sessions, sid)
+			removed++
+			continue
+		}
+		keptOrder = append(keptOrder, sid)
+	}
+	d.SessionOrder = keptOrder
 }
 
 func (d *HubStoreData) AppendAudit(nowMs int64, category, slotID, sessionID, queueID, summary string) {
@@ -413,32 +474,146 @@ func MutateVolatile[T any](p *PersistencePort, fn func(d *HubStoreData) (T, *mod
 	return res, gErr
 }
 
+func cloneOptionalString(p *string) *string {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+func cloneOptionalInt64(p *int64) *int64 {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+func cloneStringAnyMap(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// Clone creates an in-memory structural copy of HubStoreData without reflection or JSON marshaling,
+// enabling microsecond-scale rollback snapshots inside Atomic transactions.
+func (d *HubStoreData) Clone() *HubStoreData {
+	out := &HubStoreData{
+		Slots:            make(map[string]*SlotRecord, len(d.Slots)),
+		SlotViews:        make(map[string]*SlotView, len(d.SlotViews)),
+		Sessions:         make(map[string]*SessionRecord, len(d.Sessions)),
+		SessionOrder:     append([]string(nil), d.SessionOrder...),
+		Queues:           make(map[string]*QueueLedgerRecord, len(d.Queues)),
+		QueueOrder:       append([]string(nil), d.QueueOrder...),
+		ChatDedup:        make(map[string]bool, len(d.ChatDedup)),
+		ChatDedupOrder:   append([]string(nil), d.ChatDedupOrder...),
+		ConfirmCooldowns: make(map[string]int64, len(d.ConfirmCooldowns)),
+		ApprovedScopes:   make(map[string]bool, len(d.ApprovedScopes)),
+		PolicyOverrides:  make(map[string]string, len(d.PolicyOverrides)),
+		AuditLog:         append([]AuditEntry(nil), d.AuditLog...),
+	}
+	for k, sl := range d.Slots {
+		cp := *sl
+		cp.Capabilities = append([]model.CapabilityEntry(nil), sl.Capabilities...)
+		cp.CapabilityByID = make(map[string]model.CapabilityEntry, len(sl.CapabilityByID))
+		for cid, ce := range sl.CapabilityByID {
+			cp.CapabilityByID[cid] = ce
+		}
+		cp.AllowlistedCores = make(map[string]bool, len(sl.AllowlistedCores))
+		for ac, ok := range sl.AllowlistedCores {
+			cp.AllowlistedCores[ac] = ok
+		}
+		out.Slots[k] = &cp
+	}
+	for k, sv := range d.SlotViews {
+		cp := *sv
+		cp.StateBrief = cloneStringAnyMap(sv.StateBrief)
+		cp.Methods = make(map[string]model.ActiveMethodGrant, len(sv.Methods))
+		for mk, mg := range sv.Methods {
+			mgCopy := mg
+			if mg.Targets != nil {
+				mgCopy.Targets = append([]model.TargetCandidate(nil), mg.Targets...)
+			}
+			cp.Methods[mk] = mgCopy
+		}
+		cp.SettledExecutions = make(map[string]model.OriginExecuteReply, len(sv.SettledExecutions))
+		for ek, er := range sv.SettledExecutions {
+			cp.SettledExecutions[ek] = er
+		}
+		cp.SettledOrder = append([]string(nil), sv.SettledOrder...)
+		cp.LatestVisual = cloneStringAnyMap(sv.LatestVisual)
+		cp.LatestAudio = cloneStringAnyMap(sv.LatestAudio)
+		if sv.AllowedTimelineTags != nil {
+			cp.AllowedTimelineTags = append([]string(nil), sv.AllowedTimelineTags...)
+		}
+		out.SlotViews[k] = &cp
+	}
+	for k, se := range d.Sessions {
+		cp := *se
+		cp.ActiveQueueID = cloneOptionalString(se.ActiveQueueID)
+		cp.ConsumptionCap = cloneOptionalInt64(se.ConsumptionCap)
+		if se.NegotiatedExtensions != nil {
+			cp.NegotiatedExtensions = append([]string(nil), se.NegotiatedExtensions...)
+		}
+		permCopy := make(map[string][]string, len(se.Scope.PermittedMethods))
+		for pmKey, actors := range se.Scope.PermittedMethods {
+			permCopy[pmKey] = append([]string(nil), actors...)
+		}
+		cp.Scope.PermittedMethods = permCopy
+		out.Sessions[k] = &cp
+	}
+	for k, qr := range d.Queues {
+		cp := *qr
+		cp.ApprovedDigest = cloneOptionalString(qr.ApprovedDigest)
+		cp.CurrentExecutionID = cloneOptionalString(qr.CurrentExecutionID)
+		cp.Queue.Steps = append([]model.QueueStep(nil), qr.Queue.Steps...)
+		cp.StepReceipts = make([]model.StepReceipt, len(qr.StepReceipts))
+		for i, sr := range qr.StepReceipts {
+			srCopy := sr
+			srCopy.FailureReason = cloneOptionalString(sr.FailureReason)
+			srCopy.EffectSummary = cloneStringAnyMap(sr.EffectSummary)
+			cp.StepReceipts[i] = srCopy
+		}
+		out.Queues[k] = &cp
+	}
+	for k, v := range d.ChatDedup {
+		out.ChatDedup[k] = v
+	}
+	for k, v := range d.ConfirmCooldowns {
+		out.ConfirmCooldowns[k] = v
+	}
+	for k, v := range d.ApprovedScopes {
+		out.ApprovedScopes[k] = v
+	}
+	for k, v := range d.PolicyOverrides {
+		out.PolicyOverrides[k] = v
+	}
+	return out
+}
+
 // Atomic executes a durable ledger transaction with full rollback on error and immediate crash-safe disk persistence.
 func Atomic[T any](p *PersistencePort, tx func(d *HubStoreData) (T, *model.G2AError)) (T, *model.G2AError) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	var zero T
-	snapshotBytes, err := json.Marshal(p.data)
-	if err != nil {
-		return zero, model.NewError(model.ErrUnavailable, 503, "Failed to snapshot store")
-	}
+	backup := p.data.Clone()
 
 	res, gErr := tx(p.data)
 	if gErr != nil {
-		rolledBack := NewHubStoreData()
-		_ = json.Unmarshal(snapshotBytes, rolledBack)
-		rolledBack.EnsureMaps()
-		p.data = rolledBack
+		p.data = backup
 		return zero, gErr
 	}
 
 	if p.filePath != "" {
 		if err := p.persistLocked(); err != nil {
-			rolledBack := NewHubStoreData()
-			_ = json.Unmarshal(snapshotBytes, rolledBack)
-			rolledBack.EnsureMaps()
-			p.data = rolledBack
+			p.data = backup
 			return zero, model.NewError(model.ErrUnavailable, 503, "Failed to persist ledger")
 		}
 		p.dirty = false

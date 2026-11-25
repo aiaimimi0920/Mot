@@ -545,6 +545,179 @@ class TestOptimizationsAndStress(unittest.TestCase):
                 mem_srv.stop()
                 mem_store.close()
 
+    def test_early_push_confirmation_race_ws_accept_check_and_relay_keepalive(self) -> None:
+        # 1. Early queue.confirmed / queue.declined arriving on push stream BEFORE HTTP 409 returns!
+        submit_attempts: list[str] = []
+        race_sdk_holder: dict[str, CoreSDK] = {}
+
+        def _racing_confirm_post(endpoint, op, payload, token, sid):
+            if op == "queue.submit":
+                qid = payload["queue_id"]
+                submit_attempts.append(qid)
+                if len(submit_attempts) == 1:
+                    # Simulate fast SSE/WS push delivering queue.confirmed BEFORE HTTP 409 response unwinds!
+                    race_sdk_holder["sdk"].on_event_queue_confirmed(qid)
+                    raise G2AError("confirmation_required", 409, "Awaiting confirmation")
+                return {"queue_id": qid, "queue_state": "completed", "step_receipts": []}
+            return {}
+
+        race_sdk = CoreSDK(planner=_NoOpPlanner(), custom_post_fn=_racing_confirm_post)
+        race_sdk.session_id = "sess-race-1"
+        race_sdk_holder["sdk"] = race_sdk
+
+        q1 = MethodCallQueue("Q-race-ok", 1, 1, "proactive", False, "Trade wood", [QueueStep(0, "#05", "player", {"qty": 10})])
+        rec_ok = race_sdk.submit_queue_with_standard_recovery(q1)
+        self.assertIsNotNone(rec_ok)
+        self.assertEqual(rec_ok.queue_state, "completed")
+        self.assertEqual(submit_attempts, ["Q-race-ok", "Q-race-ok"])
+        self.assertEqual(race_sdk.pending_confirm_queues, {})
+
+        # Also verify early queue.declined before HTTP 409 sets refusal cooldown and cleans pending_confirm_queues
+        def _racing_decline_post(endpoint, op, payload, token, sid):
+            qid = payload["queue_id"]
+            race_sdk_holder["dec_sdk"].on_event_queue_declined(qid, cooldown_ms=60000)
+            raise G2AError("confirmation_required", 409, "Awaiting confirmation")
+
+        dec_sdk = CoreSDK(planner=_NoOpPlanner(), custom_post_fn=_racing_decline_post)
+        dec_sdk.session_id = "sess-race-2"
+        race_sdk_holder["dec_sdk"] = dec_sdk
+        q_dec = MethodCallQueue("Q-race-dec", 1, 1, "proactive", False, "Trade gold", [QueueStep(0, "#05", "player", {"qty": 99})])
+        self.assertIsNone(dec_sdk.submit_queue_with_standard_recovery(q_dec))
+        self.assertEqual(dec_sdk.pending_confirm_queues, {})
+        self.assertEqual(len(dec_sdk.refusal_cooldowns), 1)
+
+        # 2. RFC 6455 Sec-WebSocket-Accept spoofing guard in CoreSDK WebSocket client
+        spoof_ln = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        spoof_ln.bind(("127.0.0.1", 0))
+        spoof_ln.listen(4)
+        _, spoof_port = spoof_ln.getsockname()
+        spoof_stop = threading.Event()
+        rejected_upgrades = {"count": 0}
+
+        def _spoof_ws_server() -> None:
+            spoof_ln.settimeout(0.2)
+            while not spoof_stop.is_set():
+                try:
+                    cli, _ = spoof_ln.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                with cli:
+                    try:
+                        req_raw = cli.recv(4096).decode("latin1")
+                        if "POST /g2a/v1/core " in req_raw:
+                            auth_rep = json.dumps(
+                                {
+                                    "g2a_version": "0.0.1",
+                                    "request_id": "r1",
+                                    "session_id": "sess-spoof",
+                                    "timestamp_ms": 1,
+                                    "acceptance": "accepted",
+                                    "result": {
+                                        "session_id": "sess-spoof",
+                                        "scope_digest": "sha256:00",
+                                        "capability_table_digest": "sha256:11",
+                                        "frozen_scope": {
+                                            "player_id": "p1",
+                                            "core_id": "c1",
+                                            "game_instance_id": "g1",
+                                            "slot_id": "s1",
+                                            "role_kind": "companion",
+                                            "billing_mode": "player_metered",
+                                            "permitted_methods": {},
+                                            "capability_table_digest": "sha256:11",
+                                        },
+                                    },
+                                }
+                            ).encode("utf-8")
+                            cli.sendall(
+                                f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(auth_rep)}\r\n\r\n".encode(
+                                    "ascii"
+                                )
+                                + auth_rep
+                            )
+                        elif "Upgrade: websocket" in req_raw:
+                            rejected_upgrades["count"] += 1
+                            cli.sendall(
+                                b"HTTP/1.1 101 Switching Protocols\r\n"
+                                b"Upgrade: websocket\r\n"
+                                b"Connection: Upgrade\r\n"
+                                b"Sec-WebSocket-Accept: BOGUS_ACCEPT_VALUE==\r\n\r\n"
+                            )
+                    except OSError:
+                        pass
+
+        t_spoof = threading.Thread(target=_spoof_ws_server, daemon=True)
+        t_spoof.start()
+        ws_sdk = CoreSDK(planner=_NoOpPlanner(), allow_loopback=True, stream_mode="websocket")
+        try:
+            ws_sdk.slot_digest_index["s1"] = "sha256:11"
+            ws_sdk.capability_cache["sha256:11"] = []
+            # Because Sec-WebSocket-Accept is spoofed, _stream_ready MUST stay False!
+            ws_sdk.hub_endpoint = f"http://127.0.0.1:{spoof_port}"
+            ws_sdk.auth_token = "tok"
+            ws_sdk.session_id = "sess-spoof"
+            ws_sdk._start_websocket_stream_async()
+            self.assertFalse(ws_sdk._stream_ready.wait(timeout=0.35))
+            self.assertGreaterEqual(rejected_upgrades["count"], 1)
+        finally:
+            ws_sdk.shutdown_session_cleanly(notify_hub=False)
+            spoof_stop.set()
+            spoof_ln.close()
+            t_spoof.join(timeout=1.0)
+
+        # 3. CloudRelayServer strict JSON duplicate-key guard, idle SSE keepalive, & subscriber set cleanup
+        relay = CloudRelayServer(host="127.0.0.1", port=0, relay_token="rel-sec-tok", idle_keepalive_sec=0.04)
+        relay_url = relay.start()
+        r_host, r_port_str = relay_url.replace("http://", "").split(":")
+        r_port = int(r_port_str)
+        try:
+            # Duplicate key on /hubs/h1/g2a/v1/core -> 400
+            c_dup = http.client.HTTPConnection(r_host, r_port, timeout=2.0)
+            try:
+                c_dup.request(
+                    "POST",
+                    "/hubs/h1/g2a/v1/core",
+                    body=b'{"request_id":"1","request_id":"2"}',
+                    headers={"Content-Type": "application/json"},
+                )
+                r_dup = c_dup.getresponse()
+                _ = r_dup.read()
+                self.assertEqual(r_dup.status, 400)
+            finally:
+                c_dup.close()
+
+            # Idle keepalive on /hubs/h1/g2a/v1/core/events + clean _sse_subscribers removal on close
+            c_sse = http.client.HTTPConnection(r_host, r_port, timeout=2.0)
+            r_sse = None
+            try:
+                c_sse.request("GET", "/hubs/h1/g2a/v1/core/events?session_id=sess-clean-1")
+                r_sse = c_sse.getresponse()
+                self.assertEqual(r_sse.status, 200)
+                saw_ready = False
+                saw_ka = False
+                for _ in range(8):
+                    ln = r_sse.readline().decode("utf-8")
+                    if ln.startswith(": relay-core-sse-ready"):
+                        saw_ready = True
+                    elif ln.startswith(": g2a-keepalive"):
+                        saw_ka = True
+                    if saw_ready and saw_ka:
+                        break
+                self.assertTrue(saw_ready and saw_ka)
+            finally:
+                if r_sse is not None:
+                    r_sse.close()
+                c_sse.close()
+
+            deadline = time.time() + 1.0
+            while time.time() < deadline and "sess-clean-1" in relay._sse_subscribers:
+                time.sleep(0.02)
+            self.assertNotIn("sess-clean-1", relay._sse_subscribers)
+        finally:
+            relay.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

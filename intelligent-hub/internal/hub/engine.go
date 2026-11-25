@@ -731,6 +731,9 @@ func (e *Engine) OnPlayerPresenceChanged(slotID string, online bool, remainingOn
 				}
 			}
 		}
+		if len(closed) > 0 {
+			d.PruneClosedSessions()
+		}
 		return closed, nil
 	})
 	e.broadcastWakeup()
@@ -821,7 +824,7 @@ func (e *Engine) HandleSessionAuthorize(g2aVersion, callerCoreID string, req mod
 		}
 		sessionID := generateID("sess")
 		now := e.cfg.ClockNowMs()
-		d.Sessions[sessionID] = &store.SessionRecord{
+		d.RegisterSession(&store.SessionRecord{
 			SessionID:              sessionID,
 			CallerCoreID:           callerCoreID,
 			Scope:                  prep.scope,
@@ -835,7 +838,7 @@ func (e *Engine) HandleSessionAuthorize(g2aVersion, callerCoreID string, req mod
 			ConsumptionUsed:        0,
 			ConsumptionCap:         req.ConsumptionCap,
 			NegotiatedExtensions:   negotiatedExts,
-		}
+		})
 		d.AppendAudit(now, "session.authorized", req.SlotID, sessionID, "", fmt.Sprintf("Core %s connected to %s", callerCoreID, req.SlotID))
 		var tableToSend []model.CapabilityEntry
 		if req.CachedCapabilityDigest == nil || *req.CachedCapabilityDigest != prep.capDigest {
@@ -918,6 +921,7 @@ func (e *Engine) OnTrustedResumeDecision(sessionID string, approved bool) {
 			return resumeOutcome{kind: "resumed", ctx: e.projectContextInTx(d, sess, nil)}, nil
 		}
 		sess.State = "closed"
+		d.PruneClosedSessions()
 		return resumeOutcome{kind: "closed"}, nil
 	})
 	if out.kind == "resumed" {
@@ -937,6 +941,7 @@ func (e *Engine) HandleSessionClose(callerCoreID, sessionID string) *model.G2AEr
 		if sess.State != "closed" {
 			list = e.cancelAndFenceSessionQueuesInTx(d, sess)
 			sess.State = "closed"
+			d.PruneClosedSessions()
 		}
 		return list, nil
 	})
@@ -1655,6 +1660,9 @@ func (e *Engine) RevokeAutoJoinScope(scopeDigest string, closeMatchingSessions b
 				}
 			}
 		}
+		if len(closedIDs) > 0 {
+			d.PruneClosedSessions()
+		}
 		d.AppendAudit(e.cfg.ClockNowMs(), "scope.auto_join_revoked", "", "", "", scopeDigest)
 		return struct{}{}, nil
 	})
@@ -1679,6 +1687,7 @@ func (e *Engine) RevokeSessionFromTrustedUI(sessionID string) *model.G2AError {
 		if sess.State != "closed" {
 			cancels = e.cancelAndFenceSessionQueuesInTx(d, sess)
 			sess.State = "closed"
+			d.PruneClosedSessions()
 			d.AppendAudit(e.cfg.ClockNowMs(), "session.revoked_by_player", sess.Scope.SlotID, sessionID, "", "Revoked from Trusted UI")
 		}
 		return struct{}{}, nil

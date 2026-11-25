@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import http.client
 import json
 import os
@@ -98,7 +99,10 @@ class CoreSDK:
 
         self.capability_cache: Dict[str, List[CapabilityEntry]] = {}
         self.slot_digest_index: Dict[str, str] = {}
+        self._state_lock = threading.RLock()
         self.pending_confirm_queues: Dict[str, MethodCallQueue] = {}
+        self._early_confirmed_queues: OrderedDict[str, None] = OrderedDict()
+        self._early_declined_queues: OrderedDict[str, int] = OrderedDict()
         self.completed_receipts: List[QueueReceipt] = []
         self.seen_event_ids: OrderedDict[str, None] = OrderedDict()
         self.refusal_cooldowns: Dict[str, int] = {}
@@ -300,12 +304,13 @@ class CoreSDK:
             return None
         # Client-side refusal cooldown pre-filter for proactive queues (avoids redundant 429 network round-trips)
         now_ms = int(time.time() * 1000)
-        for k in [k for k, until in self.refusal_cooldowns.items() if now_ms >= until]:
-            self.refusal_cooldowns.pop(k, None)
-        if queue.trigger == "proactive":
-            fp = jcs_sha256("g2a.fp.v1", [s.to_dict() for s in queue.steps])
-            if now_ms < self.refusal_cooldowns.get(fp, 0):
-                return None
+        with self._state_lock:
+            for k in [k for k, until in self.refusal_cooldowns.items() if now_ms >= until]:
+                self.refusal_cooldowns.pop(k, None)
+            if queue.trigger == "proactive":
+                fp = jcs_sha256("g2a.fp.v1", [s.to_dict() for s in queue.steps])
+                if now_ms < self.refusal_cooldowns.get(fp, 0):
+                    return None
         try:
             res = self._post_envelope("queue.submit", queue.to_dict(), session_id=self.session_id)
             receipt = QueueReceipt.from_dict(res)
@@ -313,8 +318,20 @@ class CoreSDK:
             return receipt
         except G2AError as err:
             if err.code == "confirmation_required":
-                # Preserve original queue_id and steps intact while awaiting player decision!
-                self.pending_confirm_queues[queue.queue_id] = queue
+                # Reconcile atomically in case SSE/WS delivered queue.confirmed or queue.declined before HTTP 409 arrived!
+                resubmit_now = False
+                with self._state_lock:
+                    if queue.queue_id in self._early_confirmed_queues:
+                        self._early_confirmed_queues.pop(queue.queue_id, None)
+                        resubmit_now = True
+                    elif queue.queue_id in self._early_declined_queues:
+                        cd_ms = self._early_declined_queues.pop(queue.queue_id)
+                        fp = jcs_sha256("g2a.fp.v1", [s.to_dict() for s in queue.steps])
+                        self.refusal_cooldowns[fp] = int(time.time() * 1000) + cd_ms
+                    else:
+                        self.pending_confirm_queues[queue.queue_id] = queue
+                if resubmit_now:
+                    return self.submit_queue_with_standard_recovery(queue, _replan_depth=_replan_depth)
                 return None
             if err.code == "stale_context":
                 if err.fresh_context is not None and _replan_depth < 2:
@@ -332,16 +349,26 @@ class CoreSDK:
             return None
 
     def on_event_queue_confirmed(self, queue_id: str) -> Optional[QueueReceipt]:
-        original = self.pending_confirm_queues.pop(queue_id, None)
+        with self._state_lock:
+            original = self.pending_confirm_queues.pop(queue_id, None)
+            if original is None:
+                self._early_confirmed_queues[queue_id] = None
+                if len(self._early_confirmed_queues) > 256:
+                    self._early_confirmed_queues.popitem(last=False)
         if original is not None:
             return self.submit_queue_with_standard_recovery(original)
         return None
 
     def on_event_queue_declined(self, queue_id: str, cooldown_ms: int = 60000) -> None:
-        declined = self.pending_confirm_queues.pop(queue_id, None)
-        if declined is not None:
-            fp = jcs_sha256("g2a.fp.v1", [s.to_dict() for s in declined.steps])
-            self.refusal_cooldowns[fp] = int(time.time() * 1000) + cooldown_ms
+        with self._state_lock:
+            declined = self.pending_confirm_queues.pop(queue_id, None)
+            if declined is not None:
+                fp = jcs_sha256("g2a.fp.v1", [s.to_dict() for s in declined.steps])
+                self.refusal_cooldowns[fp] = int(time.time() * 1000) + cooldown_ms
+            else:
+                self._early_declined_queues[queue_id] = cooldown_ms
+                if len(self._early_declined_queues) > 256:
+                    self._early_declined_queues.popitem(last=False)
 
     def reconcile_unknown_queue(self, queue_id: str) -> Optional[QueueReceipt]:
         if not self.session_id or self.closed:
@@ -362,11 +389,12 @@ class CoreSDK:
     def handle_event_envelope(self, env: Dict[str, Any]) -> None:
         ev_id = env.get("event_id")
         if ev_id:
-            if ev_id in self.seen_event_ids:
-                return
-            self.seen_event_ids[ev_id] = None
-            if len(self.seen_event_ids) > 1024:
-                self.seen_event_ids.popitem(last=False)
+            with self._state_lock:
+                if ev_id in self.seen_event_ids:
+                    return
+                self.seen_event_ids[ev_id] = None
+                if len(self.seen_event_ids) > 1024:
+                    self.seen_event_ids.popitem(last=False)
 
         ev_name = env.get("event")
         payload = env.get("payload") or {}
@@ -388,11 +416,12 @@ class CoreSDK:
     # --- Transport Internals ---
 
     def _record_receipt(self, receipt: QueueReceipt) -> None:
-        self.completed_receipts.append(receipt)
-        if len(self.completed_receipts) > 256:
-            del self.completed_receipts[:-256]
-        if receipt.latest_context is not None:
-            self.latest_context = receipt.latest_context
+        with self._state_lock:
+            self.completed_receipts.append(receipt)
+            if len(self.completed_receipts) > 256:
+                del self.completed_receipts[:-256]
+            if receipt.latest_context is not None:
+                self.latest_context = receipt.latest_context
         if self.on_receipt_callback:
             self.on_receipt_callback(receipt)
 
@@ -652,16 +681,32 @@ class CoreSDK:
 
                     resp_head = b""
                     while b"\r\n\r\n" not in resp_head:
+                        if len(resp_head) > 16384:
+                            raise ConnectionError("Oversized WebSocket handshake headers")
                         chunk = raw_sock.recv(1)
                         if not chunk:
                             raise EOFError("Handshake closed")
                         resp_head += chunk
-                    status_line = resp_head.split(b"\r\n", 1)[0].decode("latin1")
+                    header_lines = resp_head.decode("latin1").split("\r\n")
+                    status_line = header_lines[0]
                     if " 101 " not in status_line:
                         if " 401 " in status_line or " 403 " in status_line:
                             self.shutdown_session_cleanly(notify_hub=False)
                             return
                         raise ConnectionError(f"WebSocket upgrade rejected: {status_line}")
+
+                    expected_accept = base64.b64encode(
+                        hashlib.sha1((ws_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+                    ).decode("ascii")
+                    actual_accept = ""
+                    for hline in header_lines[1:]:
+                        if ":" in hline:
+                            hk, hv = hline.split(":", 1)
+                            if hk.strip().lower() == "sec-websocket-accept":
+                                actual_accept = hv.strip()
+                                break
+                    if actual_accept != expected_accept:
+                        raise ConnectionError("Invalid RFC 6455 Sec-WebSocket-Accept header")
 
                     self._stream_ready.set()
                     while not self._stop_event.is_set() and not self.closed:
@@ -673,6 +718,9 @@ class CoreSDK:
                             length = struct.unpack("!H", _recv_exact(raw_sock, 2))[0]
                         elif length == 127:
                             length = struct.unpack("!Q", _recv_exact(raw_sock, 8))[0]
+                        if length > (4 << 20):
+                            _send_masked_frame(raw_sock, 0x8)
+                            raise ConnectionError("WebSocket frame exceeds 4 MiB limit")
                         mask_key = _recv_exact(raw_sock, 4) if masked else b""
                         data = _recv_exact(raw_sock, length) if length > 0 else b""
                         if masked:

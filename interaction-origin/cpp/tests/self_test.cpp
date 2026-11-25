@@ -105,6 +105,67 @@ int main() {
     assert(std::get<std::string>(last_cap_payload.at("room_id").data) == "room-arena-1");
     assert(std::get<std::string>(last_cap_payload.at("faction_id").data) == "faction-red");
 
+    // 5. Verify 35-entity crowd priority sorting, multi-module grant merge, emergency stop, & epoch advance
+    std::vector<std::pair<std::string, JsonValue>> crowd_posts;
+    bool crowd_step_cancelled = false;
+    OriginSdk crowd_sdk("slot-crowd-cpp", [&](const std::string& op, const JsonValue& p) {
+        crowd_posts.emplace_back(op, p);
+    });
+    crowd_sdk.bind_actor_subject("companion");
+    crowd_sdk.register_capability(
+        {"#02", "interact", "Interact", {"companion"}, {}, true, {}, "allow"},
+        [&](const std::string&, const JsonObject&, const std::string&) {
+            return EffectOutcome::StartedExecuting([&]() { crowd_step_cancelled = true; });
+        });
+
+    crowd_sdk.bind_state_module(
+        "crowd_far",
+        []() { return JsonObject{{"sector", "north"}}; },
+        []() {
+            std::vector<TargetCandidate> cands;
+            for (int i = 0; i < 32; ++i) {
+                char id_buf[32];
+                std::snprintf(id_buf, sizeof(id_buf), "crate_%02d", i);
+                cands.push_back({id_buf, "Far Crate", "staged", "requires_proximity", "20.0m", std::nullopt, std::nullopt});
+            }
+            cands.push_back({"station_alert", "Halted Loom", "staged", std::nullopt, "14.0m", std::nullopt, "halted_no_silk"});
+            return std::vector<ActiveMethodGrant>{{"#02", "companion", "staged", std::move(cands)}};
+        });
+    crowd_sdk.bind_state_module(
+        "crowd_near",
+        []() { return JsonObject{{"radar", true}}; },
+        []() {
+            return std::vector<ActiveMethodGrant>{
+                {"#02", "companion", "staged", {
+                    {"chest_pointed", "Pointed Chest", "staged", std::nullopt, "9.0m", "pointed_ray", std::nullopt},
+                    {"lever_ready", "Close Lever", "ready", std::nullopt, "1.2m", "ahead 1.2m", std::nullopt},
+                }},
+            };
+        });
+
+    crowd_sdk.publish_capabilities_and_baseline();
+    const auto& init_sync = std::get<JsonObject>(crowd_posts.back().second.data);
+    const auto& upserted_arr = std::get<JsonArray>(init_sync.at("upserted_methods").data);
+    assert(upserted_arr.size() == 1);
+    const auto& merged_grant = std::get<JsonObject>(upserted_arr[0].data);
+    assert(std::get<std::string>(merged_grant.at("readiness").data) == "ready");
+    const auto& target_arr = std::get<JsonArray>(merged_grant.at("targets").data);
+    assert(target_arr.size() == OriginSdk::kMaxCandidateTargets);
+    assert(std::get<std::string>(std::get<JsonObject>(target_arr[0].data).at("target_id").data) == "station_alert");
+    assert(std::get<std::string>(std::get<JsonObject>(target_arr[1].data).at("target_id").data) == "chest_pointed");
+    assert(std::get<std::string>(std::get<JsonObject>(target_arr[2].data).at("target_id").data) == "lever_ready");
+
+    auto c_exec = crowd_sdk.handle_origin_execute({"slot-crowd-cpp", 1, "invoke", "exec-crowd-1", "#02", "companion", {}});
+    assert(c_exec.state == "executing");
+    crowd_sdk.report_emergency_stop();
+    assert(crowd_step_cancelled);
+    assert(crowd_posts.back().first == "origin.player_event");
+
+    crowd_sdk.advance_epoch();
+    const auto& ep2_sync = std::get<JsonObject>(crowd_posts.back().second.data);
+    assert(std::get<int64_t>(ep2_sync.at("epoch").data) == 2);
+    assert(std::get<std::string>(ep2_sync.at("mode").data) == "full");
+
     std::cout << "C++17 G2A OriginSdk SelfTest PASSED | JCS=" << digest << "\n";
     return 0;
 }

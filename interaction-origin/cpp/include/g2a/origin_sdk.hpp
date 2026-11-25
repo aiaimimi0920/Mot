@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <deque>
 #include <fstream>
@@ -369,6 +371,64 @@ public:
         return {execution_id, "cancelled", std::nullopt, std::nullopt};
     }
 
+    void advance_epoch() {
+        std::lock_guard<std::recursive_mutex> lk(mu_);
+        current_epoch_++;
+        current_rev_ = 0;
+        last_sent_methods_.clear();
+        cancel_all_in_flight("epoch_advanced");
+        flush_full_sync();
+    }
+
+    void report_player_command(const std::string& command_text) {
+        std::lock_guard<std::recursive_mutex> lk(mu_);
+        flush_dirty_sync(true);
+        transport_("origin.player_event", JsonObject{
+            {"slot_id", slot_id_},
+            {"kind", "player_command"},
+            {"text", command_text},
+        });
+    }
+
+    void report_player_presence(bool online, int64_t remaining_online_humans = 0) {
+        std::lock_guard<std::recursive_mutex> lk(mu_);
+        sync_enabled_ = online || remaining_online_humans > 0;
+        transport_("origin.player_event", JsonObject{
+            {"slot_id", slot_id_},
+            {"kind", "presence_changed"},
+            {"online", online},
+            {"remaining_online_humans", remaining_online_humans},
+        });
+    }
+
+    void report_emergency_stop() {
+        std::lock_guard<std::recursive_mutex> lk(mu_);
+        cancel_all_in_flight("player_emergency_stop");
+        flush_dirty_sync(false);
+        transport_("origin.player_event", JsonObject{
+            {"slot_id", slot_id_},
+            {"kind", "emergency_stop"},
+        });
+    }
+
+    void report_queue_approval(
+        const std::string& session_id,
+        const std::string& queue_id,
+        const std::string& queue_digest,
+        const std::string& fingerprint,
+        bool approved) {
+        std::lock_guard<std::recursive_mutex> lk(mu_);
+        transport_("origin.player_event", JsonObject{
+            {"slot_id", slot_id_},
+            {"kind", "queue_approval"},
+            {"session_id", session_id},
+            {"queue_id", queue_id},
+            {"queue_digest", queue_digest},
+            {"fingerprint", fingerprint},
+            {"approved", approved},
+        });
+    }
+
     const CapabilityEntry& get_capability(const std::string& id) const { return capabilities_.at(id).def; }
 
 private:
@@ -398,13 +458,120 @@ private:
         }
     }
 
+    void cancel_all_in_flight(const std::string& reason) {
+        std::vector<std::pair<std::string, std::function<void()>>> active;
+        active.reserve(in_flight_.size());
+        for (auto& kv : in_flight_) {
+            active.emplace_back(kv.first, std::move(kv.second));
+        }
+        in_flight_.clear();
+        for (auto& [exec_id, fn] : active) {
+            if (fn) fn();
+            OriginExecuteReply rep{exec_id, "cancelled", std::nullopt, reason};
+            store_ledger_reply(rep);
+            pending_settled_.push_back(std::move(rep));
+        }
+    }
+
+    static double parse_anchor_meters(const std::optional<std::string>& anchor) {
+        if (!anchor || anchor->empty()) return 1e9;
+        std::string s = *anchor;
+        while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+        if (s.empty() || s.back() != 'm') return 1e9;
+        s.pop_back();
+        size_t sp = s.rfind(' ');
+        std::string tok = (sp == std::string::npos) ? s : s.substr(sp + 1);
+        try {
+            size_t idx = 0;
+            double d = std::stod(tok, &idx);
+            return (idx == tok.size() && std::isfinite(d)) ? d : 1e9;
+        } catch (...) {
+            return 1e9;
+        }
+    }
+
+    static bool contains_pointed_ci(const std::optional<std::string>& anchor) {
+        if (!anchor) return false;
+        std::string low;
+        low.reserve(anchor->size());
+        for (char c : *anchor) {
+            low.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        }
+        return low.find("pointed") != std::string::npos;
+    }
+
+    static std::vector<TargetCandidate> prioritize_targets(const std::vector<TargetCandidate>& raw) {
+        std::map<std::string, TargetCandidate> dedup;
+        for (const auto& t : raw) {
+            auto it = dedup.find(t.target_id);
+            if (it == dedup.end() || t.readiness == "ready") {
+                dedup[t.target_id] = t;
+            }
+        }
+        std::vector<TargetCandidate> ordered;
+        ordered.reserve(dedup.size());
+        for (auto& kv : dedup) ordered.push_back(std::move(kv.second));
+
+        std::sort(ordered.begin(), ordered.end(), [](const TargetCandidate& a, const TargetCandidate& b) {
+            int a_alert = (a.alert_tag && !a.alert_tag->empty()) ? 0 : 1;
+            int b_alert = (b.alert_tag && !b.alert_tag->empty()) ? 0 : 1;
+            if (a_alert != b_alert) return a_alert < b_alert;
+            int a_pt = contains_pointed_ci(a.player_anchor) ? 0 : 1;
+            int b_pt = contains_pointed_ci(b.player_anchor) ? 0 : 1;
+            if (a_pt != b_pt) return a_pt < b_pt;
+            int a_rdy = (a.readiness == "ready") ? 0 : 1;
+            int b_rdy = (b.readiness == "ready") ? 0 : 1;
+            if (a_rdy != b_rdy) return a_rdy < b_rdy;
+            double d_diff = parse_anchor_meters(a.actor_anchor) - parse_anchor_meters(b.actor_anchor);
+            if (std::fabs(d_diff) > 1e-6) return d_diff < 0.0;
+            return a.target_id < b.target_id;
+        });
+
+        if (ordered.size() > kMaxCandidateTargets) {
+            ordered.resize(kMaxCandidateTargets);
+        }
+        return ordered;
+    }
+
+    static void merge_grant(
+        std::map<std::pair<std::string, std::string>, ActiveMethodGrant>& grants,
+        const ActiveMethodGrant& incoming) {
+        std::pair<std::string, std::string> key{incoming.method_id, incoming.actor};
+        auto it = grants.find(key);
+        if (it != grants.end()) {
+            std::vector<TargetCandidate> combined = it->second.targets;
+            combined.insert(combined.end(), incoming.targets.begin(), incoming.targets.end());
+            auto prioritized = prioritize_targets(combined);
+            bool any_ready = (it->second.readiness == "ready") || (incoming.readiness == "ready");
+            for (const auto& t : prioritized) {
+                if (t.readiness == "ready") {
+                    any_ready = true;
+                    break;
+                }
+            }
+            it->second = ActiveMethodGrant{
+                incoming.method_id,
+                incoming.actor,
+                any_ready ? "ready" : "staged",
+                std::move(prioritized),
+            };
+        } else {
+            grants[key] = ActiveMethodGrant{
+                incoming.method_id,
+                incoming.actor,
+                incoming.readiness,
+                prioritize_targets(incoming.targets),
+            };
+        }
+    }
+
     std::pair<JsonObject, std::map<std::pair<std::string, std::string>, ActiveMethodGrant>> collect_view() {
         JsonObject brief;
         std::map<std::pair<std::string, std::string>, ActiveMethodGrant> grants;
         for (const auto& [name, mod] : modules_) {
             brief[name] = mod.snapshot_fn();
             for (const auto& g : mod.grants_fn()) {
-                grants[{g.method_id, g.actor}] = g;
+                merge_grant(grants, g);
             }
         }
         return {std::move(brief), std::move(grants)};

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -85,12 +86,12 @@ func (t *OutboundCloudTunnel) cancelAllSessionForwarders() {
 func (t *OutboundCloudTunnel) downlinkLoop(ctx context.Context) {
 	defer t.cancelAllSessionForwarders()
 
-	url := fmt.Sprintf("%s/g2a/v1/relay/down?hub_id=%s", t.relayBaseURL, t.hubID)
+	downURL := fmt.Sprintf("%s/g2a/v1/relay/down?hub_id=%s", t.relayBaseURL, url.QueryEscape(t.hubID))
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, downURL, nil)
 		if err != nil {
 			return
 		}
@@ -105,6 +106,16 @@ func (t *OutboundCloudTunnel) downlinkLoop(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-time.After(250 * time.Millisecond):
+				continue
+			}
+		}
+		if resp.StatusCode != http.StatusOK {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
 				continue
 			}
 		}
@@ -206,7 +217,7 @@ func (t *OutboundCloudTunnel) postUplink(ctx context.Context, up UplinkFrame) er
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/g2a/v1/relay/up?hub_id=%s", t.relayBaseURL, t.hubID), bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/g2a/v1/relay/up?hub_id=%s", t.relayBaseURL, url.QueryEscape(t.hubID)), bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}

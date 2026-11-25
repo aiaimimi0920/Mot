@@ -206,12 +206,11 @@ public sealed class OriginSdk
             });
         }
 
-        if (_executionLedger.TryGetValue(req.ExecutionId, out var existing))
-            return existing;
-
         bool shouldSync = false;
         var reply = _dispatcher.RunOnGameThread(() =>
         {
+            if (_executionLedger.TryGetValue(req.ExecutionId, out var existing))
+                return existing;
             if (req.Epoch != CurrentEpoch)
                 throw new G2AOriginException("stale_context", 409, "Epoch mismatch");
             if (req.MethodId is null || !_capabilities.TryGetValue(req.MethodId, out var reg))
@@ -324,7 +323,8 @@ public sealed class OriginSdk
 
     public void ReportEmergencyStop()
     {
-        foreach (var execId in _inFlightSteps.Keys.ToList())
+        var activeIds = _dispatcher.RunOnGameThread(() => _inFlightSteps.Keys.ToList());
+        foreach (var execId in activeIds)
             CancelInFlightStep(execId);
         _transport.PostToHub("origin.player_event", new Dictionary<string, object?>
         {
@@ -335,10 +335,14 @@ public sealed class OriginSdk
 
     public void AdvanceEpoch()
     {
-        CurrentEpoch++;
-        CurrentRev = 0;
-        _lastSentMethodJson.Clear();
-        foreach (var execId in _inFlightSteps.Keys.ToList())
+        var activeIds = _dispatcher.RunOnGameThread(() =>
+        {
+            CurrentEpoch++;
+            CurrentRev = 0;
+            _lastSentMethodJson.Clear();
+            return _inFlightSteps.Keys.ToList();
+        });
+        foreach (var execId in activeIds)
             CancelInFlightStep(execId);
         FlushFullSync();
     }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import queue
 import threading
@@ -7,6 +8,11 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
+
+from .jcs import parse_strict_json
+from .schemas import G2AError
+
+MAX_RELAY_BODY_BYTES = 4 << 20
 
 
 class CloudRelayServer:
@@ -18,10 +24,17 @@ class CloudRelayServer:
         http(s)://<relay>/hubs/<id>/g2a/v1/core and /hubs/<id>/g2a/v1/core/events!
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 0, relay_token: str = "") -> None:
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        relay_token: str = "",
+        idle_keepalive_sec: float = 15.0,
+    ) -> None:
         self.host = host
         self.port = port
         self.relay_token = relay_token
+        self.idle_keepalive_sec = idle_keepalive_sec
         self._lock = threading.Lock()
         self._hub_downlinks: Dict[str, "queue.Queue[Optional[Dict[str, Any]]]"] = {}
         self._pending_replies: Dict[str, tuple[threading.Event, Dict[str, Any]]] = {}
@@ -47,10 +60,14 @@ class CloudRelayServer:
             def log_message(self, fmt: str, *args: Any) -> None:
                 return
 
-            def _check_relay_token(self) -> bool:
+            def _check_relay_token(self, qs: Optional[Dict[str, list[str]]] = None) -> bool:
                 if not relay_ref.relay_token:
                     return True
-                return self.headers.get("Authorization", "") == f"Bearer {relay_ref.relay_token}"
+                auth = self.headers.get("Authorization", "")
+                cand = auth[7:].strip() if auth.startswith("Bearer ") else ""
+                if not cand and qs is not None:
+                    cand = (qs.get("access_token") or [""])[0]
+                return bool(cand) and hmac.compare_digest(cand.encode("utf-8"), relay_ref.relay_token.encode("utf-8"))
 
             def do_GET(self) -> None:
                 parsed = urlparse(self.path)
@@ -58,7 +75,7 @@ class CloudRelayServer:
 
                 # 1. Home Hub Outbound Downlink SSE (/g2a/v1/relay/down?hub_id=...)
                 if parsed.path == "/g2a/v1/relay/down":
-                    if not self._check_relay_token():
+                    if not self._check_relay_token(qs):
                         self._send_json(401, {"error": "unauthorized_relay_token"})
                         return
                     hub_id = (qs.get("hub_id") or [""])[0]
@@ -84,7 +101,12 @@ class CloudRelayServer:
                         self.wfile.write(b": relay-downlink-ready\n\n")
                         self.wfile.flush()
                         while True:
-                            item = q.get()
+                            try:
+                                item = q.get(timeout=relay_ref.idle_keepalive_sec)
+                            except queue.Empty:
+                                self.wfile.write(b": g2a-keepalive\n\n")
+                                self.wfile.flush()
+                                continue
                             if item is None:
                                 break
                             raw = json.dumps(item, ensure_ascii=False).encode("utf-8")
@@ -116,7 +138,12 @@ class CloudRelayServer:
                         self.wfile.write(b": relay-core-sse-ready\n\n")
                         self.wfile.flush()
                         while True:
-                            ev = ev_q.get()
+                            try:
+                                ev = ev_q.get(timeout=relay_ref.idle_keepalive_sec)
+                            except queue.Empty:
+                                self.wfile.write(b": g2a-keepalive\n\n")
+                                self.wfile.flush()
+                                continue
                             if ev is None:
                                 break
                             raw = json.dumps(ev, ensure_ascii=False).encode("utf-8")
@@ -127,14 +154,25 @@ class CloudRelayServer:
                         pass
                     finally:
                         with relay_ref._lock:
-                            relay_ref._sse_subscribers.get(session_id, set()).discard(ev_q)
+                            subs_set = relay_ref._sse_subscribers.get(session_id)
+                            if subs_set is not None:
+                                subs_set.discard(ev_q)
+                                if not subs_set:
+                                    relay_ref._sse_subscribers.pop(session_id, None)
                     return
 
                 self._send_json(404, {"error": "not_found"})
 
             def do_POST(self) -> None:
                 parsed = urlparse(self.path)
-                length = int(self.headers.get("Content-Length", "0"))
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    self._send_json(400, {"error": "invalid_content_length"})
+                    return
+                if length < 0 or length > MAX_RELAY_BODY_BYTES:
+                    self._send_json(413, {"error": "payload_too_large"})
+                    return
                 raw_body = self.rfile.read(length)
 
                 # 1. Home Hub Outbound Uplink (/g2a/v1/relay/up?hub_id=...)
@@ -142,7 +180,13 @@ class CloudRelayServer:
                     if not self._check_relay_token():
                         self._send_json(401, {"error": "unauthorized_relay_token"})
                         return
-                    up = json.loads(raw_body.decode("utf-8"))
+                    try:
+                        up = parse_strict_json(raw_body)
+                        if not isinstance(up, dict):
+                            raise G2AError("invalid_request", 400, "Expected JSON object")
+                    except (G2AError, UnicodeDecodeError) as jerr:
+                        self._send_json(400, {"error": str(jerr)})
+                        return
                     kind = up.get("kind")
                     if kind == "reply":
                         t_id = str(up.get("tunnel_req_id", ""))
@@ -157,11 +201,14 @@ class CloudRelayServer:
                         ev_env = up.get("event")
                         if isinstance(ev_env, dict):
                             sid = str(ev_env.get("session_id", ""))
+                            is_closed_ev = ev_env.get("event") == "session.closed"
                             with relay_ref._lock:
                                 subs = list(relay_ref._sse_subscribers.get(sid, set()))
                             for sub_q in subs:
                                 try:
                                     sub_q.put_nowait(ev_env)
+                                    if is_closed_ev:
+                                        sub_q.put_nowait(None)
                                 except queue.Full:
                                     pass
                     self._send_json(200, {"ok": True})
@@ -171,7 +218,17 @@ class CloudRelayServer:
                 if parsed.path.startswith("/hubs/") and parsed.path.endswith("/g2a/v1/core"):
                     parts = parsed.path.strip("/").split("/")
                     hub_id = parts[1]
-                    body_obj = json.loads(raw_body.decode("utf-8"))
+                    try:
+                        body_obj = parse_strict_json(raw_body)
+                        if not isinstance(body_obj, dict):
+                            raise G2AError("invalid_request", 400, "Expected RequestEnvelope JSON object")
+                    except (G2AError, UnicodeDecodeError) as jerr:
+                        self._send_json(400, {
+                            "g2a_version": "0.0.1", "request_id": "", "timestamp_ms": 0,
+                            "acceptance": "not_accepted", "result": None,
+                            "error": {"code": "invalid_request", "http_status": 400, "message": str(jerr)},
+                        })
+                        return
                     orig_req_id = str(body_obj.get("request_id", ""))
                     with relay_ref._lock:
                         down_q = relay_ref._hub_downlinks.get(hub_id)

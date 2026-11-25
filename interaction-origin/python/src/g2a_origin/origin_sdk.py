@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import http.client
 import json
 import math
@@ -509,6 +510,7 @@ class OriginSDK:
         self._http_server: Optional[ThreadingHTTPServer] = None
         self._outbound_stop = threading.Event()
         self._outbound_ready = threading.Event()
+        self._outbound_reply_conn: Optional[http.client.HTTPConnection] = None
         self.origin_execute_url: str = ""
 
     @classmethod
@@ -527,16 +529,28 @@ class OriginSDK:
         sdk_ref = self
 
         class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def log_message(self, format: str, *args: Any) -> None:
                 return
 
             def do_POST(self) -> None:
                 if sdk_ref.shared_token:
                     auth = self.headers.get("Authorization", "")
-                    if auth != f"Bearer {sdk_ref.shared_token}":
+                    cand = auth[7:].strip() if auth.startswith("Bearer ") else ""
+                    if not cand or not hmac.compare_digest(
+                        cand.encode("utf-8"), sdk_ref.shared_token.encode("utf-8")
+                    ):
                         self._write_error("", "unauthenticated", 401, "Invalid Origin token")
                         return
-                length = int(self.headers.get("Content-Length", "0"))
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    self._write_error("", "invalid_request", 400, "Invalid Content-Length")
+                    return
+                if length < 0 or length > (4 << 20):
+                    self._write_error("", "invalid_request", 413, "Execute payload exceeds 4 MiB limit")
+                    return
                 raw = self.rfile.read(length)
                 try:
                     env = parse_strict_json(raw)
@@ -556,6 +570,7 @@ class OriginSDK:
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(out)))
+                    self.send_header("Connection", "keep-alive")
                     self.end_headers()
                     self.wfile.write(out)
                 except StrictJSONError as jerr:
@@ -576,10 +591,15 @@ class OriginSDK:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(out)))
+                self.send_header("Connection", "keep-alive")
                 self.end_headers()
                 self.wfile.write(out)
 
-        self._http_server = ThreadingHTTPServer((host, port), _Handler)
+        class _QuietThreadingHTTPServer(ThreadingHTTPServer):
+            def handle_error(self, request: Any, client_address: Any) -> None:
+                return
+
+        self._http_server = _QuietThreadingHTTPServer((host, port), _Handler)
         bound_host, bound_port = self._http_server.server_address
         self.origin_execute_url = f"http://{bound_host}:{bound_port}/g2a/v1/origin/execute"
         threading.Thread(target=self._http_server.serve_forever, daemon=True).start()
@@ -591,12 +611,21 @@ class OriginSDK:
             self._http_server.shutdown()
             self._http_server.server_close()
             self._http_server = None
+        if self._outbound_reply_conn is not None:
+            try:
+                self._outbound_reply_conn.close()
+            except Exception:
+                pass
+            self._outbound_reply_conn = None
         close_fn = getattr(self.hub_transport, "close", None)
         if callable(close_fn):
             close_fn()
 
     def __del__(self) -> None:
         try:
+            if self._outbound_reply_conn is not None:
+                self._outbound_reply_conn.close()
+                self._outbound_reply_conn = None
             close_fn = getattr(self.hub_transport, "close", None)
             if callable(close_fn):
                 close_fn()
@@ -609,6 +638,12 @@ class OriginSDK:
         self.origin_execute_url = "pull://origin.execute"
         self._outbound_stop.clear()
         self._outbound_ready.clear()
+
+        parsed_base = urllib.parse.urlparse(base_url)
+        is_https = parsed_base.scheme == "https"
+        r_host = parsed_base.hostname or "127.0.0.1"
+        r_port = parsed_base.port or (443 if is_https else 80)
+        reply_path = (parsed_base.path.rstrip("/") or "") + "/g2a/v1/origin/execute-reply"
 
         opener = (
             urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -626,12 +661,29 @@ class OriginSDK:
                 "error": error_obj,
             }
             raw = json.dumps(reply_env, ensure_ascii=False).encode("utf-8")
-            headers = {"Content-Type": "application/json"}
+            headers = {"Content-Type": "application/json", "Connection": "keep-alive"}
             if self.shared_token:
                 headers["Authorization"] = f"Bearer {self.shared_token}"
-            r = urllib.request.Request(f"{base_url}/g2a/v1/origin/execute-reply", data=raw, method="POST", headers=headers)
-            with opener.open(r, timeout=5.0):
-                pass
+            for attempt in range(2):
+                if self._outbound_reply_conn is None:
+                    self._outbound_reply_conn = (
+                        http.client.HTTPSConnection(r_host, r_port, timeout=5.0)
+                        if is_https
+                        else http.client.HTTPConnection(r_host, r_port, timeout=5.0)
+                    )
+                try:
+                    self._outbound_reply_conn.request("POST", reply_path, body=raw, headers=headers)
+                    resp = self._outbound_reply_conn.getresponse()
+                    _ = resp.read()
+                    return
+                except Exception:
+                    try:
+                        self._outbound_reply_conn.close()
+                    except Exception:
+                        pass
+                    self._outbound_reply_conn = None
+                    if attempt == 1:
+                        raise
 
         def _worker() -> None:
             stream_url = f"{base_url}/g2a/v1/origin/execute-stream?slot_id={self.slot_id}"
@@ -977,12 +1029,11 @@ class OriginSDK:
 
             return self.engine_dispatcher.run_on_game_thread(_deliver)
 
-        if req.execution_id in self.execution_ledger:
-            return self.execution_ledger[req.execution_id]
-
         sync_needed = {"flag": False}
 
         def _invoke() -> OriginExecuteReply:
+            if req.execution_id in self.execution_ledger:
+                return self.execution_ledger[req.execution_id]
             if req.epoch != self.current_epoch:
                 raise G2AOriginError("stale_context", 409, "Epoch mismatch")
             if not req.method_id or req.method_id not in self.capabilities:

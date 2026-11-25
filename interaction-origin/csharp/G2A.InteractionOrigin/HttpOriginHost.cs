@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -119,51 +120,90 @@ public sealed class LoopbackExecuteListener : IDisposable
         }
     }
 
+    private const int MaxHeaderBytes = 64 * 1024;
+    private const int MaxBodyBytes = 4 * 1024 * 1024;
+
     private async Task HandleClientAsync(TcpClient client)
     {
         using (client)
         await using (var stream = client.GetStream())
         {
-            var (headers, bodyBytes) = await ReadHttpRequestAsync(stream);
-            if (headers.Count == 0) return;
+            var readBuf = new byte[8192];
+            var leftover = new List<byte>();
 
-            if (!string.IsNullOrEmpty(_sharedToken))
+            while (!_cts.IsCancellationRequested)
             {
-                if (!headers.TryGetValue("authorization", out var auth) || auth != $"Bearer {_sharedToken}")
+                Dictionary<string, string>? headers;
+                byte[] bodyBytes;
+                try
                 {
-                    await WriteJsonReplyAsync(stream, 401, "", "not_accepted", null,
-                        new Dictionary<string, object?> { ["code"] = "unauthenticated", ["http_status"] = 401, ["message"] = "Invalid Origin token" });
+                    var parsed = await ReadBufferedHttpRequestAsync(stream, readBuf, leftover, _cts.Token);
+                    if (parsed is null) return;
+                    (headers, bodyBytes) = parsed.Value;
+                }
+                catch (G2AOriginException gex)
+                {
+                    await WriteJsonReplyAsync(stream, gex.HttpStatus, "", "not_accepted", null,
+                        new Dictionary<string, object?> { ["code"] = gex.Code, ["http_status"] = gex.HttpStatus, ["message"] = gex.Message }, closeConn: true);
                     return;
                 }
-            }
+                catch
+                {
+                    return;
+                }
 
-            string reqId = "";
-            try
-            {
-                string rawJson = Encoding.UTF8.GetString(bodyBytes);
-                using var doc = JcsDigest.ParseStrictDocument(rawJson);
-                var root = doc.RootElement;
-                reqId = root.TryGetProperty("request_id", out var ridEl) ? ridEl.GetString() ?? "" : "";
-                string op = root.TryGetProperty("operation", out var opEl) ? opEl.GetString() ?? "" : "";
-                if (op != "origin.execute")
-                    throw new G2AOriginException("invalid_request", 400, "Expected origin.execute");
+                bool wantClose = headers.TryGetValue("connection", out var connHdr)
+                    && connHdr.Equals("close", StringComparison.OrdinalIgnoreCase);
 
-                var payloadEl = root.GetProperty("payload");
-                var execReq = ParseExecuteRequest(payloadEl);
-                var reply = _sdk.HandleOriginExecute(execReq);
-                await WriteJsonReplyAsync(stream, 200, reqId, "accepted", reply, null);
-            }
-            catch (G2AOriginException gex)
-            {
-                await WriteJsonReplyAsync(stream, gex.HttpStatus, reqId, "not_accepted", null,
-                    new Dictionary<string, object?> { ["code"] = gex.Code, ["http_status"] = gex.HttpStatus, ["message"] = gex.Message });
-            }
-            catch (Exception ex)
-            {
-                await WriteJsonReplyAsync(stream, 400, reqId, "not_accepted", null,
-                    new Dictionary<string, object?> { ["code"] = "invalid_request", ["http_status"] = 400, ["message"] = ex.Message });
+                if (!string.IsNullOrEmpty(_sharedToken))
+                {
+                    string expected = $"Bearer {_sharedToken}";
+                    if (!headers.TryGetValue("authorization", out var auth) || !SecureEquals(auth, expected))
+                    {
+                        await WriteJsonReplyAsync(stream, 401, "", "not_accepted", null,
+                            new Dictionary<string, object?> { ["code"] = "unauthenticated", ["http_status"] = 401, ["message"] = "Invalid Origin token" }, closeConn: wantClose);
+                        if (wantClose) return;
+                        continue;
+                    }
+                }
+
+                string reqId = "";
+                try
+                {
+                    string rawJson = Encoding.UTF8.GetString(bodyBytes);
+                    using var doc = JcsDigest.ParseStrictDocument(rawJson);
+                    var root = doc.RootElement;
+                    reqId = root.TryGetProperty("request_id", out var ridEl) ? ridEl.GetString() ?? "" : "";
+                    string op = root.TryGetProperty("operation", out var opEl) ? opEl.GetString() ?? "" : "";
+                    if (op != "origin.execute")
+                        throw new G2AOriginException("invalid_request", 400, "Expected origin.execute");
+
+                    var payloadEl = root.GetProperty("payload");
+                    var execReq = ParseExecuteRequest(payloadEl);
+                    var reply = _sdk.HandleOriginExecute(execReq);
+                    await WriteJsonReplyAsync(stream, 200, reqId, "accepted", reply, null, closeConn: wantClose);
+                }
+                catch (G2AOriginException gex)
+                {
+                    await WriteJsonReplyAsync(stream, gex.HttpStatus, reqId, "not_accepted", null,
+                        new Dictionary<string, object?> { ["code"] = gex.Code, ["http_status"] = gex.HttpStatus, ["message"] = gex.Message }, closeConn: wantClose);
+                }
+                catch (Exception ex)
+                {
+                    await WriteJsonReplyAsync(stream, 400, reqId, "not_accepted", null,
+                        new Dictionary<string, object?> { ["code"] = "invalid_request", ["http_status"] = 400, ["message"] = ex.Message }, closeConn: wantClose);
+                }
+
+                if (wantClose) return;
             }
         }
+    }
+
+    private static bool SecureEquals(string a, string b)
+    {
+        byte[] ba = Encoding.UTF8.GetBytes(a);
+        byte[] bb = Encoding.UTF8.GetBytes(b);
+        return ba.Length == bb.Length && CryptographicOperations.FixedTimeEquals(ba, bb);
     }
 
     private static OriginExecuteRequest ParseExecuteRequest(JsonElement p)
@@ -195,42 +235,77 @@ public sealed class LoopbackExecuteListener : IDisposable
         _ => el.GetRawText()
     };
 
-    private static async Task<(Dictionary<string, string> Headers, byte[] Body)> ReadHttpRequestAsync(NetworkStream stream)
+    private static int FindHeaderEnd(List<byte> buf)
     {
-        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        using var headerBuf = new MemoryStream();
-        var one = new byte[1];
-        int matchState = 0; // matches \r\n\r\n
-        while (await stream.ReadAsync(one.AsMemory(0, 1)) == 1)
+        for (int i = 0; i <= buf.Count - 4; i++)
         {
-            byte b = one[0];
-            headerBuf.WriteByte(b);
-            if ((matchState == 0 || matchState == 2) && b == (byte)'\r') matchState++;
-            else if ((matchState == 1 || matchState == 3) && b == (byte)'\n') matchState++;
-            else matchState = b == (byte)'\r' ? 1 : 0;
-            if (matchState == 4) break;
+            if (buf[i] == (byte)'\r' && buf[i + 1] == (byte)'\n' && buf[i + 2] == (byte)'\r' && buf[i + 3] == (byte)'\n')
+                return i;
         }
-        string headerText = Encoding.ASCII.GetString(headerBuf.ToArray());
+        return -1;
+    }
+
+    private static async Task<(Dictionary<string, string> Headers, byte[] Body)?> ReadBufferedHttpRequestAsync(
+        NetworkStream stream,
+        byte[] readBuf,
+        List<byte> leftover,
+        CancellationToken ct)
+    {
+        int headerEndIdx;
+        while ((headerEndIdx = FindHeaderEnd(leftover)) < 0)
+        {
+            if (leftover.Count > MaxHeaderBytes)
+                throw new G2AOriginException("invalid_request", 431, "HTTP headers exceed 64 KiB limit");
+            int nRead = await stream.ReadAsync(readBuf, ct);
+            if (nRead <= 0)
+            {
+                return null;
+            }
+            for (int i = 0; i < nRead; i++) leftover.Add(readBuf[i]);
+        }
+
+        byte[] headerRaw = new byte[headerEndIdx];
+        leftover.CopyTo(0, headerRaw, 0, headerEndIdx);
+        leftover.RemoveRange(0, headerEndIdx + 4);
+
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        string headerText = Encoding.ASCII.GetString(headerRaw);
         string[] lines = headerText.Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
+        if (lines.Length == 0) return null;
         for (int i = 1; i < lines.Length; i++)
         {
             int idx = lines[i].IndexOf(':');
             if (idx > 0)
                 headers[lines[i][..idx].Trim()] = lines[i][(idx + 1)..].Trim();
         }
-        int contentLength = headers.TryGetValue("content-length", out var cl) && int.TryParse(cl, NumberStyles.Integer, CultureInfo.InvariantCulture, out int n) ? n : 0;
-        var body = new byte[contentLength];
-        int offset = 0;
-        while (offset < contentLength)
+
+        int contentLength = 0;
+        if (headers.TryGetValue("content-length", out var cl))
         {
-            int read = await stream.ReadAsync(body.AsMemory(offset, contentLength - offset));
-            if (read <= 0) break;
-            offset += read;
+            if (!int.TryParse(cl, NumberStyles.Integer, CultureInfo.InvariantCulture, out contentLength) || contentLength < 0)
+                throw new G2AOriginException("invalid_request", 400, "Invalid Content-Length");
+            if (contentLength > MaxBodyBytes)
+                throw new G2AOriginException("invalid_request", 413, "Execute payload exceeds 4 MiB limit");
+        }
+
+        while (leftover.Count < contentLength)
+        {
+            int nRead = await stream.ReadAsync(readBuf, ct);
+            if (nRead <= 0)
+                throw new G2AOriginException("invalid_request", 400, "Truncated HTTP request body");
+            for (int i = 0; i < nRead; i++) leftover.Add(readBuf[i]);
+        }
+
+        var body = new byte[contentLength];
+        if (contentLength > 0)
+        {
+            leftover.CopyTo(0, body, 0, contentLength);
+            leftover.RemoveRange(0, contentLength);
         }
         return (headers, body);
     }
 
-    private static async Task WriteJsonReplyAsync(NetworkStream stream, int statusCode, string reqId, string acceptance, object? result, object? error)
+    private static async Task WriteJsonReplyAsync(NetworkStream stream, int statusCode, string reqId, string acceptance, object? result, object? error, bool closeConn = false)
     {
         var env = new Dictionary<string, object?>
         {
@@ -243,8 +318,9 @@ public sealed class LoopbackExecuteListener : IDisposable
         };
         byte[] payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(env));
         string reason = statusCode == 200 ? "OK" : "Error";
+        string connHeader = closeConn ? "close" : "keep-alive";
         byte[] head = Encoding.ASCII.GetBytes(
-            $"HTTP/1.1 {statusCode} {reason}\r\nContent-Type: application/json\r\nContent-Length: {payload.Length}\r\nConnection: close\r\n\r\n");
+            $"HTTP/1.1 {statusCode} {reason}\r\nContent-Type: application/json\r\nContent-Length: {payload.Length}\r\nConnection: {connHeader}\r\n\r\n");
         await stream.WriteAsync(head);
         await stream.WriteAsync(payload);
         await stream.FlushAsync();

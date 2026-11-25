@@ -240,6 +240,8 @@ export class CoreSDK {
   private capabilityCache = new Map<string, unknown[]>();
   private slotDigests = new Map<string, string>();
   private pendingConfirmQueues = new Map<string, MethodCallQueue>();
+  private earlyConfirmedQueues = new Set<string>();
+  private earlyDeclinedQueues = new Map<string, number>();
   private refusalCooldowns = new Map<string, number>();
   private seenEvents = new Set<string>();
   private ws: WebSocket | null = null;
@@ -362,6 +364,16 @@ export class CoreSDK {
     } catch (err) {
       if (!(err instanceof G2ACoreError)) throw err;
       if (err.code === "confirmation_required") {
+        if (this.earlyConfirmedQueues.delete(queue.queue_id)) {
+          return this.submitQueueWithRecovery(base, authToken, queue, depth);
+        }
+        const earlyCd = this.earlyDeclinedQueues.get(queue.queue_id);
+        if (earlyCd !== undefined) {
+          this.earlyDeclinedQueues.delete(queue.queue_id);
+          const fp = await jcsSha256("g2a.fp.v1", queue.steps);
+          this.refusalCooldowns.set(fp, Date.now() + earlyCd);
+          return null;
+        }
         this.pendingConfirmQueues.set(queue.queue_id, queue);
         return null;
       }
@@ -387,18 +399,32 @@ export class CoreSDK {
     if (env.event === "context.push") {
       await this.onContextReceived(base, authToken, env.payload as ProjectedContext);
     } else if (env.event === "queue.confirmed") {
-      const q = this.pendingConfirmQueues.get(env.payload?.queue_id);
+      const qid = typeof env.payload?.queue_id === "string" ? env.payload.queue_id : "";
+      const q = qid ? this.pendingConfirmQueues.get(qid) : undefined;
       if (q) {
         this.pendingConfirmQueues.delete(q.queue_id);
         await this.submitQueueWithRecovery(base, authToken, q);
+      } else if (qid) {
+        this.earlyConfirmedQueues.add(qid);
+        if (this.earlyConfirmedQueues.size > 256) {
+          const first = this.earlyConfirmedQueues.values().next().value;
+          if (first !== undefined) this.earlyConfirmedQueues.delete(first);
+        }
       }
     } else if (env.event === "queue.declined") {
-      const q = this.pendingConfirmQueues.get(env.payload?.queue_id);
+      const qid = typeof env.payload?.queue_id === "string" ? env.payload.queue_id : "";
+      const cdMs = Number(env.payload?.cooldown_ms ?? 60000);
+      const q = qid ? this.pendingConfirmQueues.get(qid) : undefined;
       if (q) {
         this.pendingConfirmQueues.delete(q.queue_id);
         const fp = await jcsSha256("g2a.fp.v1", q.steps);
-        const cdMs = Number(env.payload?.cooldown_ms ?? 60000);
         this.refusalCooldowns.set(fp, Date.now() + cdMs);
+      } else if (qid) {
+        this.earlyDeclinedQueues.set(qid, cdMs);
+        if (this.earlyDeclinedQueues.size > 256) {
+          const first = this.earlyDeclinedQueues.keys().next().value;
+          if (first !== undefined) this.earlyDeclinedQueues.delete(first);
+        }
       }
     } else if (env.event === "session.resumed") {
       this.actionsPaused = false;

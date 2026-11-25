@@ -1,3 +1,5 @@
+using System.Net.Sockets;
+using System.Text;
 using System.Text.Json;
 using G2A.InteractionOrigin;
 
@@ -211,7 +213,89 @@ internal static class Program
             crowdSdk.HandleOriginExecute(new OriginExecuteRequest("slot-crowd-cs", 1, "invoke", $"exec-b-{i}", "#02", "companion", new()));
         }
 
+        // Verify persistent HTTP/1.1 Keep-Alive multi-request pipeline on LoopbackExecuteListener + constant-time token check
+        using (var kaListener = new LoopbackExecuteListener(crowdSdk, port: 0, sharedToken: "ka-secret"))
+        {
+            var uri = new Uri(kaListener.ExecuteUrl);
+            using var tcp = new TcpClient("127.0.0.1", uri.Port);
+            using var netStream = tcp.GetStream();
+
+            for (int seq = 0; seq < 5; seq++)
+            {
+                string bodyJson = JsonSerializer.Serialize(new Dictionary<string, object?>
+                {
+                    ["g2a_version"] = "0.0.1",
+                    ["request_id"] = $"ka-req-{seq}",
+                    ["timestamp_ms"] = 1000 + seq,
+                    ["operation"] = "origin.execute",
+                    ["payload"] = new Dictionary<string, object?>
+                    {
+                        ["slot_id"] = "slot-crowd-cs",
+                        ["epoch"] = 1,
+                        ["kind"] = "invoke",
+                        ["execution_id"] = $"ka-exec-{seq}",
+                        ["method_id"] = "#02",
+                        ["actor"] = "companion",
+                        ["args"] = new Dictionary<string, object?>()
+                    },
+                    ["extensions"] = new Dictionary<string, object?>()
+                });
+                byte[] bodyBytes = Encoding.UTF8.GetBytes(bodyJson);
+                string authVal = seq == 0 ? "Bearer wrong-token" : "Bearer ka-secret";
+                string rawHttp =
+                    $"POST {uri.AbsolutePath} HTTP/1.1\r\n" +
+                    $"Host: 127.0.0.1:{uri.Port}\r\n" +
+                    $"Authorization: {authVal}\r\n" +
+                    "Content-Type: application/json\r\n" +
+                    "Connection: keep-alive\r\n" +
+                    $"Content-Length: {bodyBytes.Length}\r\n\r\n";
+                byte[] hdrBytes = Encoding.ASCII.GetBytes(rawHttp);
+                netStream.Write(hdrBytes, 0, hdrBytes.Length);
+                netStream.Write(bodyBytes, 0, bodyBytes.Length);
+                netStream.Flush();
+
+                string respHead = ReadRawHttpResponse(netStream, out string respBody);
+                int expectedStatus = seq == 0 ? 401 : 200;
+                if (!respHead.Contains($" {expectedStatus} ", StringComparison.Ordinal))
+                    throw new Exception($"Expected HTTP {expectedStatus} on Keep-Alive seq {seq}, got: {respHead}");
+                if (seq > 0 && !respBody.Contains("\"succeeded\"", StringComparison.Ordinal))
+                    throw new Exception($"Expected succeeded execute reply on seq {seq}, got: {respBody}");
+            }
+        }
+
         Console.WriteLine($"C# G2A.InteractionOrigin SelfTest PASSED | JCS={d1}");
         return 0;
+    }
+
+    private static string ReadRawHttpResponse(NetworkStream s, out string body)
+    {
+        using var hdr = new MemoryStream();
+        int state = 0;
+        while (state < 4)
+        {
+            int b = s.ReadByte();
+            if (b < 0) throw new EndOfStreamException("Unexpected EOF reading HTTP response header");
+            hdr.WriteByte((byte)b);
+            if ((state == 0 || state == 2) && b == '\r') state++;
+            else if ((state == 1 || state == 3) && b == '\n') state++;
+            else state = b == '\r' ? 1 : 0;
+        }
+        string headStr = Encoding.ASCII.GetString(hdr.ToArray());
+        int cl = 0;
+        foreach (var line in headStr.Split("\r\n", StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
+                cl = int.Parse(line["Content-Length:".Length..].Trim());
+        }
+        byte[] buf = new byte[cl];
+        int off = 0;
+        while (off < cl)
+        {
+            int r = s.Read(buf, off, cl - off);
+            if (r <= 0) throw new EndOfStreamException("Unexpected EOF reading HTTP response body");
+            off += r;
+        }
+        body = Encoding.UTF8.GetString(buf);
+        return headStr;
     }
 }
