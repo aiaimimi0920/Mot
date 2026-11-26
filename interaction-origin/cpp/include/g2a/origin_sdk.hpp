@@ -202,7 +202,19 @@ public:
         modules_[name] = {std::move(snapshot_fn), std::move(grants_fn)};
     }
 
-    void publish_capabilities_and_baseline(const std::string& execute_url = "") {
+    void attach_extension_data(const std::string& extension_name, JsonObject data, bool flush = false) {
+        std::lock_guard<std::recursive_mutex> lk(mu_);
+        extensions_data_[extension_name] = std::move(data);
+        if (flush) flush_dirty_sync(false);
+    }
+
+    void publish_capabilities_and_baseline(
+        const std::string& execute_url = "",
+        bool disabled = false,
+        int64_t max_sessions = 0,
+        int64_t shared_cooldown_ms = 0,
+        const std::vector<std::string>& allowlisted_cores = {},
+        const std::string& allowlist_criteria_url = "") {
         std::lock_guard<std::recursive_mutex> lk(mu_);
         JsonArray defs;
         for (const auto& [_, reg] : capabilities_) {
@@ -217,6 +229,15 @@ public:
             {"capability_table_digest", cap_digest},
             {"capabilities", defs},
         };
+        if (disabled) cap_payload["disabled"] = true;
+        if (max_sessions > 0) cap_payload["max_sessions"] = max_sessions;
+        if (shared_cooldown_ms > 0) cap_payload["shared_cooldown_ms"] = shared_cooldown_ms;
+        if (!allowlisted_cores.empty()) {
+            JsonArray allow_arr;
+            for (const auto& c : allowlisted_cores) allow_arr.emplace_back(c);
+            cap_payload["allowlisted_cores"] = std::move(allow_arr);
+        }
+        if (!allowlist_criteria_url.empty()) cap_payload["allowlist_criteria_url"] = allowlist_criteria_url;
         if (!room_id_.empty()) cap_payload["room_id"] = room_id_;
         if (!faction_id_.empty()) cap_payload["faction_id"] = faction_id_;
         transport_("origin.capabilities", cap_payload);
@@ -228,7 +249,16 @@ public:
         if (!sync_enabled_ && pending_settled_.empty()) return false;
 
         auto [brief, grants] = collect_view();
-        std::string brief_digest = jcs::digest_sha256("g2a.brief.v1", brief);
+        JsonValue digest_doc = brief;
+        JsonObject ext_obj;
+        if (!extensions_data_.empty()) {
+            for (const auto& [k, v] : extensions_data_) ext_obj.emplace(k, v);
+            JsonObject combined;
+            combined.emplace("brief", brief);
+            combined.emplace("ext", ext_obj);
+            digest_doc = std::move(combined);
+        }
+        std::string brief_digest = jcs::digest_sha256("g2a.brief.v1", digest_doc);
 
         std::map<std::pair<std::string, std::string>, std::string> cur_canon;
         JsonArray upserted, removed;
@@ -262,7 +292,7 @@ public:
         last_brief_digest_ = brief_digest;
         last_sent_methods_ = std::move(cur_canon);
 
-        transport_("origin.sync", JsonObject{
+        JsonObject frame{
             {"slot_id", slot_id_},
             {"epoch", current_epoch_},
             {"rev", current_rev_},
@@ -273,7 +303,9 @@ public:
             {"upserted_methods", upserted},
             {"removed_methods", removed},
             {"settled_executions", settled_arr},
-        });
+        };
+        if (!ext_obj.empty()) frame.emplace("extensions_data", std::move(ext_obj));
+        transport_("origin.sync", frame);
         return true;
     }
 
@@ -281,7 +313,16 @@ public:
         std::lock_guard<std::recursive_mutex> lk(mu_);
         auto [brief, grants] = collect_view();
         current_rev_++;
-        last_brief_digest_ = jcs::digest_sha256("g2a.brief.v1", brief);
+        JsonValue digest_doc = brief;
+        JsonObject ext_obj;
+        if (!extensions_data_.empty()) {
+            for (const auto& [k, v] : extensions_data_) ext_obj.emplace(k, v);
+            JsonObject combined;
+            combined.emplace("brief", brief);
+            combined.emplace("ext", ext_obj);
+            digest_doc = std::move(combined);
+        }
+        last_brief_digest_ = jcs::digest_sha256("g2a.brief.v1", digest_doc);
         last_sent_methods_.clear();
         JsonArray upserted;
         for (const auto& [key, g] : grants) {
@@ -293,7 +334,7 @@ public:
         for (const auto& s : pending_settled_) settled_arr.push_back(s.to_json());
         pending_settled_.clear();
 
-        transport_("origin.sync", JsonObject{
+        JsonObject frame{
             {"slot_id", slot_id_},
             {"epoch", current_epoch_},
             {"rev", current_rev_},
@@ -303,7 +344,9 @@ public:
             {"upserted_methods", upserted},
             {"removed_methods", JsonArray{}},
             {"settled_executions", settled_arr},
-        });
+        };
+        if (!ext_obj.empty()) frame.emplace("extensions_data", std::move(ext_obj));
+        transport_("origin.sync", frame);
     }
 
     OriginExecuteReply handle_origin_execute(const OriginExecuteRequest& req) {
@@ -630,6 +673,7 @@ private:
     std::map<std::string, RegCap> capabilities_;
     std::map<std::string, bool> actors_;
     std::map<std::string, StateMod> modules_;
+    std::map<std::string, JsonObject> extensions_data_;
     std::map<std::string, std::function<void()>> in_flight_;
     std::map<std::string, OriginExecuteReply> ledger_;
     std::deque<std::string> ledger_order_;

@@ -130,6 +130,10 @@ document.addEventListener("click", ev => {
     apiPost("/trusted/revoke-session", { session_id: btn.dataset.sessionId });
   } else if (act === "revoke-auto-scope") {
     apiPost("/trusted/revoke-auto-scope", { scope_digest: btn.dataset.scopeDigest, close_matching_sessions: true });
+  } else if (act === "handoff-npc") {
+    const inp = document.getElementById("handoff-in-" + btn.dataset.slotId);
+    const nextPid = inp ? inp.value.trim() : "";
+    if (nextPid) apiPost("/trusted/handoff-npc", { slot_id: btn.dataset.slotId, new_player_id: nextPid });
   }
 });
 
@@ -162,7 +166,7 @@ function setHTMLIfChanged(id, nextHtml) {
 }
 
 async function refresh(force = false) {
-  if (!force && document.activeElement && document.activeElement.tagName === "SELECT") return;
+  if (!force && document.activeElement && (document.activeElement.tagName === "SELECT" || document.activeElement.tagName === "INPUT")) return;
   const res = await fetch("/trusted/status", { headers: { "X-G2A-CSRF": CSRF } });
   if (!res.ok) return;
   const st = await res.json();
@@ -222,9 +226,19 @@ async function refresh(force = false) {
           return '<div style="margin-top:4px;font-size:12px"><code>' + esc(c.method_id) + ' ' + esc(c.name) + '</code> [' + esc(act) + ']: ' + sel + '</div>';
         }).join("");
       }).join("");
-      sRows += '<tr><td><code>' + esc(sl.slot_id) + '</code>' + capHtml + '</td><td>' + esc(sl.role_kind) + ' / ' + esc(sl.billing_mode) + '</td>' +
-        '<td>' + (sl.player_online ? '<span class="badge ok">在线</span>' : '<span class="badge danger">离线</span>') + ' epoch=' + sl.epoch + ' rev=' + sl.rev + '</td>' +
-        '<td><button class="decline" data-action="emergency-stop" data-slot-id="' + esc(sl.slot_id) + '">紧急叫停</button></td></tr>';
+      const frandHtml = sl.allowlist_criteria_url
+        ? '<div style="margin-top:4px;font-size:11px;color:var(--accent)">FRAND 准入标准: <a style="color:var(--accent)" target="_blank" rel="noopener noreferrer" href="' + esc(sl.allowlist_criteria_url) + '">' + esc(sl.allowlist_criteria_url) + '</a></div>'
+        : '';
+      const cdHtml = sl.shared_cooldown_ms ? '<div style="font-size:11px;color:var(--muted)">对等冷却: ' + Number(sl.shared_cooldown_ms) + 'ms</div>' : '';
+      const handoffHtml = (sl.role_kind === "independent_npc" && sl.billing_mode === "player_metered")
+        ? '<div style="margin-top:6px;display:flex;gap:4px"><input id="handoff-in-' + esc(sl.slot_id) + '" type="text" placeholder="新房主 player_id" style="width:110px;font-size:11px;padding:3px 6px;border-radius:4px;border:1px solid var(--border);background:#0f172a;color:var(--text)"><button class="secondary" style="padding:3px 8px;font-size:11px" data-action="handoff-npc" data-slot-id="' + esc(sl.slot_id) + '">交接</button></div>'
+        : '';
+      const stateBadge = sl.disabled
+        ? '<span class="badge warn">已禁用(竞技)</span>'
+        : (sl.player_online ? '<span class="badge ok">在线</span>' : '<span class="badge danger">离线</span>');
+      sRows += '<tr><td><code>' + esc(sl.slot_id) + '</code>' + frandHtml + capHtml + '</td><td>' + esc(sl.role_kind) + ' / ' + esc(sl.billing_mode) + '<div style="font-size:11px;color:var(--muted)">持有者: ' + esc(sl.player_id || "-") + '</div>' + cdHtml + '</td>' +
+        '<td>' + stateBadge + ' epoch=' + sl.epoch + ' rev=' + sl.rev + '</td>' +
+        '<td><button class="decline" data-action="emergency-stop" data-slot-id="' + esc(sl.slot_id) + '">紧急叫停</button>' + handoffHtml + '</td></tr>';
     }
     setHTMLIfChanged("slots-list", sRows + '</table>');
   }

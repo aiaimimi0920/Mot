@@ -732,11 +732,41 @@ class TestOptimizationsAndStress(unittest.TestCase):
             finally:
                 c_dup.close()
 
-            # Idle keepalive on /hubs/h1/g2a/v1/core/events + clean _sse_subscribers removal on close
+            # Idle keepalive on /hubs/h1/g2a/v1/core/events + offline auth guard + clean _sse_subscribers removal
             c_sse = http.client.HTTPConnection(r_host, r_port, timeout=2.0)
             r_sse = None
             try:
+                # Missing Bearer -> 401; unverified session while Hub offline -> 503
                 c_sse.request("GET", "/hubs/h1/g2a/v1/core/events?session_id=sess-clean-1")
+                r_401 = c_sse.getresponse()
+                _ = r_401.read()
+                self.assertEqual(r_401.status, 401)
+
+                c_sse.request(
+                    "GET",
+                    "/hubs/h1/g2a/v1/core/events?session_id=sess-clean-1",
+                    headers={"Authorization": "Bearer tok-clean"},
+                )
+                r_503 = c_sse.getresponse()
+                _ = r_503.read()
+                self.assertEqual(r_503.status, 503)
+
+                # Once session principal is verified, wrong token gets 403 and exact token gets 200 keepalive stream!
+                relay._record_verified_session("h1", "sess-clean-1", "tok-clean")
+                c_sse.request(
+                    "GET",
+                    "/hubs/h1/g2a/v1/core/events?session_id=sess-clean-1",
+                    headers={"Authorization": "Bearer wrong-tok"},
+                )
+                r_403 = c_sse.getresponse()
+                _ = r_403.read()
+                self.assertEqual(r_403.status, 403)
+
+                c_sse.request(
+                    "GET",
+                    "/hubs/h1/g2a/v1/core/events?session_id=sess-clean-1",
+                    headers={"Authorization": "Bearer tok-clean"},
+                )
                 r_sse = c_sse.getresponse()
                 self.assertEqual(r_sse.status, 200)
                 saw_ready = False
@@ -1084,6 +1114,184 @@ class TestOptimizationsAndStress(unittest.TestCase):
                     hub_proc.stdout.close()
                 if hub_proc.stderr:
                     hub_proc.stderr.close()
+
+    def test_nat_relay_stream_auth_cursor_replay_retry_after_and_extensions(self) -> None:
+        from g2a_origin import (
+            ActiveMethodGrant as OrigGrant,
+            CapabilityEntry as OrigCap,
+            ImmediateSucceeded,
+            LoopbackHTTPTransportClient,
+            OriginSDK,
+        )
+
+        hub_bin = resolve_hub_binary(ROOT_DIR)
+        relay = CloudRelayServer(host="127.0.0.1", port=0, relay_token="w15-rel-tok")
+        relay_url = relay.start()
+        r_host, r_port_s = relay_url.replace("http://", "").split(":")
+        r_port = int(r_port_s)
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                hub_proc = subprocess.Popen(
+                    [
+                        hub_bin,
+                        "-origin-addr", "127.0.0.1:0",
+                        "-core-addr", "127.0.0.1:0",
+                        "-consent-addr", "127.0.0.1:0",
+                        "-ledger", os.path.join(tmp, "w15_rel_ledger.json"),
+                        "-no-runtime-file",
+                        "-auto-approve-scope",
+                        "-outbound-relay", relay_url,
+                        "-hub-id", "hub-w15-home",
+                        "-relay-token", "w15-rel-tok",
+                        "-print-ports-json",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                try:
+                    assert hub_proc.stdout is not None
+                    ports = json.loads(hub_proc.stdout.readline().strip())
+                    deadline = time.time() + 4.0
+                    while time.time() < deadline and not relay.is_hub_connected("hub-w15-home"):
+                        time.sleep(0.03)
+                    self.assertTrue(relay.is_hub_connected("hub-w15-home"))
+
+                    tx = LoopbackHTTPTransportClient(f"http://{ports['origin_addr']}")
+                    orig = OriginSDK(slot_id="slot-w15-ext", hub_transport=tx)
+                    orig.start_loopback_execute_listener()
+                    orig.bind_actor_subject("companion", {})
+                    orig.register_capability(
+                        OrigCap("#01", "place_blueprint", "Place blueprint", ["companion"], {"type": "object"}),
+                        effect_handler=lambda a, s, args, t: ImmediateSucceeded({"placed": True}),
+                    )
+                    orig.bind_state_module(
+                        "sim", lambda: {"wood": 50}, lambda: [OrigGrant("#01", "companion", "ready", [])]
+                    )
+                    orig.attach_extension_data("org.g2a.sim.batch_blueprint.v1", {"layout": "grid_4x4"})
+                    orig.attach_extension_data("org.g2a.commerce.catalog.v1", {"sku": "unnegotiated"})
+                    orig.publish_capabilities_and_baseline(shared_cooldown_ms=600)
+
+                    core_rel = CoreSDK(planner=_NoOpPlanner(), allow_loopback=True)
+                    try:
+                        core_rel.connect(
+                            f"{relay_url}/hubs/hub-w15-home",
+                            "core-legit-1",
+                            "slot-w15-ext",
+                            extensions={"org.g2a.sim.batch_blueprint.v1": {"required": False}},
+                        )
+                        sid = core_rel.session_id
+                        assert sid is not None
+
+                        # 1. Unauthenticated or cross-principal SSE snooping on CloudRelayServer MUST be rejected!
+                        c_unauth = http.client.HTTPConnection(r_host, r_port, timeout=3.0)
+                        try:
+                            c_unauth.request("GET", f"/hubs/hub-w15-home/g2a/v1/core/events?session_id={sid}")
+                            r_unauth = c_unauth.getresponse()
+                            _ = r_unauth.read()
+                            self.assertEqual(r_unauth.status, 401)
+                            self.assertEqual(r_unauth.getheader("Connection"), "keep-alive")
+
+                            # Reuse SAME Keep-Alive socket with wrong Core principal token -> 403 permission_denied!
+                            c_unauth.request(
+                                "GET",
+                                f"/hubs/hub-w15-home/g2a/v1/core/events?session_id={sid}",
+                                headers={"Authorization": "Bearer attacker-other-core"},
+                            )
+                            r_forbid = c_unauth.getresponse()
+                            _ = r_forbid.read()
+                            self.assertEqual(r_forbid.status, 403)
+                        finally:
+                            c_unauth.close()
+
+                        # 2. Extension-gated context projection over NAT Relay
+                        pulled = core_rel.pull_context()
+                        self.assertEqual(
+                            pulled.extensions_data,
+                            {"org.g2a.sim.batch_blueprint.v1": {"layout": "grid_4x4"}},
+                        )
+
+                        # 3. Trigger 429 resource_limit via rapid second context.pull -> Retry-After header forwarded across tunnel!
+                        c_rl = http.client.HTTPConnection(r_host, r_port, timeout=3.0)
+                        try:
+                            # Raise IdleBackoffMs via quiet delta frames first
+                            for idx in range(3):
+                                orig.bind_state_module(
+                                    "sim",
+                                    lambda v=idx: {"wood": 50 + v},
+                                    lambda: [OrigGrant("#01", "companion", "ready", [])],
+                                )
+                                orig.flush_dirty_sync(significant_event=False)
+                            pull_body = json.dumps(
+                                {
+                                    "g2a_version": "0.0.1",
+                                    "request_id": "rel-p1",
+                                    "session_id": sid,
+                                    "timestamp_ms": 1,
+                                    "operation": "context.pull",
+                                    "payload": {},
+                                    "extensions": {},
+                                }
+                            ).encode("utf-8")
+                            hdrs = {"Content-Type": "application/json", "Authorization": "Bearer core-legit-1"}
+                            c_rl.request("POST", "/hubs/hub-w15-home/g2a/v1/core", body=pull_body, headers=hdrs)
+                            _ = c_rl.getresponse().read()
+                            c_rl.request("POST", "/hubs/hub-w15-home/g2a/v1/core", body=pull_body, headers=hdrs)
+                            r_429 = c_rl.getresponse()
+                            _ = r_429.read()
+                            self.assertEqual(r_429.status, 429)
+                            self.assertIsNotNone(r_429.getheader("Retry-After"))
+                        finally:
+                            c_rl.close()
+
+                        # 4. Emit two player commands -> verify Relay retains event_id history and honors Last-Event-ID cursor!
+                        orig.report_player_command("first relay event")
+                        orig.report_player_command("second relay event")
+                        deadline = time.time() + 3.0
+                        while time.time() < deadline and len(relay._event_history.get(sid, [])) < 2:
+                            time.sleep(0.02)
+                        hist = relay._event_history[sid]
+                        self.assertGreaterEqual(len(hist), 2)
+                        first_ev_id = hist[-2]["event_id"]
+                        second_ev_id = hist[-1]["event_id"]
+
+                        c_cur = http.client.HTTPConnection(r_host, r_port, timeout=3.0)
+                        r_cur = None
+                        try:
+                            c_cur.request(
+                                "GET",
+                                f"/hubs/hub-w15-home/g2a/v1/core/events?session_id={sid}&replay=1",
+                                headers={
+                                    "Authorization": "Bearer core-legit-1",
+                                    "Last-Event-ID": first_ev_id,
+                                },
+                            )
+                            r_cur = c_cur.getresponse()
+                            self.assertEqual(r_cur.status, 200)
+                            replayed_id = ""
+                            for _ in range(10):
+                                ln = r_cur.readline().decode("utf-8").strip()
+                                if ln.startswith("id: "):
+                                    replayed_id = ln[4:].strip()
+                                    break
+                            self.assertEqual(replayed_id, second_ev_id)
+                        finally:
+                            if r_cur is not None:
+                                r_cur.close()
+                            c_cur.close()
+                    finally:
+                        core_rel.shutdown_session_cleanly(notify_hub=True)
+                        orig.stop_loopback_execute_listener()
+                finally:
+                    hub_proc.terminate()
+                    hub_proc.wait(timeout=3)
+                    if hub_proc.stdout:
+                        hub_proc.stdout.close()
+                    if hub_proc.stderr:
+                        hub_proc.stderr.close()
+        finally:
+            relay.stop()
 
 
 if __name__ == "__main__":

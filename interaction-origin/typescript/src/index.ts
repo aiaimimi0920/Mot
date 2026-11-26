@@ -77,6 +77,7 @@ export class OriginSDK {
   private pendingSettled: OriginExecuteReply[] = [];
   private lastSentMethods = new Map<string, string>();
   private lastBriefDigest = "";
+  private extensionsData: Record<string, Record<string, unknown>> = {};
   private eventSource: EventSource | null = null;
 
   public currentEpoch = 1;
@@ -120,6 +121,10 @@ export class OriginSDK {
     grantsFn: () => ActiveMethodGrant[]
   ): void {
     this.modules.set(name, { snapshotFn, grantsFn });
+  }
+
+  attachExtensionData(extName: string, data: Record<string, unknown>): void {
+    this.extensionsData[extName] = { ...data };
   }
 
   async publishCapabilitiesAndStartOutboundStream(): Promise<void> {
@@ -175,7 +180,8 @@ export class OriginSDK {
   async flushDirtySync(significantEvent = false): Promise<boolean> {
     if (!this.syncEnabled && this.pendingSettled.length === 0) return false;
     const { brief, grants } = this.collectView();
-    const briefDigest = await jcsSha256("g2a.brief.v1", brief);
+    const hasExt = Object.keys(this.extensionsData).length > 0;
+    const briefDigest = await jcsSha256("g2a.brief.v1", hasExt ? { brief, ext: this.extensionsData } : brief);
 
     const upserted: ActiveMethodGrant[] = [];
     const removed: Array<{ method_id: string; actor: string }> = [];
@@ -211,14 +217,16 @@ export class OriginSDK {
       upserted_methods: upserted,
       removed_methods: removed,
       settled_executions: settledBatch,
+      ...(hasExt ? { extensions_data: { ...this.extensionsData } } : {}),
     });
     return true;
   }
 
   async flushFullSync(): Promise<void> {
     const { brief, grants } = this.collectView();
+    const hasExt = Object.keys(this.extensionsData).length > 0;
     this.currentRev++;
-    this.lastBriefDigest = await jcsSha256("g2a.brief.v1", brief);
+    this.lastBriefDigest = await jcsSha256("g2a.brief.v1", hasExt ? { brief, ext: this.extensionsData } : brief);
     this.lastSentMethods.clear();
     for (const [k, g] of grants.entries()) this.lastSentMethods.set(k, canonicalizeJcs(g));
     const settledBatch = this.pendingSettled.splice(0, this.pendingSettled.length);
@@ -232,6 +240,7 @@ export class OriginSDK {
       upserted_methods: [...grants.values()],
       removed_methods: [],
       settled_executions: settledBatch,
+      ...(hasExt ? { extensions_data: { ...this.extensionsData } } : {}),
     });
   }
 

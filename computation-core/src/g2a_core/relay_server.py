@@ -1,18 +1,27 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import queue
 import threading
+import time
 import uuid
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
 from .jcs import parse_strict_json
 from .schemas import G2AError
 
 MAX_RELAY_BODY_BYTES = 4 << 20
+MAX_RELAY_SESSION_HISTORY = 256
+MAX_RELAY_EVENTS_PER_SESSION = 64
+
+
+def _token_sha256(token: str) -> bytes:
+    return hashlib.sha256(token.encode("utf-8")).digest()
 
 
 class CloudRelayServer:
@@ -39,7 +48,31 @@ class CloudRelayServer:
         self._hub_downlinks: Dict[str, "queue.Queue[Optional[Dict[str, Any]]]"] = {}
         self._pending_replies: Dict[str, tuple[threading.Event, Dict[str, Any]]] = {}
         self._sse_subscribers: Dict[str, set["queue.Queue[Optional[Dict[str, Any]]]"]] = {}
+        self._event_history: OrderedDict[str, List[Dict[str, Any]]] = OrderedDict()
+        self._session_token_digests: OrderedDict[tuple[str, str], bytes] = OrderedDict()
         self._httpd: Optional[ThreadingHTTPServer] = None
+
+    def _record_verified_session(self, hub_id: str, session_id: str, core_bearer: str) -> None:
+        if not hub_id or not session_id or not core_bearer:
+            return
+        digest = _token_sha256(core_bearer)
+        key = (hub_id, session_id)
+        with self._lock:
+            self._session_token_digests[key] = digest
+            self._session_token_digests.move_to_end(key)
+            while len(self._session_token_digests) > MAX_RELAY_SESSION_HISTORY:
+                self._session_token_digests.popitem(last=False)
+
+    def _evict_verified_session(self, hub_id: str, session_id: str) -> None:
+        if not session_id:
+            return
+        with self._lock:
+            if hub_id:
+                self._session_token_digests.pop((hub_id, session_id), None)
+            else:
+                stale = [k for k in self._session_token_digests if k[1] == session_id]
+                for k in stale:
+                    self._session_token_digests.pop(k, None)
 
     @property
     def base_url(self) -> str:
@@ -122,12 +155,121 @@ class CloudRelayServer:
 
                 # 2. Computation Core SSE Stream (/hubs/<hub_id>/g2a/v1/core/events?session_id=...)
                 if parsed.path.startswith("/hubs/") and parsed.path.endswith("/g2a/v1/core/events"):
+                    parts = parsed.path.strip("/").split("/")
+                    hub_id = parts[1] if len(parts) >= 2 else ""
                     session_id = (qs.get("session_id") or [""])[0]
                     if not session_id:
                         self._send_json(400, {"error": "missing_session_id"})
                         return
+
+                    # Enforce Core bearer & session ownership on Relay SSE stream (§4.1)
+                    auth_hdr = self.headers.get("Authorization", "")
+                    core_bearer = auth_hdr[7:].strip() if auth_hdr.startswith("Bearer ") else ""
+                    if not core_bearer:
+                        core_bearer = (qs.get("access_token") or [""])[0].strip()
+                    if not core_bearer:
+                        self._send_json(
+                            401,
+                            {
+                                "g2a_version": "0.0.1",
+                                "request_id": "",
+                                "session_id": session_id,
+                                "timestamp_ms": int(time.time() * 1000),
+                                "acceptance": "not_accepted",
+                                "result": None,
+                                "error": {
+                                    "code": "unauthenticated",
+                                    "http_status": 401,
+                                    "message": "Missing Core Bearer token on Relay SSE stream",
+                                },
+                            },
+                        )
+                        return
+
+                    with relay_ref._lock:
+                        down_q = relay_ref._hub_downlinks.get(hub_id)
+                        cached_digest = relay_ref._session_token_digests.get((hub_id, session_id))
+                    if down_q is not None:
+                        hb_status, hb_reply, hb_retry = self._dispatch_downlink_rpc(
+                            down_q,
+                            core_bearer,
+                            {
+                                "g2a_version": "0.0.1",
+                                "request_id": f"relay-auth-{uuid.uuid4().hex[:8]}",
+                                "session_id": session_id,
+                                "timestamp_ms": int(time.time() * 1000),
+                                "operation": "session.heartbeat",
+                                "payload": {},
+                                "extensions": {},
+                            },
+                            orig_req_id="",
+                        )
+                        if hb_status != 200:
+                            self._send_json(hb_status, hb_reply, retry_after=hb_retry)
+                            return
+                        relay_ref._record_verified_session(hub_id, session_id, core_bearer)
+                    else:
+                        if cached_digest is None:
+                            self._send_json(
+                                503,
+                                {
+                                    "g2a_version": "0.0.1",
+                                    "request_id": "",
+                                    "session_id": session_id,
+                                    "timestamp_ms": int(time.time() * 1000),
+                                    "acceptance": "not_accepted",
+                                    "result": None,
+                                    "error": {
+                                        "code": "unavailable",
+                                        "http_status": 503,
+                                        "message": "Target Hub tunnel offline",
+                                    },
+                                },
+                            )
+                            return
+                        if not hmac.compare_digest(cached_digest, _token_sha256(core_bearer)):
+                            self._send_json(
+                                403,
+                                {
+                                    "g2a_version": "0.0.1",
+                                    "request_id": "",
+                                    "session_id": session_id,
+                                    "timestamp_ms": int(time.time() * 1000),
+                                    "acceptance": "not_accepted",
+                                    "result": None,
+                                    "error": {
+                                        "code": "permission_denied",
+                                        "http_status": 403,
+                                        "message": "Core token does not match verified session principal",
+                                    },
+                                },
+                            )
+                            return
+
+                    replay = (qs.get("replay") or [""])[0] == "1"
+                    last_event_id = self.headers.get("Last-Event-ID", "").strip()
+                    if not last_event_id:
+                        last_event_id = (qs.get("last_event_id") or [""])[0].strip()
+
                     ev_q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=256)
                     with relay_ref._lock:
+                        hist = list(relay_ref._event_history.get(session_id, []))
+                        if last_event_id:
+                            found_idx = -1
+                            for idx, h_ev in enumerate(hist):
+                                if h_ev.get("event_id") == last_event_id:
+                                    found_idx = idx
+                                    break
+                            to_replay = hist[found_idx + 1 :] if found_idx >= 0 else (hist if replay else [])
+                        elif replay:
+                            to_replay = hist
+                        else:
+                            to_replay = []
+                        for h_ev in to_replay:
+                            try:
+                                ev_q.put_nowait(h_ev)
+                            except queue.Full:
+                                break
                         relay_ref._sse_subscribers.setdefault(session_id, set()).add(ev_q)
                     try:
                         self.send_response(200)
@@ -147,8 +289,10 @@ class CloudRelayServer:
                             if ev is None:
                                 break
                             raw = json.dumps(ev, ensure_ascii=False).encode("utf-8")
+                            ev_id = str(ev.get("event_id", "")).encode("utf-8")
                             ev_name = str(ev.get("event", "message")).encode("utf-8")
-                            self.wfile.write(b"event: " + ev_name + b"\ndata: " + raw + b"\n\n")
+                            id_prefix = (b"id: " + ev_id + b"\n") if ev_id else b""
+                            self.wfile.write(id_prefix + b"event: " + ev_name + b"\ndata: " + raw + b"\n\n")
                             self.wfile.flush()
                     except Exception:
                         pass
@@ -195,6 +339,7 @@ class CloudRelayServer:
                         if entry is not None:
                             ev_obj, holder = entry
                             holder["status"] = int(up.get("http_status", 200))
+                            holder["retry_after"] = str(up.get("retry_after") or "")
                             holder["reply"] = up.get("reply")
                             ev_obj.set()
                     elif kind == "event":
@@ -202,7 +347,18 @@ class CloudRelayServer:
                         if isinstance(ev_env, dict):
                             sid = str(ev_env.get("session_id", ""))
                             is_closed_ev = ev_env.get("event") == "session.closed"
+                            up_hub_id = (parse_qs(parsed.query).get("hub_id") or [""])[0]
+                            if is_closed_ev and sid:
+                                relay_ref._evict_verified_session(up_hub_id, sid)
                             with relay_ref._lock:
+                                if sid:
+                                    hist_list = relay_ref._event_history.setdefault(sid, [])
+                                    relay_ref._event_history.move_to_end(sid)
+                                    hist_list.append(ev_env)
+                                    if len(hist_list) > MAX_RELAY_EVENTS_PER_SESSION:
+                                        del hist_list[:-MAX_RELAY_EVENTS_PER_SESSION]
+                                    while len(relay_ref._event_history) > MAX_RELAY_SESSION_HISTORY:
+                                        relay_ref._event_history.popitem(last=False)
                                 subs = list(relay_ref._sse_subscribers.get(sid, set()))
                             for sub_q in subs:
                                 try:
@@ -242,44 +398,91 @@ class CloudRelayServer:
 
                     auth_hdr = self.headers.get("Authorization", "")
                     core_bearer = auth_hdr[7:].strip() if auth_hdr.startswith("Bearer ") else ""
-                    t_id = f"treq-{uuid.uuid4().hex[:12]}"
-                    done_ev = threading.Event()
-                    holder: Dict[str, Any] = {}
-                    with relay_ref._lock:
-                        relay_ref._pending_replies[t_id] = (done_ev, holder)
-                    try:
-                        down_q.put_nowait({
-                            "tunnel_req_id": t_id,
-                            "core_bearer": core_bearer,
-                            "body": body_obj,
-                        })
-                        if not done_ev.wait(timeout=12.0):
-                            self._send_json(504, {
-                                "g2a_version": "0.0.1", "request_id": orig_req_id, "timestamp_ms": 0,
-                                "acceptance": "unknown", "result": None,
-                                "error": {"code": "outcome_unknown", "http_status": 504, "message": "Hub tunnel reply timeout"}
-                            })
-                            return
-                        self._send_json(holder["status"], holder["reply"])
-                    except queue.Full:
-                        self._send_json(429, {
-                            "g2a_version": "0.0.1", "request_id": orig_req_id, "timestamp_ms": 0,
-                            "acceptance": "not_accepted", "result": None,
-                            "error": {"code": "resource_limit", "http_status": 429, "message": "Relay downlink buffer full"}
-                        })
-                    finally:
-                        with relay_ref._lock:
-                            relay_ref._pending_replies.pop(t_id, None)
+                    status, reply_obj, retry_after = self._dispatch_downlink_rpc(
+                        down_q, core_bearer, body_obj, orig_req_id=orig_req_id
+                    )
+                    if status == 200 and isinstance(reply_obj, dict):
+                        res_obj = reply_obj.get("result")
+                        verified_sid = str(
+                            body_obj.get("session_id")
+                            or (res_obj.get("session_id") if isinstance(res_obj, dict) else "")
+                            or ""
+                        )
+                        if body_obj.get("operation") == "session.close" and verified_sid:
+                            relay_ref._evict_verified_session(hub_id, verified_sid)
+                        elif verified_sid and core_bearer:
+                            relay_ref._record_verified_session(hub_id, verified_sid, core_bearer)
+                    self._send_json(status, reply_obj, retry_after=retry_after)
                     return
 
                 self._send_json(404, {"error": "not_found"})
 
-            def _send_json(self, status: int, obj: Any) -> None:
+            def _dispatch_downlink_rpc(
+                self,
+                down_q: "queue.Queue[Optional[Dict[str, Any]]]",
+                core_bearer: str,
+                body_obj: Dict[str, Any],
+                orig_req_id: str,
+            ) -> tuple[int, Any, str]:
+                t_id = f"treq-{uuid.uuid4().hex[:12]}"
+                done_ev = threading.Event()
+                holder: Dict[str, Any] = {}
+                with relay_ref._lock:
+                    relay_ref._pending_replies[t_id] = (done_ev, holder)
+                try:
+                    down_q.put_nowait({
+                        "tunnel_req_id": t_id,
+                        "core_bearer": core_bearer,
+                        "body": body_obj,
+                    })
+                    if not done_ev.wait(timeout=12.0):
+                        return (
+                            504,
+                            {
+                                "g2a_version": "0.0.1",
+                                "request_id": orig_req_id,
+                                "timestamp_ms": 0,
+                                "acceptance": "unknown",
+                                "result": None,
+                                "error": {
+                                    "code": "outcome_unknown",
+                                    "http_status": 504,
+                                    "message": "Hub tunnel reply timeout",
+                                },
+                            },
+                            "",
+                        )
+                    return holder["status"], holder["reply"], holder.get("retry_after", "")
+                except queue.Full:
+                    return (
+                        429,
+                        {
+                            "g2a_version": "0.0.1",
+                            "request_id": orig_req_id,
+                            "timestamp_ms": 0,
+                            "acceptance": "not_accepted",
+                            "result": None,
+                            "error": {
+                                "code": "resource_limit",
+                                "http_status": 429,
+                                "message": "Relay downlink buffer full",
+                            },
+                        },
+                        "1",
+                    )
+                finally:
+                    with relay_ref._lock:
+                        relay_ref._pending_replies.pop(t_id, None)
+
+            def _send_json(self, status: int, obj: Any, retry_after: str = "") -> None:
                 out = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                want_close = self.headers.get("Connection", "").strip().lower() == "close"
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(out)))
-                self.send_header("Connection", "close")
+                if retry_after:
+                    self.send_header("Retry-After", retry_after)
+                self.send_header("Connection", "close" if want_close else "keep-alive")
                 self.end_headers()
                 self.wfile.write(out)
 

@@ -198,6 +198,7 @@ export interface ProjectedContext {
   visual_ref?: Record<string, unknown>;
   audio_ref?: Record<string, unknown>;
   allowed_timeline_tags?: string[];
+  extensions_data?: Record<string, Record<string, unknown>>;
 }
 
 export interface PlanDecision {
@@ -281,19 +282,31 @@ export class CoreSDK {
     hubEndpoint: string,
     authToken: string,
     slotId: string,
-    options?: { playerId?: string; factionId?: string; requestedScope?: Record<string, unknown> }
+    options?: {
+      playerId?: string;
+      factionId?: string;
+      requestedScope?: Record<string, unknown>;
+      extensions?: Record<string, { required?: boolean }>;
+    }
   ): Promise<void> {
     validateOutboundUrlAgainstSsrf(hubEndpoint, this.allowLoopback);
 
     const base = hubEndpoint.replace(/\/$/, "");
     const cachedDigest = this.slotDigests.get(slotId);
-    const res = await this.postEnvelope(base, authToken, "session.authorize", {
-      slot_id: slotId,
-      player_id: options?.playerId,
-      faction_id: options?.factionId,
-      requested_scope: options?.requestedScope ?? { allow_chat: true },
-      cached_capability_digest: cachedDigest,
-    });
+    const res = await this.postEnvelope(
+      base,
+      authToken,
+      "session.authorize",
+      {
+        slot_id: slotId,
+        player_id: options?.playerId,
+        faction_id: options?.factionId,
+        requested_scope: options?.requestedScope ?? { allow_chat: true },
+        cached_capability_digest: cachedDigest,
+      },
+      undefined,
+      options?.extensions
+    );
 
     const capDigest = String(res.capability_table_digest);
     if (Array.isArray(res.capability_table)) {
@@ -543,7 +556,8 @@ export class CoreSDK {
     authToken: string,
     operation: string,
     payload: unknown,
-    sessionId?: string
+    sessionId?: string,
+    extensions?: Record<string, unknown>
   ): Promise<Record<string, unknown>> {
     const resp = await fetch(`${base}/g2a/v1/core`, {
       method: "POST",
@@ -558,7 +572,7 @@ export class CoreSDK {
         timestamp_ms: Date.now(),
         operation,
         payload,
-        extensions: {},
+        extensions: extensions ?? {},
       }),
     });
     const raw = await resp.text();

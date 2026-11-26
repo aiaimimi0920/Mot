@@ -538,3 +538,92 @@ func TestSSELastEventIDCursorReplayAndTrustedNpcHandoff(t *testing.T) {
 		t.Fatalf("expected 200 on valid metered NPC handoff, got %d (%s)", okRec.Code, okRec.Body.String())
 	}
 }
+
+func TestRFC6455WebSocketVersionAndControlFrameHardening(t *testing.T) {
+	eng := newTestHubEngine(t)
+	registerSlotForServerTest(t, eng, "slot-ws-rfc")
+	authRep, gErr := eng.HandleSessionAuthorize(model.WireVersion, "core-ws-rfc", model.AuthorizeRequest{
+		SlotID:         "slot-ws-rfc",
+		RequestedScope: model.RequestedScopeSpec{AllowChat: true},
+	})
+	if gErr != nil {
+		t.Fatalf("authorize: %v", gErr)
+	}
+
+	coreSrv := httptest.NewServer(server.NewCoreHandler(eng, server.AuthRegistry{
+		CoreTokens: map[string]string{"ws-tok": "core-ws-rfc"},
+	}))
+	defer coreSrv.Close()
+	hostPort := strings.TrimPrefix(coreSrv.URL, "http://")
+
+	// 1. RFC 6455 §4.4: Wrong Sec-WebSocket-Version (e.g. "8") MUST return 426 Upgrade Required + Sec-WebSocket-Version: 13
+	{
+		conn, err := net.DialTimeout("tcp", hostPort, 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		secKey := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef"))
+		hs := "GET /g2a/v1/core/ws?session_id=" + authRep.SessionID + " HTTP/1.1\r\n" +
+			"Host: " + hostPort + "\r\n" +
+			"Upgrade: websocket\r\n" +
+			"Connection: Upgrade\r\n" +
+			"Sec-WebSocket-Key: " + secKey + "\r\n" +
+			"Sec-WebSocket-Version: 8\r\n" +
+			"Authorization: Bearer ws-tok\r\n\r\n"
+		_, _ = conn.Write([]byte(hs))
+		br := bufio.NewReader(conn)
+		statusLine, _ := br.ReadString('\n')
+		if !strings.Contains(statusLine, " 426 ") {
+			t.Fatalf("expected HTTP 426 Upgrade Required for Sec-WebSocket-Version: 8, got %q", statusLine)
+		}
+	}
+
+	// 2. RFC 6455 §5.2 & §5.5: Non-zero RSV bits and oversized (>125B) Ping control frames MUST close with 1002 (0x03EA)
+	for _, tc := range []struct {
+		name  string
+		frame []byte
+	}{
+		{
+			name:  "non-zero RSV1 bit on Ping",
+			frame: []byte{0xC9, 0x80, 1, 2, 3, 4}, // FIN=1, RSV1=1, opcode=0x9, MASK=1, len=0
+		},
+		{
+			name:  "fragmented Ping control frame (FIN=0)",
+			frame: []byte{0x09, 0x80, 1, 2, 3, 4}, // FIN=0, opcode=0x9, MASK=1, len=0
+		},
+		{
+			name:  "oversized Ping control frame (len=126 > 125)",
+			frame: append([]byte{0x89, 0x80 | 126, 0x00, 0x7E, 1, 2, 3, 4}, make([]byte, 126)...),
+		},
+	} {
+		conn, err := net.DialTimeout("tcp", hostPort, 2*time.Second)
+		if err != nil {
+			t.Fatalf("%s dial: %v", tc.name, err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		secKey := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef"))
+		hs := "GET /g2a/v1/core/ws?session_id=" + authRep.SessionID + " HTTP/1.1\r\n" +
+			"Host: " + hostPort + "\r\n" +
+			"Upgrade: websocket\r\n" +
+			"Connection: Upgrade\r\n" +
+			"Sec-WebSocket-Key: " + secKey + "\r\n" +
+			"Sec-WebSocket-Version: 13\r\n" +
+			"Authorization: Bearer ws-tok\r\n\r\n"
+		_, _ = conn.Write([]byte(hs))
+		br := bufio.NewReader(conn)
+		for {
+			ln, rErr := br.ReadString('\n')
+			if rErr != nil || ln == "\r\n" {
+				break
+			}
+		}
+		_, _ = conn.Write(tc.frame)
+		op, payload := readServerWSFrame(t, br)
+		_ = conn.Close()
+		if op != 0x8 || len(payload) < 2 || int(payload[0])<<8|int(payload[1]) != 1002 {
+			t.Fatalf("case %q expected Close(1002), got opcode=0x%x payload=%v", tc.name, op, payload)
+		}
+	}
+}

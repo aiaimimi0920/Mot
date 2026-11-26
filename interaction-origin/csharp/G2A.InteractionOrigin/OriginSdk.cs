@@ -36,6 +36,7 @@ public sealed class OriginSdk
     private readonly List<OriginExecuteReply> _pendingSettled = new();
 
     private Dictionary<(string MethodId, string Actor), string> _lastSentMethodJson = new();
+    private readonly Dictionary<string, Dictionary<string, object?>> _extensionsData = new();
     private string _lastSentBriefDigest = "";
     private bool _syncEnabled = true;
 
@@ -87,7 +88,23 @@ public sealed class OriginSdk
             FlushDirtySync(significantEvent);
     }
 
-    public void PublishCapabilitiesAndBaseline(string originExecuteUrl = "")
+    public void AttachExtensionData(string extensionName, Dictionary<string, object?> data, bool flush = false)
+    {
+        _dispatcher.RunOnGameThread(() =>
+        {
+            _extensionsData[extensionName] = new Dictionary<string, object?>(data);
+            return true;
+        });
+        if (flush) FlushDirtySync(false);
+    }
+
+    public void PublishCapabilitiesAndBaseline(
+        string originExecuteUrl = "",
+        bool disabled = false,
+        int maxSessions = 0,
+        long sharedCooldownMs = 0,
+        List<string>? allowlistedCores = null,
+        string allowlistCriteriaUrl = "")
     {
         var sortedDefs = _capabilities.Values
             .OrderBy(c => c.Def.MethodId, StringComparer.Ordinal)
@@ -103,6 +120,11 @@ public sealed class OriginSdk
             ["capability_table_digest"] = capDigest,
             ["capabilities"] = sortedDefs
         };
+        if (disabled) capPayload["disabled"] = true;
+        if (maxSessions > 0) capPayload["max_sessions"] = maxSessions;
+        if (sharedCooldownMs > 0) capPayload["shared_cooldown_ms"] = sharedCooldownMs;
+        if (allowlistedCores is { Count: > 0 }) capPayload["allowlisted_cores"] = allowlistedCores;
+        if (!string.IsNullOrEmpty(allowlistCriteriaUrl)) capPayload["allowlist_criteria_url"] = allowlistCriteriaUrl;
         if (!string.IsNullOrEmpty(_roomId)) capPayload["room_id"] = _roomId;
         if (!string.IsNullOrEmpty(_factionId)) capPayload["faction_id"] = _factionId;
         _transport.PostToHub("origin.capabilities", capPayload);
@@ -113,15 +135,21 @@ public sealed class OriginSdk
     {
         if (!_syncEnabled && _pendingSettled.Count == 0) return false;
 
-        var (brief, grants, settled) = _dispatcher.RunOnGameThread(() =>
+        var (brief, grants, settled, extSnapshot) = _dispatcher.RunOnGameThread(() =>
         {
             var (b, g) = CollectCurrentView();
             var s = _pendingSettled.ToList();
             _pendingSettled.Clear();
-            return (b, g, s);
+            var ext = _extensionsData.ToDictionary(
+                kv => kv.Key,
+                kv => new Dictionary<string, object?>(kv.Value));
+            return (b, g, s, ext);
         });
 
-        string briefDigest = JcsDigest.ComputeSha256("g2a.brief.v1", brief);
+        object digestTarget = extSnapshot.Count > 0
+            ? new Dictionary<string, object?> { ["brief"] = brief, ["ext"] = extSnapshot }
+            : brief;
+        string briefDigest = JcsDigest.ComputeSha256("g2a.brief.v1", digestTarget);
         var currentSerialized = grants.ToDictionary(kv => kv.Key, kv => JsonSerializer.Serialize(kv.Value));
 
         var upserted = new List<ActiveMethodGrant>();
@@ -146,7 +174,7 @@ public sealed class OriginSdk
         _lastSentBriefDigest = briefDigest;
         _lastSentMethodJson = currentSerialized;
 
-        _transport.PostToHub("origin.sync", new Dictionary<string, object?>
+        var frame = new Dictionary<string, object?>
         {
             ["slot_id"] = _slotId,
             ["epoch"] = CurrentEpoch,
@@ -158,25 +186,33 @@ public sealed class OriginSdk
             ["upserted_methods"] = upserted,
             ["removed_methods"] = removed,
             ["settled_executions"] = settled
-        });
+        };
+        if (extSnapshot.Count > 0) frame["extensions_data"] = extSnapshot;
+        _transport.PostToHub("origin.sync", frame);
         return true;
     }
 
     public void FlushFullSync()
     {
-        var (brief, grants, settled) = _dispatcher.RunOnGameThread(() =>
+        var (brief, grants, settled, extSnapshot) = _dispatcher.RunOnGameThread(() =>
         {
             var (b, g) = CollectCurrentView();
             var s = _pendingSettled.ToList();
             _pendingSettled.Clear();
-            return (b, g, s);
+            var ext = _extensionsData.ToDictionary(
+                kv => kv.Key,
+                kv => new Dictionary<string, object?>(kv.Value));
+            return (b, g, s, ext);
         });
 
         CurrentRev++;
-        _lastSentBriefDigest = JcsDigest.ComputeSha256("g2a.brief.v1", brief);
+        object digestTarget = extSnapshot.Count > 0
+            ? new Dictionary<string, object?> { ["brief"] = brief, ["ext"] = extSnapshot }
+            : brief;
+        _lastSentBriefDigest = JcsDigest.ComputeSha256("g2a.brief.v1", digestTarget);
         _lastSentMethodJson = grants.ToDictionary(kv => kv.Key, kv => JsonSerializer.Serialize(kv.Value));
 
-        _transport.PostToHub("origin.sync", new Dictionary<string, object?>
+        var frame = new Dictionary<string, object?>
         {
             ["slot_id"] = _slotId,
             ["epoch"] = CurrentEpoch,
@@ -187,7 +223,9 @@ public sealed class OriginSdk
             ["upserted_methods"] = grants.Values.ToList(),
             ["removed_methods"] = new List<MethodActorKey>(),
             ["settled_executions"] = settled
-        });
+        };
+        if (extSnapshot.Count > 0) frame["extensions_data"] = extSnapshot;
+        _transport.PostToHub("origin.sync", frame);
     }
 
     public OriginExecuteReply HandleOriginExecute(OriginExecuteRequest req)

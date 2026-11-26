@@ -289,6 +289,24 @@ internal static class Program
         if ((string?)hoPayload["kind"] != "host_handoff" || (string?)hoPayload["new_player_id"] != "player-teammate-2")
             throw new Exception("Expected host_handoff event in C# OriginSdk");
 
+        // Verify FRAND slot governance fields & reverse-DNS modular extension data (§7.3 & §8.1)
+        var extTx = new RecordingTransport();
+        var extSdk = new OriginSdk("slot-ext-cs", extTx);
+        extSdk.AttachExtensionData("org.g2a.sim.batch_blueprint.v1", new Dictionary<string, object?> { ["grid"] = "6x6" });
+        extSdk.PublishCapabilitiesAndBaseline(
+            originExecuteUrl: "pull://origin.execute",
+            maxSessions: 2,
+            sharedCooldownMs: 650,
+            allowlistedCores: new List<string> { "core-alpha" },
+            allowlistCriteriaUrl: "https://game.example/g2a-frand");
+        var extCap = (Dictionary<string, object?>)extTx.Posts[0].Payload;
+        if ((long)extCap["shared_cooldown_ms"]! != 650L || (string?)extCap["allowlist_criteria_url"] != "https://game.example/g2a-frand")
+            throw new Exception("Expected FRAND governance metadata in C# OriginSdk");
+        var extSync = (Dictionary<string, object?>)extTx.Posts[1].Payload;
+        var extData = (Dictionary<string, Dictionary<string, object?>>)extSync["extensions_data"]!;
+        if ((string?)extData["org.g2a.sim.batch_blueprint.v1"]["grid"] != "6x6")
+            throw new Exception("Expected modular extensions_data in C# OriginSdk");
+
         Console.WriteLine($"C# G2A.InteractionOrigin SelfTest PASSED | JCS={d1}");
         return 0;
     }

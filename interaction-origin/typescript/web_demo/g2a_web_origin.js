@@ -133,6 +133,7 @@ export class WebOriginSDK {
     this.pendingSettled = [];
     this.lastSentMethods = new Map();
     this.lastBriefDigest = "";
+    this.extensionsData = {};
     this.eventSource = null;
 
     this.currentEpoch = 1;
@@ -166,6 +167,10 @@ export class WebOriginSDK {
 
   bindStateModule(name, snapshotFn, grantsFn) {
     this.modules.set(name, { snapshotFn, grantsFn });
+  }
+
+  attachExtensionData(extName, data) {
+    this.extensionsData[extName] = { ...data };
   }
 
   async connect() {
@@ -295,7 +300,17 @@ export class WebOriginSDK {
     if (req.epoch !== this.currentEpoch || !reg || !req.actor || !this.actors.has(req.actor)) {
       return { execution_id: req.execution_id, state: "failed", failure_reason: "invalid_context_or_actor" };
     }
-    const out = reg.handler(req.actor, this.actors.get(req.actor), req.args ?? {}, req.execution_id);
+    if (!reg.def.permitted_actors.includes(req.actor)) {
+      return { execution_id: req.execution_id, state: "failed", failure_reason: "permission_denied" };
+    }
+    const reqArgs = req.args ?? {};
+    const reqFields = Array.isArray(reg.def.params_schema?.required) ? reg.def.params_schema.required : [];
+    for (const f of reqFields) {
+      if (!(f in reqArgs)) {
+        return { execution_id: req.execution_id, state: "failed", failure_reason: `missing_required_arg:${f}` };
+      }
+    }
+    const out = reg.handler(req.actor, this.actors.get(req.actor), reqArgs, req.execution_id);
     if (out.kind === "executing") {
       this.inFlight.set(req.execution_id, out.cancel_fn);
       const rep = { execution_id: req.execution_id, state: "executing" };
@@ -355,6 +370,40 @@ export class WebOriginSDK {
       slot_id: this.slotId,
       kind: "player_command",
       text,
+    });
+  }
+
+  async reportPresenceChanged(online, remainingOnlineHumans = 0) {
+    this.syncEnabled = Boolean(online) || remainingOnlineHumans > 0;
+    await this.postToHub("origin.player_event", {
+      slot_id: this.slotId,
+      kind: "presence_changed",
+      online: Boolean(online),
+      remaining_online_humans: remainingOnlineHumans,
+    });
+  }
+
+  async reportQueueApproval(sessionId, queueId, queueDigest, fingerprint, approved) {
+    await this.postToHub("origin.player_event", {
+      slot_id: this.slotId,
+      kind: "queue_approval",
+      session_id: sessionId,
+      queue_id: queueId,
+      queue_digest: queueDigest,
+      fingerprint,
+      approved: Boolean(approved),
+    });
+  }
+
+  async reportNpcHostHandoff(newPlayerId) {
+    for (const execId of [...this.inFlight.keys()]) {
+      await this.cancelInFlightStep(execId);
+    }
+    this.syncEnabled = true;
+    await this.postToHub("origin.player_event", {
+      slot_id: this.slotId,
+      kind: "host_handoff",
+      new_player_id: String(newPlayerId).trim(),
     });
   }
 

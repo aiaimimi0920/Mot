@@ -28,6 +28,7 @@ type UplinkFrame struct {
 	Kind        string               `json:"kind"` // "reply" | "event"
 	TunnelReqID string               `json:"tunnel_req_id,omitempty"`
 	HTTPStatus  int                  `json:"http_status,omitempty"`
+	RetryAfter  string               `json:"retry_after,omitempty"`
 	Reply       json.RawMessage      `json:"reply,omitempty"`
 	Event       *model.EventEnvelope `json:"event,omitempty"`
 }
@@ -183,6 +184,7 @@ func (t *OutboundCloudTunnel) handleDownlinkFrame(ctx context.Context, rawJSON s
 		Kind:        "reply",
 		TunnelReqID: frame.TunnelReqID,
 		HTTPStatus:  rec.Code,
+		RetryAfter:  rec.Header().Get("Retry-After"),
 		Reply:       json.RawMessage(respBytes),
 	})
 }

@@ -25,10 +25,17 @@ type Conn struct {
 
 func Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
 	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		http.Error(w, "missing Upgrade: websocket header", http.StatusBadRequest)
 		return nil, errors.New("missing Upgrade: websocket header")
+	}
+	if strings.TrimSpace(r.Header.Get("Sec-WebSocket-Version")) != "13" {
+		w.Header().Set("Sec-WebSocket-Version", "13")
+		http.Error(w, "Sec-WebSocket-Version: 13 required", http.StatusUpgradeRequired)
+		return nil, errors.New("unsupported Sec-WebSocket-Version")
 	}
 	key := strings.TrimSpace(r.Header.Get("Sec-WebSocket-Key"))
 	if key == "" {
+		http.Error(w, "missing Sec-WebSocket-Key", http.StatusBadRequest)
 		return nil, errors.New("missing Sec-WebSocket-Key")
 	}
 	hj, ok := w.(http.Hijacker)
@@ -67,6 +74,12 @@ func (c *Conn) WritePing(payload []byte) error {
 	return c.writeFrame(0x9, payload)
 }
 
+func (c *Conn) WriteClose(statusCode uint16) error {
+	var codeBuf [2]byte
+	binary.BigEndian.PutUint16(codeBuf[:], statusCode)
+	return c.writeFrame(0x8, codeBuf[:])
+}
+
 func (c *Conn) writeFrame(opcode byte, payload []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -100,9 +113,11 @@ func (c *Conn) writeFrame(opcode byte, payload []byte) error {
 }
 
 // ReadLoop drains client control frames (ping -> pong, close -> return) until the peer disconnects.
-// Enforces RFC 6455 client masking, TCP-fragment-safe io.ReadFull headers, and 64-bit overflow bounds.
+// Enforces RFC 6455 §5.1 client masking, §5.2 RSV=0 invariants, §5.5 control-frame fragmentation/125B limits,
+// TCP-fragment-safe io.ReadFull headers, 64-bit overflow bounds, and zero-alloc stack buffers for control frames.
 func (c *Conn) ReadLoop() {
 	const maxClientFrameBytes = 1 << 20
+	var stackBuf [128]byte
 	for {
 		b0, err := c.bufrw.ReadByte()
 		if err != nil {
@@ -112,14 +127,32 @@ func (c *Conn) ReadLoop() {
 		if err != nil {
 			return
 		}
+		fin := (b0 & 0x80) != 0
+		rsv := b0 & 0x70
 		opcode := b0 & 0x0F
 		masked := (b1 & 0x80) != 0
+		if rsv != 0 {
+			// RFC 6455 §5.2: RSV1..3 MUST be 0 when no extensions were negotiated.
+			_ = c.WriteClose(1002)
+			return
+		}
+		switch opcode {
+		case 0x0, 0x1, 0x2, 0x8, 0x9, 0xA:
+		default:
+			_ = c.WriteClose(1002)
+			return
+		}
 		if !masked {
-			// RFC 6455 Section 5.1: server MUST close connection upon receiving an unmasked client frame.
-			_ = c.writeFrame(0x8, nil)
+			// RFC 6455 §5.1: server MUST close connection upon receiving an unmasked client frame.
+			_ = c.WriteClose(1002)
 			return
 		}
 		uLen := uint64(b1 & 0x7F)
+		if opcode >= 0x8 && (!fin || uLen > 125) {
+			// RFC 6455 §5.5: control frames MUST NOT be fragmented and MUST NOT exceed 125 payload bytes.
+			_ = c.WriteClose(1002)
+			return
+		}
 		if uLen == 126 {
 			var ext [2]byte
 			if _, err := io.ReadFull(c.bufrw, ext[:]); err != nil {
@@ -134,14 +167,19 @@ func (c *Conn) ReadLoop() {
 			uLen = binary.BigEndian.Uint64(ext[:])
 		}
 		if uLen > maxClientFrameBytes {
-			_ = c.writeFrame(0x8, nil)
+			_ = c.WriteClose(1009)
 			return
 		}
 		var maskKey [4]byte
 		if _, err := io.ReadFull(c.bufrw, maskKey[:]); err != nil {
 			return
 		}
-		data := make([]byte, int(uLen))
+		var data []byte
+		if uLen <= uint64(len(stackBuf)) {
+			data = stackBuf[:int(uLen)]
+		} else {
+			data = make([]byte, int(uLen))
+		}
 		if uLen > 0 {
 			if _, err := io.ReadFull(c.bufrw, data); err != nil {
 				return

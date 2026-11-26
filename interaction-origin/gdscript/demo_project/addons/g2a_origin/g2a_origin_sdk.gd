@@ -17,6 +17,11 @@ const MAX_EXECUTION_LEDGER := 512
 @export var room_id: String = ""
 @export var faction_id: String = ""
 @export var perception_radius: float = 15.0
+@export var slot_disabled: bool = false
+@export var max_sessions: int = 0
+@export var shared_cooldown_ms: int = 0
+@export var allowlisted_cores: PackedStringArray = PackedStringArray()
+@export var allowlist_criteria_url: String = ""
 
 signal ai_chat_delivered(audience: String, text: String)
 
@@ -27,6 +32,7 @@ var sync_enabled: bool = true
 var _capabilities: Dictionary = {}        # method_id -> Dictionary { def, effect_callable, readiness_callable }
 var _actors: Dictionary = {}              # actor -> Variant (Node3D / RefCounted seat controller)
 var _signal_modules: Dictionary = {}      # module_name -> Dictionary { snapshot_fn, active_methods_fn }
+var _extensions_data: Dictionary = {}     # extension_name -> Dictionary
 var _in_flight_steps: Dictionary = {}     # execution_id -> Callable (cancel_fn)
 var _execution_ledger: Dictionary = {}    # execution_id -> Dictionary (OriginExecuteReply)
 var _ledger_order: Array[String] = []
@@ -102,6 +108,11 @@ func notify_module_changed(module_name: String, significant_event: bool = false)
 	if _signal_modules.has(module_name):
 		flush_dirty_sync(significant_event)
 
+func attach_extension_data(extension_name: String, data: Dictionary, flush: bool = false) -> void:
+	_extensions_data[extension_name] = data.duplicate(true)
+	if flush:
+		flush_dirty_sync(false)
+
 func publish_capabilities_and_baseline(origin_execute_url: String = "") -> void:
 	var ids := _capabilities.keys()
 	ids.sort()
@@ -117,6 +128,19 @@ func publish_capabilities_and_baseline(origin_execute_url: String = "") -> void:
 		"capability_table_digest": cap_digest,
 		"capabilities": defs,
 	}
+	if slot_disabled:
+		cap_payload["disabled"] = true
+	if max_sessions > 0:
+		cap_payload["max_sessions"] = max_sessions
+	if shared_cooldown_ms > 0:
+		cap_payload["shared_cooldown_ms"] = shared_cooldown_ms
+	if not allowlisted_cores.is_empty():
+		var cores_arr: Array = []
+		for c in allowlisted_cores:
+			cores_arr.append(c)
+		cap_payload["allowlisted_cores"] = cores_arr
+	if allowlist_criteria_url != "":
+		cap_payload["allowlist_criteria_url"] = allowlist_criteria_url
 	if room_id != "":
 		cap_payload["room_id"] = room_id
 	if faction_id != "":
@@ -193,7 +217,8 @@ func flush_dirty_sync(significant_event: bool = false) -> bool:
 	var settled := _pending_settled.duplicate(true)
 	_pending_settled.clear()
 
-	var brief_digest := G2AJcs.compute_sha256("g2a.brief.v1", brief)
+	var digest_doc: Variant = {"brief": brief, "ext": _extensions_data} if not _extensions_data.is_empty() else brief
+	var brief_digest := G2AJcs.compute_sha256("g2a.brief.v1", digest_doc)
 	var upserted: Array = []
 	var removed: Array = []
 	var current_serialized: Dictionary = {}
@@ -215,7 +240,7 @@ func flush_dirty_sync(significant_event: bool = false) -> bool:
 	current_rev += 1
 	_last_sent_brief_digest = brief_digest
 	_last_sent_methods = current_serialized
-	_post_to_hub("origin.sync", {
+	var delta_frame := {
 		"slot_id": slot_id,
 		"epoch": current_epoch,
 		"rev": current_rev,
@@ -226,7 +251,10 @@ func flush_dirty_sync(significant_event: bool = false) -> bool:
 		"upserted_methods": upserted,
 		"removed_methods": removed,
 		"settled_executions": settled,
-	})
+	}
+	if not _extensions_data.is_empty():
+		delta_frame["extensions_data"] = _extensions_data.duplicate(true)
+	_post_to_hub("origin.sync", delta_frame)
 	return true
 
 func flush_full_sync() -> void:
@@ -237,12 +265,13 @@ func flush_full_sync() -> void:
 	_pending_settled.clear()
 
 	current_rev += 1
-	_last_sent_brief_digest = G2AJcs.compute_sha256("g2a.brief.v1", brief)
+	var digest_doc: Variant = {"brief": brief, "ext": _extensions_data} if not _extensions_data.is_empty() else brief
+	_last_sent_brief_digest = G2AJcs.compute_sha256("g2a.brief.v1", digest_doc)
 	_last_sent_methods.clear()
 	for k in grants.keys():
 		_last_sent_methods[k] = G2AJcs.canonicalize(grants[k])
 
-	_post_to_hub("origin.sync", {
+	var full_frame := {
 		"slot_id": slot_id,
 		"epoch": current_epoch,
 		"rev": current_rev,
@@ -252,7 +281,10 @@ func flush_full_sync() -> void:
 		"upserted_methods": grants.values(),
 		"removed_methods": [],
 		"settled_executions": settled,
-	})
+	}
+	if not _extensions_data.is_empty():
+		full_frame["extensions_data"] = _extensions_data.duplicate(true)
+	_post_to_hub("origin.sync", full_frame)
 
 func _store_ledger_reply(rep: Dictionary) -> void:
 	var eid: String = rep["execution_id"]

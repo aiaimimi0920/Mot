@@ -859,3 +859,144 @@ func TestConfirmationTimeoutQuietBackoffSustainedCancelCapRefreshAndNpcHandoff(t
 		t.Fatalf("expected host-player-2 to authorize cleanly onto handed-off NPC slot, got %+v err=%v", npcAuth2, gErr)
 	}
 }
+
+func TestSlotGovernanceFRANDSharedCooldownAndExtensionProjection(t *testing.T) {
+	nowMs := int64(500000)
+	p, err := store.NewPersistencePort("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := hub.DefaultConfig()
+	cfg.AutoApproveScope = true
+	cfg.ClockNowMs = func() int64 { return nowMs }
+	eng := hub.NewEngine(cfg, p, &fakeOrigin{}, nil, nil)
+
+	caps := []model.CapabilityEntry{
+		{
+			MethodID: "#01", Name: "ping_map", Description: "Tactical ping",
+			PermittedActors: []string{"companion"},
+			ParamsSchema:    map[string]any{"type": "object"},
+			DefaultPolicy:   "allow",
+		},
+	}
+	capDigest, _ := jcs.DigestSHA256("g2a.cap.v1", caps)
+
+	// 1. FRAND transparency (§7.3): companion allowlist without public allowlist_criteria_url MUST be rejected!
+	if fErr := eng.HandleOriginCapabilities(model.OriginCapabilitiesPayload{
+		SlotID:                "slot-frand",
+		RoleKind:              "companion",
+		BillingMode:           "player_metered",
+		CapabilityTableDigest: capDigest,
+		Capabilities:          caps,
+		AllowlistedCores:      []string{"core-first-party", "core-open-third-party"},
+	}); fErr == nil || fErr.Code != model.ErrInvalidArguments {
+		t.Fatalf("expected invalid_arguments when companion allowlist omits allowlist_criteria_url, got %v", fErr)
+	}
+
+	// Publishing with objective FRAND criteria URL + SharedCooldownMs=400ms + MaxSessions=2 succeeds
+	if fErr := eng.HandleOriginCapabilities(model.OriginCapabilitiesPayload{
+		SlotID:                "slot-frand",
+		RoleKind:              "companion",
+		BillingMode:           "player_metered",
+		CapabilityTableDigest: capDigest,
+		Capabilities:          caps,
+		OriginExecuteURL:      "mem://frand",
+		MaxSessions:           2,
+		SharedCooldownMs:      400,
+		AllowlistedCores:      []string{"core-first-party", "core-open-third-party", "core-overflow"},
+		AllowlistCriteriaURL:  "https://game.example/g2a-frand-criteria",
+	}); fErr != nil {
+		t.Fatalf("expected valid FRAND capability publish, got %v", fErr)
+	}
+
+	// 2. Sync full view with two modular extensions (§8.1)
+	if sErr := eng.HandleOriginSync(model.OriginSyncFrame{
+		SlotID: "slot-frand", Epoch: 1, Rev: 1, Mode: "full", SignificantEvent: true,
+		StateBrief: map[string]any{"match": "casual"},
+		UpsertedMethods: []model.ActiveMethodGrant{
+			{MethodID: "#01", Actor: "companion", Readiness: "ready"},
+		},
+		ExtensionsData: map[string]map[string]any{
+			"org.g2a.sim.batch_blueprint.v1": {"grid": "8x8", "prefab": "watchtower"},
+			"org.g2a.commerce.catalog.v1":    {"items": []string{"potion"}},
+		},
+	}); sErr != nil {
+		t.Fatalf("sync err: %v", sErr)
+	}
+
+	// Session 1 negotiates ONLY org.g2a.sim.batch_blueprint.v1; Session 2 negotiates ZERO extensions
+	auth1, gErr := eng.HandleSessionAuthorize("0.0.1", "core-first-party", model.AuthorizeRequest{
+		SlotID:     "slot-frand",
+		Extensions: []model.ExtensionSpec{{Name: "org.g2a.sim.batch_blueprint.v1", Required: false}},
+	})
+	if gErr != nil {
+		t.Fatalf("auth1 err: %v", gErr)
+	}
+	auth2, gErr := eng.HandleSessionAuthorize("0.0.1", "core-open-third-party", model.AuthorizeRequest{
+		SlotID: "slot-frand",
+	})
+	if gErr != nil {
+		t.Fatalf("auth2 err: %v", gErr)
+	}
+	// MaxSessions=2: a 3rd distinct Core MUST receive 429 resource_limit
+	if _, maxErr := eng.HandleSessionAuthorize("0.0.1", "core-overflow", model.AuthorizeRequest{
+		SlotID: "slot-frand",
+	}); maxErr == nil || maxErr.Code != model.ErrResourceLimit {
+		t.Fatalf("expected 429 resource_limit when exceeding MaxSessions=2, got %v", maxErr)
+	}
+
+	ctx1, _ := eng.HandleContextPull("core-first-party", auth1.SessionID)
+	if ctx1.ExtensionsData == nil || ctx1.ExtensionsData["org.g2a.sim.batch_blueprint.v1"]["prefab"] != "watchtower" {
+		t.Fatalf("expected negotiated batch_blueprint extension in ctx1, got %+v", ctx1.ExtensionsData)
+	}
+	if _, leaked := ctx1.ExtensionsData["org.g2a.commerce.catalog.v1"]; leaked {
+		t.Fatal("unnegotiated commerce.catalog extension leaked into ctx1")
+	}
+
+	ctx2, _ := eng.HandleContextPull("core-open-third-party", auth2.SessionID)
+	if ctx2.ExtensionsData != nil {
+		t.Fatalf("expected nil ExtensionsData when session negotiated zero extensions, got %+v", ctx2.ExtensionsData)
+	}
+
+	// 3. FRAND equal SharedCooldownMs: Core-1 dispatches at t=500000 -> both Core-1 and Core-2 are equally throttled until +400ms!
+	if _, q1Err := eng.HandleQueueSubmit("core-first-party", auth1.SessionID, model.MethodCallQueue{
+		QueueID: "Q-fp-1", Epoch: 1, BasedOnRev: 1, Trigger: "player_command",
+		Steps: []model.QueueStep{{StepIndex: 0, MethodID: "#01", Actor: "companion"}},
+	}); q1Err != nil {
+		t.Fatalf("Q-fp-1 failed: %v", q1Err)
+	}
+	nowMs += 100
+	if _, fpBurstErr := eng.HandleQueueSubmit("core-first-party", auth1.SessionID, model.MethodCallQueue{
+		QueueID: "Q-fp-2", Epoch: 1, BasedOnRev: 1, Trigger: "player_command",
+		Steps: []model.QueueStep{{StepIndex: 0, MethodID: "#01", Actor: "companion"}},
+	}); fpBurstErr == nil || fpBurstErr.Code != model.ErrResourceLimit {
+		t.Fatalf("first-party Core MUST obey equal FRAND SharedCooldownMs, got %v", fpBurstErr)
+	}
+	nowMs += 350 // Total +450ms >= 400ms -> third-party Core succeeds!
+	if _, q3Err := eng.HandleQueueSubmit("core-open-third-party", auth2.SessionID, model.MethodCallQueue{
+		QueueID: "Q-tp-1", Epoch: 1, BasedOnRev: 1, Trigger: "player_command",
+		Steps: []model.QueueStep{{StepIndex: 0, MethodID: "#01", Actor: "companion"}},
+	}); q3Err != nil {
+		t.Fatalf("expected third-party Core to succeed once SharedCooldownMs elapsed, got %v", q3Err)
+	}
+
+	// 4. Ranked match disables companion slot (§4.3): closes existing sessions and blocks new session.authorize!
+	if dErr := eng.HandleOriginCapabilities(model.OriginCapabilitiesPayload{
+		SlotID:                "slot-frand",
+		RoleKind:              "companion",
+		BillingMode:           "player_metered",
+		CapabilityTableDigest: capDigest,
+		Capabilities:          caps,
+		Disabled:              true,
+	}); dErr != nil {
+		t.Fatalf("disable slot err: %v", dErr)
+	}
+	if _, hbErr := eng.HandleSessionHeartbeat("core-first-party", auth1.SessionID); hbErr == nil || hbErr.Code != model.ErrRevoked {
+		t.Fatalf("expected active session to be revoked when slot transitions to disabled, got %v", hbErr)
+	}
+	if _, disAuthErr := eng.HandleSessionAuthorize("0.0.1", "core-first-party", model.AuthorizeRequest{
+		SlotID: "slot-frand",
+	}); disAuthErr == nil || disAuthErr.Code != model.ErrPermissionDenied {
+		t.Fatalf("expected permission_denied when authorizing against disabled ranked-mode slot, got %v", disAuthErr)
+	}
+}

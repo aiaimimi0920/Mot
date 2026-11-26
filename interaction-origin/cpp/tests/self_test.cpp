@@ -207,6 +207,25 @@ int main() {
     assert(std::get<std::string>(ho_obj.at("kind").data) == "host_handoff");
     assert(std::get<std::string>(ho_obj.at("new_player_id").data) == "teammate-2");
 
+    // 8. Verify FRAND slot governance fields & reverse-DNS modular extension data (§7.3 & §8.1)
+    std::vector<std::pair<std::string, JsonValue>> ext_posts;
+    OriginSdk ext_sdk("slot-ext-cpp", [&](const std::string& op, const JsonValue& p) { ext_posts.emplace_back(op, p); });
+    ext_sdk.attach_extension_data("org.g2a.sim.batch_blueprint.v1", JsonObject{{"grid", "8x8"}});
+    ext_sdk.publish_capabilities_and_baseline(
+        "pull://origin.execute",
+        false,
+        2,
+        750,
+        {"core-alpha"},
+        "https://game.example/g2a-frand");
+    const auto& ext_cap = std::get<JsonObject>(ext_posts[0].second.data);
+    assert(std::get<int64_t>(ext_cap.at("max_sessions").data) == 2);
+    assert(std::get<int64_t>(ext_cap.at("shared_cooldown_ms").data) == 750);
+    assert(std::get<std::string>(ext_cap.at("allowlist_criteria_url").data) == "https://game.example/g2a-frand");
+    const auto& ext_sync = std::get<JsonObject>(ext_posts[1].second.data);
+    const auto& ext_map = std::get<JsonObject>(ext_sync.at("extensions_data").data);
+    assert(std::get<std::string>(std::get<JsonObject>(ext_map.at("org.g2a.sim.batch_blueprint.v1").data).at("grid").data) == "8x8");
+
     std::cout << "C++17 G2A OriginSdk SelfTest PASSED | JCS=" << digest << "\n";
     return 0;
 }

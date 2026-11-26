@@ -138,23 +138,28 @@ type OriginCapabilitiesPayload struct {
 	RoomID                string            `json:"room_id,omitempty"`
 	FactionID             string            `json:"faction_id,omitempty"`
 	PlayerID              string            `json:"player_id,omitempty"`
+	Disabled              bool              `json:"disabled,omitempty"`
+	MaxSessions           int               `json:"max_sessions,omitempty"`
+	SharedCooldownMs      int64             `json:"shared_cooldown_ms,omitempty"`
 	AllowlistedCores      []string          `json:"allowlisted_cores,omitempty"`
+	AllowlistCriteriaURL  string            `json:"allowlist_criteria_url,omitempty"`
 }
 
 type OriginSyncFrame struct {
-	SlotID              string               `json:"slot_id"`
-	Epoch               int64                `json:"epoch"`
-	Rev                 int64                `json:"rev"`
-	BaseRev             *int64               `json:"base_rev,omitempty"`
-	Mode                string               `json:"mode"` // "full" | "delta"
-	SignificantEvent    bool                 `json:"significant_event"`
-	StateBrief          map[string]any       `json:"state_brief"`
-	UpsertedMethods     []ActiveMethodGrant  `json:"upserted_methods"`
-	RemovedMethods      []MethodActorKey     `json:"removed_methods"`
-	SettledExecutions   []OriginExecuteReply `json:"settled_executions"`
-	VisualRef           map[string]any       `json:"visual_ref,omitempty"`
-	AudioRef            map[string]any       `json:"audio_ref,omitempty"`
-	AllowedTimelineTags []string             `json:"allowed_timeline_tags,omitempty"`
+	SlotID              string                    `json:"slot_id"`
+	Epoch               int64                     `json:"epoch"`
+	Rev                 int64                     `json:"rev"`
+	BaseRev             *int64                    `json:"base_rev,omitempty"`
+	Mode                string                    `json:"mode"` // "full" | "delta"
+	SignificantEvent    bool                      `json:"significant_event"`
+	StateBrief          map[string]any            `json:"state_brief"`
+	UpsertedMethods     []ActiveMethodGrant       `json:"upserted_methods"`
+	RemovedMethods      []MethodActorKey          `json:"removed_methods"`
+	SettledExecutions   []OriginExecuteReply      `json:"settled_executions"`
+	VisualRef           map[string]any            `json:"visual_ref,omitempty"`
+	AudioRef            map[string]any            `json:"audio_ref,omitempty"`
+	AllowedTimelineTags []string                  `json:"allowed_timeline_tags,omitempty"`
+	ExtensionsData      map[string]map[string]any `json:"extensions_data,omitempty"`
 }
 
 type OriginPlayerEvent struct {
@@ -172,16 +177,17 @@ type OriginPlayerEvent struct {
 }
 
 type ProjectedContext struct {
-	SlotID                string              `json:"slot_id"`
-	Epoch                 int64               `json:"epoch"`
-	Rev                   int64               `json:"rev"`
-	CapabilityTableDigest string              `json:"capability_table_digest"`
-	PlayerCommand         *string             `json:"player_command,omitempty"`
-	StateBrief            map[string]any      `json:"state_brief"`
-	ActiveMethods         []ActiveMethodGrant `json:"active_methods"`
-	VisualRef             map[string]any      `json:"visual_ref,omitempty"`
-	AudioRef              map[string]any      `json:"audio_ref,omitempty"`
-	AllowedTimelineTags   []string            `json:"allowed_timeline_tags,omitempty"`
+	SlotID                string                    `json:"slot_id"`
+	Epoch                 int64                     `json:"epoch"`
+	Rev                   int64                     `json:"rev"`
+	CapabilityTableDigest string                    `json:"capability_table_digest"`
+	PlayerCommand         *string                   `json:"player_command,omitempty"`
+	StateBrief            map[string]any            `json:"state_brief"`
+	ActiveMethods         []ActiveMethodGrant       `json:"active_methods"`
+	VisualRef             map[string]any            `json:"visual_ref,omitempty"`
+	AudioRef              map[string]any            `json:"audio_ref,omitempty"`
+	AllowedTimelineTags   []string                  `json:"allowed_timeline_tags,omitempty"`
+	ExtensionsData        map[string]map[string]any `json:"extensions_data,omitempty"`
 }
 
 type QueueStep struct {

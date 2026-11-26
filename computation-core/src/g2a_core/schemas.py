@@ -143,10 +143,17 @@ class ProjectedContext:
     visual_ref: Optional[Dict[str, Any]] = None
     audio_ref: Optional[Dict[str, Any]] = None
     allowed_timeline_tags: Optional[List[str]] = None
+    extensions_data: Optional[Dict[str, Dict[str, Any]]] = None
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ProjectedContext":
         raw_tags = d.get("allowed_timeline_tags")
+        raw_ext = d.get("extensions_data")
+        ext_map = (
+            {str(k): dict(v) for k, v in raw_ext.items() if isinstance(v, dict)}
+            if isinstance(raw_ext, dict)
+            else None
+        )
         return cls(
             slot_id=d["slot_id"],
             epoch=int(d["epoch"]),
@@ -158,6 +165,7 @@ class ProjectedContext:
             visual_ref=d.get("visual_ref"),
             audio_ref=d.get("audio_ref"),
             allowed_timeline_tags=list(raw_tags) if isinstance(raw_tags, list) else None,
+            extensions_data=ext_map,
         )
 
 

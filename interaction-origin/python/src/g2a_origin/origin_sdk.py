@@ -590,6 +590,7 @@ class OriginSDK:
         self.latest_visual_ref: Optional[Dict[str, Any]] = None
         self.latest_audio_ref: Optional[Dict[str, Any]] = None
         self.allowed_timeline_tags: Optional[List[str]] = None
+        self.extensions_data: Dict[str, Dict[str, Any]] = {}
 
         self._http_server: Optional[ThreadingHTTPServer] = None
         self._outbound_stop = threading.Event()
@@ -828,6 +829,12 @@ class OriginSDK:
         if flush:
             self.flush_dirty_sync(significant_event=True)
 
+    def attach_extension_data(self, extension_name: str, data: Dict[str, Any], flush: bool = False) -> None:
+        """Attaches reverse-DNS modular extension state (§8.1, e.g. org.g2a.sim.batch_blueprint.v1)."""
+        self.extensions_data[extension_name] = dict(data)
+        if flush:
+            self.flush_dirty_sync(significant_event=False)
+
     # --- Developer-Facing Registration APIs (§2.2) ---
 
     def register_capability(
@@ -848,25 +855,41 @@ class OriginSDK:
             navigation_verb=navigation_verb,
         )
 
-    def publish_capabilities_and_baseline(self) -> None:
+    def publish_capabilities_and_baseline(
+        self,
+        disabled: bool = False,
+        max_sessions: int = 0,
+        shared_cooldown_ms: int = 0,
+        allowlisted_cores: Optional[List[str]] = None,
+        allowlist_criteria_url: str = "",
+    ) -> None:
         defs = [reg.definition.to_dict() for _, reg in sorted(self.capabilities.items(), key=lambda kv: kv[0])]
         cap_digest = jcs_sha256("g2a.cap.v1", defs)
-        self.hub_transport.post_to_hub(
-            "origin.capabilities",
-            {
-                "slot_id": self.slot_id,
-                "role_kind": self.slot_role_kind,
-                "billing_mode": self.billing_mode,
-                "player_id": self.player_id,
-                "game_instance_id": self.game_instance_id,
-                "room_id": self.room_id,
-                "faction_id": self.faction_id,
-                "origin_execute_url": self.origin_execute_url,
-                "capability_table_digest": cap_digest,
-                "capabilities": defs,
-            },
-        )
-        self.flush_full_sync()
+        cap_payload: Dict[str, Any] = {
+            "slot_id": self.slot_id,
+            "role_kind": self.slot_role_kind,
+            "billing_mode": self.billing_mode,
+            "player_id": self.player_id,
+            "game_instance_id": self.game_instance_id,
+            "room_id": self.room_id,
+            "faction_id": self.faction_id,
+            "origin_execute_url": self.origin_execute_url,
+            "capability_table_digest": cap_digest,
+            "capabilities": defs,
+        }
+        if disabled:
+            cap_payload["disabled"] = True
+        if max_sessions > 0:
+            cap_payload["max_sessions"] = max_sessions
+        if shared_cooldown_ms > 0:
+            cap_payload["shared_cooldown_ms"] = shared_cooldown_ms
+        if allowlisted_cores is not None:
+            cap_payload["allowlisted_cores"] = list(allowlisted_cores)
+        if allowlist_criteria_url:
+            cap_payload["allowlist_criteria_url"] = allowlist_criteria_url
+        self.hub_transport.post_to_hub("origin.capabilities", cap_payload)
+        if not disabled:
+            self.flush_full_sync()
 
     def bind_actor_subject(self, actor: str, instance: Any) -> None:
         self.actors[actor] = instance
@@ -1036,6 +1059,7 @@ class OriginSDK:
                 "visual": self.latest_visual_ref,
                 "audio": self.latest_audio_ref,
                 "timelines": self.allowed_timeline_tags,
+                "extensions": self.extensions_data or None,
             },
         )
 
@@ -1077,6 +1101,8 @@ class OriginSDK:
             frame["audio_ref"] = self.latest_audio_ref
         if self.allowed_timeline_tags is not None:
             frame["allowed_timeline_tags"] = self.allowed_timeline_tags
+        if self.extensions_data:
+            frame["extensions_data"] = dict(self.extensions_data)
         self.last_sent_brief_digest = brief_digest
         self.last_sent_methods = current_grants
         self.hub_transport.post_to_hub("origin.sync", frame)
@@ -1109,6 +1135,8 @@ class OriginSDK:
             frame["audio_ref"] = self.latest_audio_ref
         if self.allowed_timeline_tags is not None:
             frame["allowed_timeline_tags"] = self.allowed_timeline_tags
+        if self.extensions_data:
+            frame["extensions_data"] = dict(self.extensions_data)
         self.last_sent_brief_digest = jcs_sha256(
             "g2a.brief.v1",
             {
@@ -1116,6 +1144,7 @@ class OriginSDK:
                 "visual": self.latest_visual_ref,
                 "audio": self.latest_audio_ref,
                 "timelines": self.allowed_timeline_tags,
+                "extensions": self.extensions_data or None,
             },
         )
         self.last_sent_methods = current_grants

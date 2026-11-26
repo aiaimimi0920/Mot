@@ -518,6 +518,13 @@ func (e *Engine) HandleOriginCapabilities(payload model.OriginCapabilitiesPayloa
 	if verifiedDigest != payload.CapabilityTableDigest {
 		return model.NewError(model.ErrInvalidArguments, 400, "Capability table digest mismatch")
 	}
+	// FRAND non-discriminatory allowlist transparency (§7.3): companion slots with an allowlist MUST publish an http(s) criteria URL.
+	criteriaURL := strings.TrimSpace(payload.AllowlistCriteriaURL)
+	if payload.RoleKind == "companion" && len(payload.AllowlistedCores) > 0 {
+		if !strings.HasPrefix(criteriaURL, "https://") && !strings.HasPrefix(criteriaURL, "http://") {
+			return model.NewError(model.ErrInvalidArguments, 400, "FRAND rule (§7.3): companion slot allowlist requires a public http(s) allowlist_criteria_url")
+		}
+	}
 
 	sanitizedCaps := make([]model.CapabilityEntry, len(sortedCaps))
 	copy(sanitizedCaps, sortedCaps)
@@ -533,7 +540,13 @@ func (e *Engine) HandleOriginCapabilities(payload model.OriginCapabilitiesPayloa
 		}
 	}
 
-	notifySessions, gErr := store.Atomic(e.persistence, func(d *store.HubStoreData) ([]string, *model.G2AError) {
+	type capUpdateOutcome struct {
+		notifySessions []string
+		closedSessions []string
+		cancels        []cancelTarget
+	}
+	outcome, gErr := store.Atomic(e.persistence, func(d *store.HubStoreData) (capUpdateOutcome, *model.G2AError) {
+		var out capUpdateOutcome
 		slot, exists := d.Slots[payload.SlotID]
 		prevDigest := ""
 		if !exists {
@@ -548,6 +561,10 @@ func (e *Engine) HandleOriginCapabilities(payload model.OriginCapabilitiesPayloa
 		}
 		slot.RoleKind = payload.RoleKind
 		slot.BillingMode = payload.BillingMode
+		slot.Disabled = payload.Disabled
+		slot.MaxSessions = payload.MaxSessions
+		slot.SharedCooldownMs = payload.SharedCooldownMs
+		slot.AllowlistCriteriaURL = criteriaURL
 		if payload.PlayerID != "" {
 			slot.PlayerID = payload.PlayerID
 		} else if slot.PlayerID == "" {
@@ -579,6 +596,9 @@ func (e *Engine) HandleOriginCapabilities(payload model.OriginCapabilitiesPayloa
 			for _, cid := range payload.AllowlistedCores {
 				slot.AllowlistedCores[cid] = true
 			}
+		} else {
+			slot.AllowlistEnabled = false
+			slot.AllowlistedCores = make(map[string]bool)
 		}
 		if _, hasView := d.SlotViews[payload.SlotID]; !hasView {
 			d.SlotViews[payload.SlotID] = &store.SlotView{
@@ -591,10 +611,24 @@ func (e *Engine) HandleOriginCapabilities(payload model.OriginCapabilitiesPayloa
 			}
 		}
 
+		// Competitive / ranked mode slot disabling (§4.3): fence-close any active sessions immediately!
+		if payload.Disabled {
+			for _, sess := range d.SessionsForSlot(payload.SlotID) {
+				if sess.State != "closed" {
+					out.cancels = append(out.cancels, e.cancelAndFenceSessionQueuesInTx(d, sess)...)
+					sess.State = "closed"
+					out.closedSessions = append(out.closedSessions, sess.SessionID)
+				}
+			}
+			if len(out.closedSessions) > 0 {
+				d.PruneClosedSessions()
+			}
+			return out, nil
+		}
+
 		// Mid-session dynamic capability refresh (§3.3 & §4.1):
 		// Intersect existing FrozenScope downward (never silently expanding unapproved methods/actors!)
 		// and notify live sessions of the updated capability_table_digest.
-		var notify []string
 		if prevDigest != "" && prevDigest != verifiedDigest {
 			for _, sess := range d.SessionsForSlot(payload.SlotID) {
 				if sess.State == "closed" {
@@ -623,14 +657,25 @@ func (e *Engine) HandleOriginCapabilities(payload model.OriginCapabilitiesPayloa
 					sess.ScopeDigest = newSD
 				}
 				if sess.PlayerOnline && sess.State == "active" {
-					notify = append(notify, sess.SessionID)
+					out.notifySessions = append(out.notifySessions, sess.SessionID)
 				}
 			}
 		}
-		return notify, nil
+		return out, nil
 	})
 	if gErr == nil {
-		for _, sid := range notifySessions {
+		if len(outcome.cancels) > 0 || len(outcome.closedSessions) > 0 {
+			e.broadcastWakeup()
+		}
+		for _, c := range outcome.cancels {
+			_, _ = e.originClient.Execute(c.targetURL, model.OriginExecuteRequest{
+				SlotID: c.slotID, Epoch: c.epoch, Kind: "cancel", ExecutionID: c.execID, Args: map[string]any{},
+			})
+		}
+		for _, sid := range outcome.closedSessions {
+			e.pushStream.PushEvent(sid, "session.closed", map[string]any{"reason": "slot_disabled_by_origin"})
+		}
+		for _, sid := range outcome.notifySessions {
 			e.pushStream.PushEvent(sid, "capabilities.updated", map[string]any{
 				"slot_id":                 payload.SlotID,
 				"capability_table_digest": verifiedDigest,
@@ -679,6 +724,18 @@ func (e *Engine) HandleOriginSync(frame model.OriginSyncFrame) *model.G2AError {
 			if frame.Epoch > oldEpoch {
 				e.abortObsoleteEpochQueuesInTx(d, frame.SlotID, frame.Epoch)
 			}
+			if frame.ExtensionsData != nil {
+				view.ExtensionsData = make(map[string]map[string]any, len(frame.ExtensionsData))
+				for ek, ev := range frame.ExtensionsData {
+					cp := make(map[string]any, len(ev))
+					for mk, mv := range ev {
+						cp[mk] = mv
+					}
+					view.ExtensionsData[ek] = cp
+				}
+			} else {
+				view.ExtensionsData = nil
+			}
 		} else {
 			if frame.Epoch != view.Epoch || frame.BaseRev == nil || *frame.BaseRev != view.Rev {
 				return nil, model.NewError(model.ErrStaleContext, 409, "Origin delta base_rev mismatch; resend full frame")
@@ -693,6 +750,18 @@ func (e *Engine) HandleOriginSync(frame model.OriginSyncFrame) *model.G2AError {
 			}
 			for _, g := range frame.UpsertedMethods {
 				view.Methods[store.MethodKey(g.MethodID, g.Actor)] = g
+			}
+			if frame.ExtensionsData != nil {
+				if view.ExtensionsData == nil {
+					view.ExtensionsData = make(map[string]map[string]any, len(frame.ExtensionsData))
+				}
+				for ek, ev := range frame.ExtensionsData {
+					cp := make(map[string]any, len(ev))
+					for mk, mv := range ev {
+						cp[mk] = mv
+					}
+					view.ExtensionsData[ek] = cp
+				}
 			}
 		}
 
@@ -1007,6 +1076,9 @@ func (e *Engine) HandleSessionAuthorize(g2aVersion, callerCoreID string, req mod
 		if !slot.PlayerOnline {
 			return zp, model.NewError(model.ErrPermissionDenied, 403, "Associated player is offline")
 		}
+		if slot.Disabled {
+			return zp, model.NewError(model.ErrPermissionDenied, 403, "Slot is disabled for the current game mode")
+		}
 		// Multiplayer faction & personal-seat confidentiality isolation (Section 2.2 Row 2)
 		if slot.FactionID != "" && req.FactionID != "" && req.FactionID != slot.FactionID {
 			return zp, model.NewError(model.ErrPermissionDenied, 403, "Cross-faction slot authorization is forbidden")
@@ -1047,8 +1119,25 @@ func (e *Engine) HandleSessionAuthorize(g2aVersion, callerCoreID string, req mod
 	return store.Atomic(e.persistence, func(d *store.HubStoreData) (model.AuthorizeReply, *model.G2AError) {
 		var zr model.AuthorizeReply
 		slot, ok := d.Slots[req.SlotID]
-		if !ok || !slot.PlayerOnline {
-			return zr, model.NewError(model.ErrPermissionDenied, 403, "Player went offline during consent")
+		if !ok || !slot.PlayerOnline || slot.Disabled {
+			return zr, model.NewError(model.ErrPermissionDenied, 403, "Player went offline or slot was disabled during consent")
+		}
+		if slot.MaxSessions > 0 {
+			otherLive := 0
+			for _, existingSess := range d.SessionsForSlot(req.SlotID) {
+				if existingSess.State == "closed" {
+					continue
+				}
+				if existingSess.CallerCoreID == callerCoreID {
+					_ = e.cancelAndFenceSessionQueuesInTx(d, existingSess)
+					existingSess.State = "closed"
+					continue
+				}
+				otherLive++
+			}
+			if otherLive >= slot.MaxSessions {
+				return zr, model.NewError(model.ErrResourceLimit, 429, "Slot active session limit reached")
+			}
 		}
 		if rememberScope {
 			d.ApprovedScopes[prep.scopeDigest] = true
@@ -1349,6 +1438,10 @@ func (e *Engine) HandleQueueSubmit(callerCoreID, sessionID string, q model.Metho
 			return zd, model.NewError(model.ErrInvalidArguments, 400, "Invalid step count")
 		}
 
+		now := e.cfg.ClockNowMs()
+		d.SweepExpiredCooldowns(now)
+		slot := d.Slots[sess.Scope.SlotID]
+
 		// 1. Pre-execution anti-replay barrier: exact deduplication on (session_id, queue_id)
 		qKey := store.QueueKey(sessionID, q.QueueID)
 		if existing, exists := d.Queues[qKey]; exists {
@@ -1367,16 +1460,31 @@ func (e *Engine) HandleQueueSubmit(callerCoreID, sessionID string, q model.Metho
 					cooldownMs: e.cfg.DefaultConfirmCooldownMs,
 				}, nil
 			}
+			if until, inSlotCd := d.SlotCooldowns[sess.Scope.SlotID]; inSlotCd && now < until {
+				wait := until - now
+				scErr := model.NewError(model.ErrResourceLimit, 429, "Slot shared FRAND cooldown active")
+				scErr.RetryAfterMs = &wait
+				scErr.CooldownMs = &wait
+				return zd, scErr
+			}
+			if slot != nil && slot.SharedCooldownMs > 0 {
+				d.SlotCooldowns[sess.Scope.SlotID] = now + slot.SharedCooldownMs
+			}
 			existing.State = "running"
 			return submitDecision{kind: "ready_dispatch"}, nil
 		}
 
-		// 2. Validate scope, tri-state policy, target-level readiness, and refusal cooldown
+		// 2. Validate scope, tri-state policy, target-level readiness, FRAND shared cooldown, and refusal cooldown
+		if until, inSlotCd := d.SlotCooldowns[sess.Scope.SlotID]; inSlotCd && now < until {
+			wait := until - now
+			scErr := model.NewError(model.ErrResourceLimit, 429, "Slot shared FRAND cooldown active")
+			scErr.RetryAfterMs = &wait
+			scErr.CooldownMs = &wait
+			return zd, scErr
+		}
 		needsConfirm := false
 		requiresRealMoneyUI := false
 		fp := computeTargetFingerprint(q.Steps)
-		now := e.cfg.ClockNowMs()
-		d.SweepExpiredCooldowns(now)
 		cdKey := sessionID + "|" + fp
 		if until, inCd := d.ConfirmCooldowns[cdKey]; inCd && now < until {
 			wait := until - now
@@ -1385,8 +1493,6 @@ func (e *Engine) HandleQueueSubmit(callerCoreID, sessionID string, q model.Metho
 			cdErr.CooldownMs = &wait
 			return zd, cdErr
 		}
-
-		slot := d.Slots[sess.Scope.SlotID]
 		for idx, step := range q.Steps {
 			if step.StepIndex != idx {
 				return zd, model.NewError(model.ErrInvalidArguments, 400, "step_index must be contiguous starting at 0")
@@ -1493,6 +1599,9 @@ func (e *Engine) HandleQueueSubmit(callerCoreID, sessionID string, q model.Metho
 					RequireNativeRealMoneyUI: requiresRealMoneyUI,
 				},
 			}, nil
+		}
+		if slot != nil && slot.SharedCooldownMs > 0 {
+			d.SlotCooldowns[sess.Scope.SlotID] = now + slot.SharedCooldownMs
 		}
 		d.AppendAudit(now, "queue.accepted", sess.Scope.SlotID, sessionID, q.QueueID, q.IntentSummary)
 		return submitDecision{kind: "ready_dispatch"}, nil
@@ -2137,14 +2246,18 @@ func (e *Engine) SnapshotDashboardStatus() map[string]any {
 			capsCopy := make([]model.CapabilityEntry, len(sl.Capabilities))
 			copy(capsCopy, sl.Capabilities)
 			slotsOut = append(slotsOut, map[string]any{
-				"slot_id":          sl.SlotID,
-				"role_kind":        sl.RoleKind,
-				"billing_mode":     sl.BillingMode,
-				"player_online":    sl.PlayerOnline,
-				"epoch":            ep,
-				"rev":              rev,
-				"capabilities":     len(capsCopy),
-				"capability_items": capsCopy,
+				"slot_id":                sl.SlotID,
+				"role_kind":              sl.RoleKind,
+				"billing_mode":           sl.BillingMode,
+				"player_id":              sl.PlayerID,
+				"player_online":          sl.PlayerOnline,
+				"disabled":               sl.Disabled,
+				"shared_cooldown_ms":     sl.SharedCooldownMs,
+				"allowlist_criteria_url": sl.AllowlistCriteriaURL,
+				"epoch":                  ep,
+				"rev":                    rev,
+				"capabilities":           len(capsCopy),
+				"capability_items":       capsCopy,
 			})
 		}
 
@@ -2246,6 +2359,21 @@ func (e *Engine) projectContextInTx(d *store.HubStoreData, sess *store.SessionRe
 	}
 	if containsString(sess.NegotiatedExtensions, "org.g2a.narrative.timeline.v1") && len(view.AllowedTimelineTags) > 0 {
 		ctx.AllowedTimelineTags = append([]string(nil), view.AllowedTimelineTags...)
+	}
+	if len(sess.NegotiatedExtensions) > 0 && len(view.ExtensionsData) > 0 {
+		extProj := make(map[string]map[string]any)
+		for _, extName := range sess.NegotiatedExtensions {
+			if extMap, hasExt := view.ExtensionsData[extName]; hasExt && extMap != nil {
+				cp := make(map[string]any, len(extMap))
+				for mk, mv := range extMap {
+					cp[mk] = mv
+				}
+				extProj[extName] = cp
+			}
+		}
+		if len(extProj) > 0 {
+			ctx.ExtensionsData = extProj
+		}
 	}
 	return ctx
 }

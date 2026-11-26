@@ -34,8 +34,12 @@ type SlotRecord struct {
 	Capabilities          []model.CapabilityEntry          `json:"capabilities"`
 	CapabilityByID        map[string]model.CapabilityEntry `json:"capability_by_id"`
 	CapabilityTableDigest string                           `json:"capability_table_digest"`
+	Disabled              bool                             `json:"disabled,omitempty"`
+	MaxSessions           int                              `json:"max_sessions,omitempty"`
+	SharedCooldownMs      int64                            `json:"shared_cooldown_ms,omitempty"`
 	AllowlistEnabled      bool                             `json:"allowlist_enabled"`
 	AllowlistedCores      map[string]bool                  `json:"allowlisted_cores"`
+	AllowlistCriteriaURL  string                           `json:"allowlist_criteria_url,omitempty"`
 }
 
 type SlotView struct {
@@ -50,6 +54,7 @@ type SlotView struct {
 	LatestVisual        map[string]any                      `json:"latest_visual,omitempty"`
 	LatestAudio         map[string]any                      `json:"latest_audio,omitempty"`
 	AllowedTimelineTags []string                            `json:"allowed_timeline_tags,omitempty"`
+	ExtensionsData      map[string]map[string]any           `json:"extensions_data,omitempty"`
 }
 
 func (v *SlotView) RecordSettledExecution(rep model.OriginExecuteReply) {
@@ -133,8 +138,9 @@ type HubStoreData struct {
 	QueueOrder       []string                      `json:"queue_order,omitempty"`
 	ChatDedup        map[string]bool               `json:"chat_dedup"`
 	ChatDedupOrder   []string                      `json:"chat_dedup_order,omitempty"`
-	ConfirmCooldowns map[string]int64              `json:"confirm_cooldowns"` // session_id|fingerprint -> deadline_ms
-	ApprovedScopes   map[string]bool               `json:"approved_scopes"`   // exact scope_digests approved for auto-join
+	ConfirmCooldowns map[string]int64              `json:"confirm_cooldowns"`        // session_id|fingerprint -> deadline_ms
+	SlotCooldowns    map[string]int64              `json:"slot_cooldowns,omitempty"` // slot_id -> FRAND shared cooldown deadline_ms
+	ApprovedScopes   map[string]bool               `json:"approved_scopes"`          // exact scope_digests approved for auto-join
 	PolicyOverrides  map[string]string             `json:"policy_overrides"`  // slot_id|method_id|actor -> allow|confirm|prohibit
 	AuditLog         []AuditEntry                  `json:"audit_log"`
 
@@ -152,6 +158,7 @@ func NewHubStoreData() *HubStoreData {
 		ChatDedup:        make(map[string]bool),
 		ChatDedupOrder:   make([]string, 0),
 		ConfirmCooldowns: make(map[string]int64),
+		SlotCooldowns:    make(map[string]int64),
 		ApprovedScopes:   make(map[string]bool),
 		PolicyOverrides:  make(map[string]string),
 		AuditLog:         make([]AuditEntry, 0),
@@ -321,6 +328,11 @@ func (d *HubStoreData) SweepExpiredCooldowns(nowMs int64) {
 			delete(d.ConfirmCooldowns, k)
 		}
 	}
+	for k, until := range d.SlotCooldowns {
+		if nowMs >= until {
+			delete(d.SlotCooldowns, k)
+		}
+	}
 }
 
 // SanitizeAfterRestart reconciles in-flight state after an unclean Hub process crash/restart:
@@ -372,6 +384,9 @@ func (d *HubStoreData) EnsureMaps() {
 	}
 	if d.ConfirmCooldowns == nil {
 		d.ConfirmCooldowns = make(map[string]int64)
+	}
+	if d.SlotCooldowns == nil {
+		d.SlotCooldowns = make(map[string]int64)
 	}
 	if d.ApprovedScopes == nil {
 		d.ApprovedScopes = make(map[string]bool)
@@ -568,6 +583,17 @@ func cloneStringAnyMap(m map[string]any) map[string]any {
 	return out
 }
 
+func cloneNestedStringAnyMap(m map[string]map[string]any) map[string]map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]map[string]any, len(m))
+	for k, inner := range m {
+		out[k] = cloneStringAnyMap(inner)
+	}
+	return out
+}
+
 // Clone creates an in-memory structural copy of HubStoreData without reflection or JSON marshaling,
 // enabling microsecond-scale rollback snapshots inside Atomic transactions.
 func (d *HubStoreData) Clone() *HubStoreData {
@@ -581,6 +607,7 @@ func (d *HubStoreData) Clone() *HubStoreData {
 		ChatDedup:        make(map[string]bool, len(d.ChatDedup)),
 		ChatDedupOrder:   append([]string(nil), d.ChatDedupOrder...),
 		ConfirmCooldowns: make(map[string]int64, len(d.ConfirmCooldowns)),
+		SlotCooldowns:    make(map[string]int64, len(d.SlotCooldowns)),
 		ApprovedScopes:   make(map[string]bool, len(d.ApprovedScopes)),
 		PolicyOverrides:  make(map[string]string, len(d.PolicyOverrides)),
 		AuditLog:         append([]AuditEntry(nil), d.AuditLog...),
@@ -620,6 +647,7 @@ func (d *HubStoreData) Clone() *HubStoreData {
 		if sv.AllowedTimelineTags != nil {
 			cp.AllowedTimelineTags = append([]string(nil), sv.AllowedTimelineTags...)
 		}
+		cp.ExtensionsData = cloneNestedStringAnyMap(sv.ExtensionsData)
 		out.SlotViews[k] = &cp
 	}
 	for k, se := range d.Sessions {
@@ -656,6 +684,9 @@ func (d *HubStoreData) Clone() *HubStoreData {
 	}
 	for k, v := range d.ConfirmCooldowns {
 		out.ConfirmCooldowns[k] = v
+	}
+	for k, v := range d.SlotCooldowns {
+		out.SlotCooldowns[k] = v
 	}
 	for k, v := range d.ApprovedScopes {
 		out.ApprovedScopes[k] = v
