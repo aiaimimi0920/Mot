@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aiaimimi0920/g2a-intelligent-hub/internal/model"
 )
@@ -87,6 +88,7 @@ type SessionRecord struct {
 	LeaseDeadlineMs        int64             `json:"lease_deadline_ms"`
 	IdleBackoffMs          int64             `json:"idle_backoff_ms"`
 	NextAllowedPullMs      int64             `json:"next_allowed_pull_ms"`
+	LastContextPushMs      int64             `json:"last_context_push_ms,omitempty"`
 	ActiveQueueID          *string           `json:"active_queue_id,omitempty"`
 	ConsumptionUsed        int64             `json:"consumption_used"`
 	ConsumptionCap         *int64            `json:"consumption_cap,omitempty"`
@@ -103,6 +105,7 @@ type QueueLedgerRecord struct {
 	Queue               model.MethodCallQueue `json:"queue"`
 	State               string                `json:"state"` // "awaiting_confirmation" | "running" | "completed" | "aborted" | "cancelled"
 	RequiresRealMoneyUI bool                  `json:"requires_real_money_ui"`
+	ConfirmDeadlineMs   int64                 `json:"confirm_deadline_ms,omitempty"`
 	ApprovedDigest      *string               `json:"approved_digest,omitempty"`
 	StepReceipts        []model.StepReceipt   `json:"step_receipts"`
 	CurrentExecutionID  *string               `json:"current_execution_id,omitempty"`
@@ -712,17 +715,30 @@ func (p *PersistencePort) persistLocked() error {
 }
 
 func ValidateArgsAgainstSchema(args map[string]any, schema map[string]any) *model.G2AError {
+	return validateObjectAtDepth("", args, schema, 0)
+}
+
+func validateObjectAtDepth(prefix string, args map[string]any, schema map[string]any, depth int) *model.G2AError {
+	if depth > 16 {
+		return model.NewError(model.ErrInvalidArguments, 400, "Schema validation nesting depth exceeded")
+	}
 	if len(schema) == 0 {
 		return nil
 	}
 	if args == nil {
 		args = map[string]any{}
 	}
+	qualify := func(field string) string {
+		if prefix == "" {
+			return field
+		}
+		return prefix + "." + field
+	}
 	if reqRaw, ok := schema["required"]; ok {
 		if reqList, ok := toStringSlice(reqRaw); ok {
 			for _, field := range reqList {
 				if _, exists := args[field]; !exists {
-					return model.NewError(model.ErrInvalidArguments, 400, fmt.Sprintf("Missing required argument %q", field))
+					return model.NewError(model.ErrInvalidArguments, 400, fmt.Sprintf("Missing required argument %q", qualify(field)))
 				}
 			}
 		}
@@ -731,7 +747,7 @@ func ValidateArgsAgainstSchema(args map[string]any, schema map[string]any) *mode
 	if addl, ok := schema["additionalProperties"].(bool); ok && !addl && props != nil {
 		for k := range args {
 			if _, declared := props[k]; !declared {
-				return model.NewError(model.ErrInvalidArguments, 400, fmt.Sprintf("Unexpected argument %q", k))
+				return model.NewError(model.ErrInvalidArguments, 400, fmt.Sprintf("Unexpected argument %q", qualify(k)))
 			}
 		}
 	}
@@ -743,20 +759,30 @@ func ValidateArgsAgainstSchema(args map[string]any, schema map[string]any) *mode
 		if !ok {
 			continue
 		}
-		if err := validateField(k, v, propSchema); err != nil {
+		if err := validateField(qualify(k), v, propSchema, depth+1); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateField(name string, val any, schema map[string]any) *model.G2AError {
+func validateField(name string, val any, schema map[string]any, depth int) *model.G2AError {
+	if depth > 16 {
+		return model.NewError(model.ErrInvalidArguments, 400, "Argument nesting depth exceeded")
+	}
 	expectedType, _ := schema["type"].(string)
 	switch expectedType {
 	case "string":
 		s, ok := val.(string)
 		if !ok {
 			return model.NewError(model.ErrInvalidArguments, 400, fmt.Sprintf("Argument %q must be string", name))
+		}
+		runeLen := float64(utf8.RuneCountInString(s))
+		if minLen, ok := toFloat(schema["minLength"]); ok && runeLen < minLen {
+			return model.NewError(model.ErrInvalidArguments, 400, fmt.Sprintf("Argument %q shorter than minLength", name))
+		}
+		if maxLen, ok := toFloat(schema["maxLength"]); ok && runeLen > maxLen {
+			return model.NewError(model.ErrInvalidArguments, 400, fmt.Sprintf("Argument %q exceeds maxLength", name))
 		}
 		if enums, ok := toStringSlice(schema["enum"]); ok {
 			found := false
@@ -791,12 +817,31 @@ func validateField(name string, val any, schema map[string]any) *model.G2AError 
 			return model.NewError(model.ErrInvalidArguments, 400, fmt.Sprintf("Argument %q must be boolean", name))
 		}
 	case "array":
-		if _, ok := val.([]any); !ok {
+		arr, ok := val.([]any)
+		if !ok {
 			return model.NewError(model.ErrInvalidArguments, 400, fmt.Sprintf("Argument %q must be array", name))
 		}
+		arrLen := float64(len(arr))
+		if minItems, ok := toFloat(schema["minItems"]); ok && arrLen < minItems {
+			return model.NewError(model.ErrInvalidArguments, 400, fmt.Sprintf("Argument %q has fewer than minItems", name))
+		}
+		if maxItems, ok := toFloat(schema["maxItems"]); ok && arrLen > maxItems {
+			return model.NewError(model.ErrInvalidArguments, 400, fmt.Sprintf("Argument %q exceeds maxItems", name))
+		}
+		if itemSchema, ok := schema["items"].(map[string]any); ok {
+			for idx, elem := range arr {
+				if err := validateField(fmt.Sprintf("%s[%d]", name, idx), elem, itemSchema, depth+1); err != nil {
+					return err
+				}
+			}
+		}
 	case "object":
-		if _, ok := val.(map[string]any); !ok {
+		objVal, ok := val.(map[string]any)
+		if !ok {
 			return model.NewError(model.ErrInvalidArguments, 400, fmt.Sprintf("Argument %q must be object", name))
+		}
+		if err := validateObjectAtDepth(name, objVal, schema, depth+1); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -808,6 +853,12 @@ func checkNumericBounds(name string, num float64, schema map[string]any) *model.
 	}
 	if maxVal, ok := toFloat(schema["maximum"]); ok && num > maxVal {
 		return model.NewError(model.ErrInvalidArguments, 400, fmt.Sprintf("Argument %q exceeds maximum", name))
+	}
+	if exMin, ok := toFloat(schema["exclusiveMinimum"]); ok && num <= exMin {
+		return model.NewError(model.ErrInvalidArguments, 400, fmt.Sprintf("Argument %q must exceed exclusiveMinimum", name))
+	}
+	if exMax, ok := toFloat(schema["exclusiveMaximum"]); ok && num >= exMax {
+		return model.NewError(model.ErrInvalidArguments, 400, fmt.Sprintf("Argument %q must be below exclusiveMaximum", name))
 	}
 	return nil
 }

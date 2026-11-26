@@ -248,6 +248,15 @@ export class OriginSDK {
     if (req.epoch !== this.currentEpoch || !reg || !req.actor || !this.actors.has(req.actor)) {
       return { execution_id: req.execution_id, state: "failed", failure_reason: "invalid_context_or_actor" };
     }
+    if (!reg.def.permitted_actors.includes(req.actor)) {
+      return { execution_id: req.execution_id, state: "failed", failure_reason: "permission_denied" };
+    }
+    const reqFields = Array.isArray(reg.def.params_schema?.required) ? (reg.def.params_schema.required as string[]) : [];
+    for (const f of reqFields) {
+      if (!(f in (req.args ?? {}))) {
+        return { execution_id: req.execution_id, state: "failed", failure_reason: `missing_required_arg:${f}` };
+      }
+    }
     const out = reg.handler(req.actor, this.actors.get(req.actor), req.args, req.execution_id);
     if (out.kind === "executing") {
       this.inFlight.set(req.execution_id, out.cancel_fn);
@@ -330,13 +339,43 @@ export class OriginSDK {
     });
   }
 
-  async reportQueueApproval(queueId: string, confirmDigest: string, approved: boolean): Promise<void> {
+  async advanceEpoch(): Promise<void> {
+    this.currentEpoch += 1;
+    this.currentRev = 0;
+    this.lastSentMethods.clear();
+    for (const execId of [...this.inFlight.keys()]) {
+      await this.cancelInFlightStep(execId);
+    }
+    await this.flushFullSync();
+  }
+
+  async reportQueueApproval(
+    sessionId: string,
+    queueId: string,
+    queueDigest: string,
+    fingerprint: string,
+    approved: boolean
+  ): Promise<void> {
     await this.postToHub("origin.player_event", {
       slot_id: this.slotId,
       kind: "queue_approval",
+      session_id: sessionId,
       queue_id: queueId,
-      confirm_digest: confirmDigest,
+      queue_digest: queueDigest,
+      fingerprint,
       approved,
+    });
+  }
+
+  async reportNpcHostHandoff(newPlayerId: string): Promise<void> {
+    for (const execId of [...this.inFlight.keys()]) {
+      await this.cancelInFlightStep(execId);
+    }
+    this.syncEnabled = true;
+    await this.postToHub("origin.player_event", {
+      slot_id: this.slotId,
+      kind: "host_handoff",
+      new_player_id: newPlayerId.trim(),
     });
   }
 

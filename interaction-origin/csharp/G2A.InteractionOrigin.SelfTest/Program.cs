@@ -263,6 +263,32 @@ internal static class Program
             }
         }
 
+        // Verify required ParamsSchema enforcement & player_metered independent_npc host_handoff
+        var npcTx = new RecordingTransport();
+        var npcSdk = new OriginSdk("slot-npc-cs", npcTx, roleKind: "independent_npc", billingMode: "player_metered");
+        npcSdk.BindActorSubject("boss", new object());
+        npcSdk.RegisterCapability(
+            new CapabilityEntry(
+                "#07", "cast_spell", "Cast spell", new List<string> { "boss" },
+                new Dictionary<string, object?> { ["required"] = new[] { "spell_id" } }),
+            (_, _, _, _) => new EffectInvocationResult.ImmediateSucceeded(new Dictionary<string, object?>()));
+
+        bool caughtMissingArg = false;
+        try
+        {
+            npcSdk.HandleOriginExecute(new OriginExecuteRequest("slot-npc-cs", 1, "invoke", "ex-miss", "#07", "boss", new()));
+        }
+        catch (G2AOriginException gex) when (gex.Code == "invalid_arguments")
+        {
+            caughtMissingArg = true;
+        }
+        if (!caughtMissingArg) throw new Exception("Expected missing required argument rejection in C# OriginSdk");
+
+        npcSdk.ReportNpcHostHandoff("player-teammate-2");
+        var hoPayload = (Dictionary<string, object?>)npcTx.Posts[^1].Payload;
+        if ((string?)hoPayload["kind"] != "host_handoff" || (string?)hoPayload["new_player_id"] != "player-teammate-2")
+            throw new Exception("Expected host_handoff event in C# OriginSdk");
+
         Console.WriteLine($"C# G2A.InteractionOrigin SelfTest PASSED | JCS={d1}");
         return 0;
     }

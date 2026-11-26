@@ -159,7 +159,7 @@ type OriginSyncFrame struct {
 
 type OriginPlayerEvent struct {
 	SlotID                string `json:"slot_id"`
-	Kind                  string `json:"kind"` // "presence_changed" | "emergency_stop" | "player_command" | "queue_approval"
+	Kind                  string `json:"kind"` // "presence_changed" | "emergency_stop" | "player_command" | "queue_approval" | "host_handoff"
 	Online                bool   `json:"online,omitempty"`
 	RemainingOnlineHumans int    `json:"remaining_online_humans,omitempty"`
 	Text                  string `json:"text,omitempty"`
@@ -168,6 +168,7 @@ type OriginPlayerEvent struct {
 	QueueDigest           string `json:"queue_digest,omitempty"`
 	Fingerprint           string `json:"fingerprint,omitempty"`
 	Approved              bool   `json:"approved,omitempty"`
+	NewPlayerID           string `json:"new_player_id,omitempty"`
 }
 
 type ProjectedContext struct {

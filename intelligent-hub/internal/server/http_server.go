@@ -349,7 +349,11 @@ func NewCoreHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
 			return
 		}
 		replay := r.URL.Query().Get("replay") == "1"
-		ch, unsubscribe := engine.PushStream().Subscribe(sid, replay)
+		lastEventID := strings.TrimSpace(r.Header.Get("Last-Event-ID"))
+		if lastEventID == "" {
+			lastEventID = strings.TrimSpace(r.URL.Query().Get("last_event_id"))
+		}
+		ch, unsubscribe := engine.PushStream().SubscribeAfter(sid, replay, lastEventID)
 		defer unsubscribe()
 
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -398,7 +402,11 @@ func NewCoreHandler(engine *hub.Engine, auth AuthRegistry) http.Handler {
 			return
 		}
 		replay := r.URL.Query().Get("replay") == "1"
-		ch, unsubscribe := engine.PushStream().Subscribe(sid, replay)
+		lastEventID := strings.TrimSpace(r.Header.Get("Last-Event-ID"))
+		if lastEventID == "" {
+			lastEventID = strings.TrimSpace(r.URL.Query().Get("last_event_id"))
+		}
+		ch, unsubscribe := engine.PushStream().SubscribeAfter(sid, replay, lastEventID)
 		defer unsubscribe()
 
 		wsConn, err := ws.Upgrade(w, r)
@@ -699,6 +707,25 @@ func NewTrustedConsentHandler(engine *hub.Engine, auth AuthRegistry) http.Handle
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		setSecurityHeaders(w)
 		engine.RevokeAutoJoinScope(body.ScopeDigest, body.CloseMatchingSessions)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
+
+	mux.HandleFunc("/trusted/handoff-npc", func(w http.ResponseWriter, r *http.Request) {
+		if !checkTrustedAuth(r) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var body struct {
+			SlotID      string `json:"slot_id"`
+			NewPlayerID string `json:"new_player_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		setSecurityHeaders(w)
+		if gErr := engine.HandoffMeteredNPCSlot(body.SlotID, body.NewPlayerID); gErr != nil {
+			writeReplyError(w, "", nil, gErr)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})

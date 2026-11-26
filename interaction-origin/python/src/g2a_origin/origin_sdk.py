@@ -368,11 +368,16 @@ def _compute_player_deictic_label(focus: PlayerFocusInfo, obj: InteractableRef) 
         return "pointed_ray"
     dx = obj.pose.x - focus.pose.x
     dz = obj.pose.z - focus.pose.z
+    yaw_rad = math.radians(focus.pose.yaw_deg)
+    cos_y = math.cos(yaw_rad)
+    sin_y = math.sin(yaw_rad)
+    local_right = dx * cos_y - dz * sin_y
+    local_forward = dx * sin_y + dz * cos_y
     dist = round(_distance(focus.pose, obj.pose), 1)
-    if abs(dx) >= abs(dz):
-        side = "right" if dx >= 0 else "left"
+    if abs(local_right) >= abs(local_forward):
+        side = "right" if local_right >= 0 else "left"
     else:
-        side = "ahead" if dz >= 0 else "behind"
+        side = "ahead" if local_forward >= 0 else "behind"
     return f"{side} {dist}m"
 
 
@@ -435,10 +440,89 @@ def merge_method_grant(
         )
 
 
-def _validate_args_schema(args: Dict[str, Any], schema: Dict[str, Any]) -> None:
+def _validate_field_schema(name: str, val: Any, spec: Dict[str, Any], depth: int = 0) -> None:
+    if depth > 16:
+        raise G2AOriginError("invalid_arguments", 400, "Argument nesting depth exceeded")
+    ptype = spec.get("type")
+    if ptype == "string":
+        if not isinstance(val, str):
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} must be string")
+        if "minLength" in spec and len(val) < int(spec["minLength"]):
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} shorter than minLength")
+        if "maxLength" in spec and len(val) > int(spec["maxLength"]):
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} exceeds maxLength")
+        enums = spec.get("enum")
+        if isinstance(enums, list) and val not in enums:
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} not in enum")
+    elif ptype == "boolean":
+        if not isinstance(val, bool):
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} must be boolean")
+    elif ptype == "integer":
+        if isinstance(val, bool) or not isinstance(val, int):
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} must be integer")
+        if "minimum" in spec and val < spec["minimum"]:
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} below minimum")
+        if "maximum" in spec and val > spec["maximum"]:
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} exceeds maximum")
+        if "exclusiveMinimum" in spec and val <= spec["exclusiveMinimum"]:
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} must exceed exclusiveMinimum")
+        if "exclusiveMaximum" in spec and val >= spec["exclusiveMaximum"]:
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} must be below exclusiveMaximum")
+    elif ptype == "number":
+        if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(float(val)):
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} must be finite number")
+        fval = float(val)
+        if "minimum" in spec and fval < float(spec["minimum"]):
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} below minimum")
+        if "maximum" in spec and fval > float(spec["maximum"]):
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} exceeds maximum")
+        if "exclusiveMinimum" in spec and fval <= float(spec["exclusiveMinimum"]):
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} must exceed exclusiveMinimum")
+        if "exclusiveMaximum" in spec and fval >= float(spec["exclusiveMaximum"]):
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} must be below exclusiveMaximum")
+    elif ptype == "array":
+        if not isinstance(val, list):
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} must be array")
+        if "minItems" in spec and len(val) < int(spec["minItems"]):
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} has fewer than minItems")
+        if "maxItems" in spec and len(val) > int(spec["maxItems"]):
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} exceeds maxItems")
+        item_spec = spec.get("items")
+        if isinstance(item_spec, dict):
+            for idx, elem in enumerate(val):
+                _validate_field_schema(f"{name}[{idx}]", elem, item_spec, depth + 1)
+    elif ptype == "object":
+        if not isinstance(val, dict):
+            raise G2AOriginError("invalid_arguments", 400, f"Argument {name!r} must be object")
+        _validate_args_schema(val, spec, prefix=name, depth=depth + 1)
+
+
+def _validate_args_schema(
+    args: Dict[str, Any],
+    schema: Dict[str, Any],
+    prefix: str = "",
+    depth: int = 0,
+) -> None:
+    if depth > 16:
+        raise G2AOriginError("invalid_arguments", 400, "Schema nesting depth exceeded")
+    if not schema:
+        return
     for req_key in schema.get("required", []):
         if req_key not in args:
-            raise G2AOriginError("invalid_arguments", 400, f"Missing required argument {req_key!r}")
+            qual = f"{prefix}.{req_key}" if prefix else str(req_key)
+            raise G2AOriginError("invalid_arguments", 400, f"Missing required argument {qual!r}")
+    props = schema.get("properties")
+    if isinstance(props, dict):
+        if schema.get("additionalProperties") is False:
+            for k in args:
+                if k not in props:
+                    qual = f"{prefix}.{k}" if prefix else k
+                    raise G2AOriginError("invalid_arguments", 400, f"Unexpected argument {qual!r}")
+        for k, v in args.items():
+            prop_spec = props.get(k)
+            if isinstance(prop_spec, dict):
+                qual = f"{prefix}.{k}" if prefix else k
+                _validate_field_schema(qual, v, prop_spec, depth + 1)
 
 
 # --- OriginSDK (§2.2 - §2.4) ---
@@ -854,6 +938,30 @@ class OriginSDK:
                 "queue_digest": queue_digest,
                 "fingerprint": fingerprint,
                 "approved": approved,
+            },
+        )
+
+    def report_npc_host_handoff(self, new_player_id: str) -> None:
+        """Section 4.3 privacy-isolated host handoff for player_metered independent_npc slots."""
+        cleaned = new_player_id.strip()
+        if not cleaned:
+            raise G2AOriginError("invalid_arguments", 400, "new_player_id is required")
+        if self.slot_role_kind != "independent_npc" or self.billing_mode != "player_metered":
+            raise G2AOriginError(
+                "permission_denied",
+                403,
+                "host_handoff is only permitted on player_metered independent_npc slots",
+            )
+        self._cancel_all_in_flight("npc_host_handoff")
+        self.player_id = cleaned
+        self.sync_enabled = True
+        self.flush_dirty_sync(significant_event=False)
+        self.hub_transport.post_to_hub(
+            "origin.player_event",
+            {
+                "slot_id": self.slot_id,
+                "kind": "host_handoff",
+                "new_player_id": cleaned,
             },
         )
 

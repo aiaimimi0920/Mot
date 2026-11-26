@@ -450,3 +450,91 @@ func TestTrustedDashboardSSEPushAndSecurityHeaders(t *testing.T) {
 		t.Fatal("did not receive event: status.changed over /trusted/events")
 	}
 }
+
+func TestSSELastEventIDCursorReplayAndTrustedNpcHandoff(t *testing.T) {
+	eng := newTestHubEngine(t)
+	registerSlotForServerTest(t, eng, "slot-cursor")
+	authRep, gErr := eng.HandleSessionAuthorize(model.WireVersion, "core-cursor", model.AuthorizeRequest{
+		SlotID:         "slot-cursor",
+		RequestedScope: model.RequestedScopeSpec{AllowChat: true},
+	})
+	if gErr != nil {
+		t.Fatalf("authorize: %v", gErr)
+	}
+
+	// Push 3 distinct events into history
+	eng.PushStream().PushEvent(authRep.SessionID, "context.push", map[string]any{"seq": 1})
+	eng.PushStream().PushEvent(authRep.SessionID, "context.push", map[string]any{"seq": 2})
+	eng.PushStream().PushEvent(authRep.SessionID, "context.push", map[string]any{"seq": 3})
+
+	// Inspect event IDs by replaying full history in-memory
+	chAll, unsubAll := eng.PushStream().Subscribe(authRep.SessionID, true)
+	ev1 := <-chAll
+	ev2 := <-chAll
+	ev3 := <-chAll
+	unsubAll()
+	if ev1.EventID == "" || ev2.EventID == "" || ev3.EventID == "" {
+		t.Fatal("expected non-empty event IDs")
+	}
+
+	coreSrv := httptest.NewServer(server.NewCoreHandler(eng, server.AuthRegistry{
+		CoreTokens: map[string]string{"tok-cursor": "core-cursor"},
+	}))
+	defer coreSrv.Close()
+
+	// Reconnect with W3C Last-Event-ID = ev2.EventID -> MUST receive ONLY ev3 (skipping ev1 & ev2)!
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, coreSrv.URL+"/g2a/v1/core/events?session_id="+authRep.SessionID+"&replay=1", nil)
+	req.Header.Set("Authorization", "Bearer tok-cursor")
+	req.Header.Set("Last-Event-ID", ev2.EventID)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /g2a/v1/core/events with Last-Event-ID: %v", err)
+	}
+	defer resp.Body.Close()
+
+	reader := bufio.NewReader(resp.Body)
+	var firstReplayedID string
+	for firstReplayedID == "" {
+		line, rErr := reader.ReadString('\n')
+		if rErr != nil {
+			t.Fatalf("reading SSE cursor replay: %v", rErr)
+		}
+		if strings.HasPrefix(line, "id: ") {
+			firstReplayedID = strings.TrimSpace(strings.TrimPrefix(line, "id: "))
+		}
+	}
+	if firstReplayedID != ev3.EventID {
+		t.Fatalf("expected Last-Event-ID cursor replay to start strictly after %s with %s, got %s", ev2.EventID, ev3.EventID, firstReplayedID)
+	}
+
+	// Verify /trusted/handoff-npc endpoint rejects companion slots and succeeds on player_metered independent_npc slots
+	npcCaps := []model.CapabilityEntry{{MethodID: "#01", Name: "act", PermittedActors: []string{"npc"}, ParamsSchema: map[string]any{"type": "object"}}}
+	npcDig, _ := jcs.DigestSHA256("g2a.cap.v1", npcCaps)
+	_ = eng.HandleOriginCapabilities(model.OriginCapabilitiesPayload{
+		SlotID: "slot-npc-http", RoleKind: "independent_npc", BillingMode: "player_metered",
+		PlayerID: "p-old", CapabilityTableDigest: npcDig, Capabilities: npcCaps, OriginExecuteURL: "pull://origin.execute",
+	})
+	dashHandler := server.NewTrustedConsentHandler(eng, server.AuthRegistry{ConsentToken: "c-tok"})
+
+	badBody, _ := json.Marshal(map[string]any{"slot_id": "slot-cursor", "new_player_id": "p-new"})
+	badReq := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:19230/trusted/handoff-npc", bytes.NewReader(badBody))
+	badReq.Host = "127.0.0.1:19230"
+	badReq.Header.Set("Authorization", "Bearer c-tok")
+	badRec := httptest.NewRecorder()
+	dashHandler.ServeHTTP(badRec, badReq)
+	if badRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when calling handoff-npc on companion slot, got %d", badRec.Code)
+	}
+
+	okBody, _ := json.Marshal(map[string]any{"slot_id": "slot-npc-http", "new_player_id": "p-new"})
+	okReq := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:19230/trusted/handoff-npc", bytes.NewReader(okBody))
+	okReq.Host = "127.0.0.1:19230"
+	okReq.Header.Set("Authorization", "Bearer c-tok")
+	okRec := httptest.NewRecorder()
+	dashHandler.ServeHTTP(okRec, okReq)
+	if okRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on valid metered NPC handoff, got %d (%s)", okRec.Code, okRec.Body.String())
+	}
+}

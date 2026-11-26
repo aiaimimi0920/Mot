@@ -105,6 +105,8 @@ class CoreSDK:
         self._early_declined_queues: OrderedDict[str, int] = OrderedDict()
         self.completed_receipts: List[QueueReceipt] = []
         self.seen_event_ids: OrderedDict[str, None] = OrderedDict()
+        self.last_event_id: str = ""
+        self.next_allowed_pull_ms: int = 0
         self.refusal_cooldowns: Dict[str, int] = {}
         self._http_tls = threading.local()
         self._pool_lock = threading.Lock()
@@ -247,10 +249,28 @@ class CoreSDK:
     def pull_context(self) -> ProjectedContext:
         if not self.session_id or self.closed:
             raise G2AError("revoked", 403, "Session is closed")
-        res = self._post_envelope("context.pull", {}, session_id=self.session_id)
+        try:
+            res = self._post_envelope("context.pull", {}, session_id=self.session_id)
+        except G2AError as err:
+            if err.code == "resource_limit" and err.retry_after_ms is not None:
+                self.next_allowed_pull_ms = int(time.time() * 1000) + int(err.retry_after_ms)
+            raise
         ctx = ProjectedContext.from_dict(res)
         self.latest_context = ctx
         return ctx
+
+    def pull_context_if_due(self) -> Optional[ProjectedContext]:
+        """Client-side adaptive quiet-period polling shield (§3.4 & §6.3): avoids wasted 429 HTTP round-trips."""
+        if self.closed or not self.session_id:
+            return None
+        if int(time.time() * 1000) < self.next_allowed_pull_ms:
+            return None
+        try:
+            return self.pull_context()
+        except G2AError as err:
+            if err.code == "resource_limit":
+                return None
+            raise
 
     def on_context_received(self, ctx: ProjectedContext, _replan_depth: int = 0) -> Optional[QueueReceipt]:
         if self.closed or self.actions_paused or not self.session_id or not self.scope:
@@ -393,13 +413,29 @@ class CoreSDK:
                 if ev_id in self.seen_event_ids:
                     return
                 self.seen_event_ids[ev_id] = None
+                self.last_event_id = str(ev_id)
                 if len(self.seen_event_ids) > 1024:
                     self.seen_event_ids.popitem(last=False)
 
         ev_name = env.get("event")
         payload = env.get("payload") or {}
         if ev_name == "context.push" and isinstance(payload, dict):
+            self.next_allowed_pull_ms = 0
             self.on_context_received(ProjectedContext.from_dict(payload))
+        elif ev_name == "capabilities.updated" and isinstance(payload, dict):
+            cap_digest = payload.get("capability_table_digest")
+            raw_table = payload.get("capability_table")
+            slot_id = payload.get("slot_id")
+            if isinstance(cap_digest, str) and isinstance(raw_table, list):
+                caps = [CapabilityEntry.from_dict(item) for item in raw_table]
+                caps_sorted = sorted(caps, key=lambda c: c.method_id)
+                verified = jcs_sha256("g2a.cap.v1", [c.to_dict() for c in caps_sorted])
+                if verified == cap_digest:
+                    self.capability_cache[cap_digest] = caps_sorted
+                    if isinstance(slot_id, str) and slot_id:
+                        self.slot_digest_index[slot_id] = cap_digest
+                    if self.scope is not None:
+                        self.scope.capability_table_digest = cap_digest
         elif ev_name == "queue.confirmed" and isinstance(payload, dict):
             qid = payload.get("queue_id")
             if isinstance(qid, str):
@@ -565,14 +601,20 @@ class CoreSDK:
             first_connect = True
             while not self._stop_event.is_set() and not self.closed and self.session_id:
                 replay_param = "" if first_connect else "&replay=1"
+                cursor_id = self.last_event_id if not first_connect else ""
+                if cursor_id:
+                    replay_param += f"&last_event_id={urllib.parse.quote(cursor_id)}"
                 stream_url = f"{self.hub_endpoint}/g2a/v1/core/events?session_id={self.session_id}{replay_param}"
+                sse_headers = {
+                    "Accept": "text/event-stream",
+                    "Authorization": f"Bearer {self.auth_token}",
+                }
+                if cursor_id:
+                    sse_headers["Last-Event-ID"] = cursor_id
                 req = urllib.request.Request(
                     stream_url,
                     method="GET",
-                    headers={
-                        "Accept": "text/event-stream",
-                        "Authorization": f"Bearer {self.auth_token}",
-                    },
+                    headers=sse_headers,
                 )
                 try:
                     if not first_connect:
@@ -651,6 +693,8 @@ class CoreSDK:
                 port = parsed.port or (443 if is_tls else 80)
                 base_path = parsed.path.rstrip("/")
                 replay_param = "" if first_connect else "&replay=1"
+                if not first_connect and self.last_event_id:
+                    replay_param += f"&last_event_id={urllib.parse.quote(self.last_event_id)}"
                 ws_path = f"{base_path}/g2a/v1/core/ws?session_id={urllib.parse.quote(self.session_id)}{replay_param}"
 
                 raw_sock: Optional[socket.socket] = None

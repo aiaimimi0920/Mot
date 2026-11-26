@@ -220,6 +220,17 @@ public sealed class OriginSdk
             if (!_actors.TryGetValue(req.Actor, out var subject))
                 throw new G2AOriginException("not_found", 404, "Actor subject not present");
 
+            if (reg.Def.ParamsSchema is not null &&
+                reg.Def.ParamsSchema.TryGetValue("required", out var reqObj) &&
+                reqObj is IEnumerable<string> reqList)
+            {
+                foreach (string reqKey in reqList)
+                {
+                    if (!req.Args.ContainsKey(reqKey))
+                        throw new G2AOriginException("invalid_arguments", 400, $"Missing required argument '{reqKey}'");
+                }
+            }
+
             var outcome = reg.Handler(req.Actor, subject, req.Args, req.ExecutionId);
             switch (outcome)
             {
@@ -345,6 +356,40 @@ public sealed class OriginSdk
         foreach (var execId in activeIds)
             CancelInFlightStep(execId);
         FlushFullSync();
+    }
+
+    public void ReportQueueApproval(string sessionId, string queueId, string queueDigest, string fingerprint, bool approved)
+    {
+        _transport.PostToHub("origin.player_event", new Dictionary<string, object?>
+        {
+            ["slot_id"] = _slotId,
+            ["kind"] = "queue_approval",
+            ["session_id"] = sessionId,
+            ["queue_id"] = queueId,
+            ["queue_digest"] = queueDigest,
+            ["fingerprint"] = fingerprint,
+            ["approved"] = approved
+        });
+    }
+
+    public void ReportNpcHostHandoff(string newPlayerId)
+    {
+        string cleaned = newPlayerId.Trim();
+        if (string.IsNullOrEmpty(cleaned))
+            throw new G2AOriginException("invalid_arguments", 400, "new_player_id is required");
+        if (_roleKind != "independent_npc" || _billingMode != "player_metered")
+            throw new G2AOriginException("permission_denied", 403, "host_handoff requires player_metered independent_npc slot");
+
+        var activeIds = _dispatcher.RunOnGameThread(() => _inFlightSteps.Keys.ToList());
+        foreach (var execId in activeIds)
+            CancelInFlightStep(execId);
+        _syncEnabled = true;
+        _transport.PostToHub("origin.player_event", new Dictionary<string, object?>
+        {
+            ["slot_id"] = _slotId,
+            ["kind"] = "host_handoff",
+            ["new_player_id"] = cleaned
+        });
     }
 
     private (Dictionary<string, object?> Brief, Dictionary<(string MethodId, string Actor), ActiveMethodGrant> Grants) CollectCurrentView()

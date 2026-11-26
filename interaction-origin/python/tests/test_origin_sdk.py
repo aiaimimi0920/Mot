@@ -200,6 +200,103 @@ class TestInteractionOriginPythonSDK(unittest.TestCase):
         sdk.report_emergency_stop()
         self.assertEqual(sdk.execution_ledger["exec-hold-inflight"].state, "cancelled")
 
+    def test_yaw_relative_deictic_labels_recursive_schema_and_npc_handoff(self):
+        from g2a_origin.origin_sdk import G2AOriginError
+
+        tx = RecordingTransport()
+        world = MockSpatialWorld()
+        sdk = OriginSDK(slot_id="slot-yaw", hub_transport=tx, spatial=world)
+        sdk.bind_actor_subject("companion", {})
+        sdk.register_capability(
+            CapabilityEntry(
+                "#01",
+                "craft_grid",
+                "Craft at grid coordinate",
+                ["companion"],
+                {
+                    "type": "object",
+                    "required": ["code", "items", "coord"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "target_id": {"type": "string"},
+                        "code": {"type": "string", "minLength": 3, "maxLength": 6},
+                        "items": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 2,
+                            "items": {"type": "string", "enum": ["wood", "iron"]},
+                        },
+                        "coord": {
+                            "type": "object",
+                            "required": ["x", "y"],
+                            "additionalProperties": False,
+                            "properties": {
+                                "x": {"type": "integer", "minimum": 0, "maximum": 10},
+                                "y": {"type": "integer", "minimum": 0, "maximum": 10},
+                            },
+                        },
+                    },
+                },
+            ),
+            effect_handler=lambda act, subj, args, tok: ImmediateSucceeded({"crafted": True}),
+            spatial_target_verb=True,
+        )
+
+        # Facing +Z (yaw_deg=0): chest_R at (+4, 0, 0) is "right 4.0m"
+        _, g0 = sdk.collect_current_view()
+        self.assertEqual(g0[("#01", "companion")].targets[0].player_anchor, "right 4.0m")
+
+        # Player turns 90 deg clockwise (facing +X): chest_R at (+4, 0, 0) is now directly "ahead 4.0m"!
+        world.poses["player"] = Pose3D(0.0, 0.0, 0.0, yaw_deg=90.0)
+        _, g90 = sdk.collect_current_view()
+        self.assertEqual(g90[("#01", "companion")].targets[0].player_anchor, "ahead 4.0m")
+
+        # Player turns 180 deg (facing -Z): chest_R at (+4, 0, 0) is now "left 4.0m"!
+        world.poses["player"] = Pose3D(0.0, 0.0, 0.0, yaw_deg=180.0)
+        _, g180 = sdk.collect_current_view()
+        self.assertEqual(g180[("#01", "companion")].targets[0].player_anchor, "left 4.0m")
+
+        # Recursive schema validation rejects invalid array item and out-of-bounds nested coord
+        with self.assertRaises(G2AOriginError):
+            sdk.handle_origin_execute(
+                OriginExecuteRequest(
+                    "slot-yaw", 1, "invoke", "ex-bad-1", "#01", "companion",
+                    {"code": "abc", "items": ["wood", "illegal_item"], "coord": {"x": 1, "y": 2}},
+                )
+            )
+        with self.assertRaises(G2AOriginError):
+            sdk.handle_origin_execute(
+                OriginExecuteRequest(
+                    "slot-yaw", 1, "invoke", "ex-bad-2", "#01", "companion",
+                    {"code": "abc", "items": ["wood"], "coord": {"x": 99, "y": 2}},
+                )
+            )
+        ok_rep = sdk.handle_origin_execute(
+            OriginExecuteRequest(
+                "slot-yaw", 1, "invoke", "ex-ok-1", "#01", "companion",
+                {"code": "abc", "items": ["wood", "iron"], "coord": {"x": 4, "y": 7}},
+            )
+        )
+        self.assertEqual(ok_rep.state, "succeeded")
+
+        # Companion slot rejects report_npc_host_handoff; player_metered independent_npc succeeds!
+        with self.assertRaises(G2AOriginError):
+            sdk.report_npc_host_handoff("player-2")
+
+        npc_tx = RecordingTransport()
+        npc_sdk = OriginSDK(
+            slot_id="slot-npc-boss",
+            hub_transport=npc_tx,
+            slot_role_kind="independent_npc",
+            billing_mode="player_metered",
+            player_id="player-1",
+        )
+        npc_sdk.report_npc_host_handoff("player-2")
+        self.assertEqual(npc_sdk.player_id, "player-2")
+        self.assertEqual(npc_tx.posts[-1][0], "origin.player_event")
+        self.assertEqual(npc_tx.posts[-1][1]["kind"], "host_handoff")
+        self.assertEqual(npc_tx.posts[-1][1]["new_player_id"], "player-2")
+
 
 if __name__ == "__main__":
     unittest.main()

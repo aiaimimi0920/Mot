@@ -260,6 +260,8 @@ export class CoreSDK {
   private earlyDeclinedQueues = new Map<string, number>();
   private refusalCooldowns = new Map<string, number>();
   private seenEvents = new Set<string>();
+  private lastEventId = "";
+  private nextAllowedPullMs = 0;
   private ws: WebSocket | null = null;
   private sse: EventSource | null = null;
   private hbTimer: ReturnType<typeof setInterval> | null = null;
@@ -331,6 +333,23 @@ export class CoreSDK {
     this.ws = null;
     this.sse?.close();
     this.sse = null;
+  }
+
+  async pullContextIfDue(base: string, authToken: string): Promise<ProjectedContext | null> {
+    if (this.closed || !this.sessionId) return null;
+    if (Date.now() < this.nextAllowedPullMs) return null;
+    try {
+      const res = await this.postEnvelope(base.replace(/\/$/, ""), authToken, "context.pull", {}, this.sessionId);
+      return res as unknown as ProjectedContext;
+    } catch (err) {
+      if (err instanceof G2ACoreError && err.code === "resource_limit") {
+        if (err.retryAfterMs !== undefined) {
+          this.nextAllowedPullMs = Date.now() + err.retryAfterMs;
+        }
+        return null;
+      }
+      throw err;
+    }
   }
 
   async onContextReceived(base: string, authToken: string, ctx: ProjectedContext, depth = 0): Promise<void> {
@@ -407,13 +426,26 @@ export class CoreSDK {
     if (typeof env.event_id === "string" && env.event_id) {
       if (this.seenEvents.has(env.event_id)) return;
       this.seenEvents.add(env.event_id);
+      this.lastEventId = env.event_id;
       if (this.seenEvents.size > MAX_SEEN_EVENT_IDS) {
         const oldest = this.seenEvents.values().next().value;
         if (oldest !== undefined) this.seenEvents.delete(oldest);
       }
     }
     if (env.event === "context.push") {
+      this.nextAllowedPullMs = 0;
       await this.onContextReceived(base, authToken, env.payload as ProjectedContext);
+    } else if (env.event === "capabilities.updated") {
+      const capDigest = typeof env.payload?.capability_table_digest === "string" ? env.payload.capability_table_digest : "";
+      const capTable = env.payload?.capability_table;
+      const slotId = typeof env.payload?.slot_id === "string" ? env.payload.slot_id : "";
+      if (capDigest && Array.isArray(capTable)) {
+        const verified = await jcsSha256("g2a.cap.v1", capTable);
+        if (verified === capDigest) {
+          this.capabilityCache.set(capDigest, capTable);
+          if (slotId) this.slotDigests.set(slotId, capDigest);
+        }
+      }
     } else if (env.event === "queue.confirmed") {
       const qid = typeof env.payload?.queue_id === "string" ? env.payload.queue_id : "";
       const q = qid ? this.pendingConfirmQueues.get(qid) : undefined;
@@ -467,7 +499,10 @@ export class CoreSDK {
 
   private openWebSocketStream(base: string, authToken: string, isReconnect: boolean): void {
     if (typeof WebSocket === "undefined" || this.closed || !this.sessionId) return;
-    const replay = isReconnect ? "&replay=1" : "";
+    let replay = isReconnect ? "&replay=1" : "";
+    if (isReconnect && this.lastEventId) {
+      replay += `&last_event_id=${encodeURIComponent(this.lastEventId)}`;
+    }
     const wsUrl =
       base.replace(/^http/, "ws") +
       `/g2a/v1/core/ws?session_id=${encodeURIComponent(this.sessionId)}&access_token=${encodeURIComponent(authToken)}${replay}`;
@@ -488,11 +523,14 @@ export class CoreSDK {
 
   private openSseStream(base: string, authToken: string, isReconnect: boolean): void {
     if (typeof EventSource === "undefined" || this.closed || !this.sessionId) return;
-    const replay = isReconnect ? "&replay=1" : "";
+    let replay = isReconnect ? "&replay=1" : "";
+    if (isReconnect && this.lastEventId) {
+      replay += `&last_event_id=${encodeURIComponent(this.lastEventId)}`;
+    }
     const sseUrl =
       `${base}/g2a/v1/core/events?session_id=${encodeURIComponent(this.sessionId)}&access_token=${encodeURIComponent(authToken)}${replay}`;
     this.sse = new EventSource(sseUrl);
-    for (const evType of ["context.push", "queue.confirmed", "queue.declined", "session.resumed", "session.closed"]) {
+    for (const evType of ["context.push", "capabilities.updated", "queue.confirmed", "queue.declined", "session.resumed", "session.closed"]) {
       this.sse.addEventListener(evType, async (ev: MessageEvent) => {
         const env = parseStrictJson<Record<string, any>>(String(ev.data));
         await this.handlePushEnvelope(base, authToken, env);

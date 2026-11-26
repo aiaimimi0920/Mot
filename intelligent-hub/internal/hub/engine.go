@@ -9,8 +9,10 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aiaimimi0920/g2a-intelligent-hub/internal/jcs"
 	"github.com/aiaimimi0920/g2a-intelligent-hub/internal/model"
@@ -22,6 +24,7 @@ type Config struct {
 	MinSyncIntervalMs        int64
 	MaxIdleSleepIntervalMs   int64
 	DefaultConfirmCooldownMs int64
+	ConfirmPromptTimeoutMs   int64
 	StepTransitionGraceMs    int64
 	SustainedStepTimeoutMs   int64
 	MaxQueueSteps            int
@@ -39,6 +42,7 @@ func DefaultConfig() Config {
 		MinSyncIntervalMs:        100,
 		MaxIdleSleepIntervalMs:   10000,
 		DefaultConfirmCooldownMs: 60000,
+		ConfirmPromptTimeoutMs:   30000,
 		StepTransitionGraceMs:    3000,
 		SustainedStepTimeoutMs:   30000,
 		MaxQueueSteps:            32,
@@ -195,14 +199,36 @@ func (b *EventStreamHub) PushEvent(sessionID, eventName string, payload any) {
 }
 
 func (b *EventStreamHub) Subscribe(sessionID string, replayPending bool) (chan model.EventEnvelope, func()) {
+	return b.SubscribeAfter(sessionID, replayPending, "")
+}
+
+func (b *EventStreamHub) SubscribeAfter(sessionID string, replayPending bool, lastEventID string) (chan model.EventEnvelope, func()) {
 	ch := make(chan model.EventEnvelope, 64)
 	b.mu.Lock()
 	if b.subscribers[sessionID] == nil {
 		b.subscribers[sessionID] = make(map[chan model.EventEnvelope]struct{})
 	}
 	b.subscribers[sessionID][ch] = struct{}{}
-	if replayPending {
-		for _, ev := range b.history[sessionID] {
+	hist := b.history[sessionID]
+	if lastEventID != "" {
+		foundIdx := -1
+		for idx, ev := range hist {
+			if ev.EventID == lastEventID {
+				foundIdx = idx
+				break
+			}
+		}
+		if foundIdx >= 0 {
+			for _, ev := range hist[foundIdx+1:] {
+				ch <- ev
+			}
+		} else if replayPending {
+			for _, ev := range hist {
+				ch <- ev
+			}
+		}
+	} else if replayPending {
+		for _, ev := range hist {
 			ch <- ev
 		}
 	}
@@ -493,8 +519,23 @@ func (e *Engine) HandleOriginCapabilities(payload model.OriginCapabilitiesPayloa
 		return model.NewError(model.ErrInvalidArguments, 400, "Capability table digest mismatch")
 	}
 
-	_, gErr := store.Atomic(e.persistence, func(d *store.HubStoreData) (struct{}, *model.G2AError) {
+	sanitizedCaps := make([]model.CapabilityEntry, len(sortedCaps))
+	copy(sanitizedCaps, sortedCaps)
+	if payload.RoleKind == "independent_npc" {
+		for i := range sanitizedCaps {
+			filtered := make([]string, 0, len(sanitizedCaps[i].PermittedActors))
+			for _, a := range sanitizedCaps[i].PermittedActors {
+				if a != "player" {
+					filtered = append(filtered, a)
+				}
+			}
+			sanitizedCaps[i].PermittedActors = filtered
+		}
+	}
+
+	notifySessions, gErr := store.Atomic(e.persistence, func(d *store.HubStoreData) ([]string, *model.G2AError) {
 		slot, exists := d.Slots[payload.SlotID]
+		prevDigest := ""
 		if !exists {
 			slot = &store.SlotRecord{
 				SlotID:           payload.SlotID,
@@ -502,6 +543,8 @@ func (e *Engine) HandleOriginCapabilities(payload model.OriginCapabilitiesPayloa
 				AllowlistedCores: make(map[string]bool),
 			}
 			d.Slots[payload.SlotID] = slot
+		} else {
+			prevDigest = slot.CapabilityTableDigest
 		}
 		slot.RoleKind = payload.RoleKind
 		slot.BillingMode = payload.BillingMode
@@ -524,19 +567,9 @@ func (e *Engine) HandleOriginCapabilities(payload model.OriginCapabilitiesPayloa
 		if payload.OriginExecuteURL != "" {
 			slot.OriginExecuteURL = payload.OriginExecuteURL
 		}
-		slot.Capabilities = sortedCaps
-		slot.CapabilityByID = make(map[string]model.CapabilityEntry, len(sortedCaps))
-		for _, c := range sortedCaps {
-			// Enforce independent_npc safety rule on Hub side as well
-			if slot.RoleKind == "independent_npc" {
-				filtered := make([]string, 0, len(c.PermittedActors))
-				for _, a := range c.PermittedActors {
-					if a != "player" {
-						filtered = append(filtered, a)
-					}
-				}
-				c.PermittedActors = filtered
-			}
+		slot.Capabilities = sanitizedCaps
+		slot.CapabilityByID = make(map[string]model.CapabilityEntry, len(sanitizedCaps))
+		for _, c := range sanitizedCaps {
 			slot.CapabilityByID[c.MethodID] = c
 		}
 		slot.CapabilityTableDigest = verifiedDigest
@@ -557,9 +590,53 @@ func (e *Engine) HandleOriginCapabilities(payload model.OriginCapabilitiesPayloa
 				SettledExecutions: map[string]model.OriginExecuteReply{},
 			}
 		}
-		return struct{}{}, nil
+
+		// Mid-session dynamic capability refresh (§3.3 & §4.1):
+		// Intersect existing FrozenScope downward (never silently expanding unapproved methods/actors!)
+		// and notify live sessions of the updated capability_table_digest.
+		var notify []string
+		if prevDigest != "" && prevDigest != verifiedDigest {
+			for _, sess := range d.SessionsForSlot(payload.SlotID) {
+				if sess.State == "closed" {
+					continue
+				}
+				narrowedPerm := make(map[string][]string, len(sess.Scope.PermittedMethods))
+				for mID, prevActors := range sess.Scope.PermittedMethods {
+					capDef, stillExists := slot.CapabilityByID[mID]
+					if !stillExists {
+						continue
+					}
+					kept := make([]string, 0, len(prevActors))
+					for _, a := range prevActors {
+						if containsString(capDef.PermittedActors, a) {
+							kept = append(kept, a)
+						}
+					}
+					if len(kept) > 0 {
+						sort.Strings(kept)
+						narrowedPerm[mID] = kept
+					}
+				}
+				sess.Scope.PermittedMethods = narrowedPerm
+				sess.Scope.CapabilityTableDigest = verifiedDigest
+				if newSD, errSD := jcs.DigestSHA256("g2a.scope.v1", sess.Scope); errSD == nil {
+					sess.ScopeDigest = newSD
+				}
+				if sess.PlayerOnline && sess.State == "active" {
+					notify = append(notify, sess.SessionID)
+				}
+			}
+		}
+		return notify, nil
 	})
 	if gErr == nil {
+		for _, sid := range notifySessions {
+			e.pushStream.PushEvent(sid, "capabilities.updated", map[string]any{
+				"slot_id":                 payload.SlotID,
+				"capability_table_digest": verifiedDigest,
+				"capability_table":        sanitizedCaps,
+			})
+		}
 		e.NotifyDashboard()
 	}
 	return gErr
@@ -633,21 +710,34 @@ func (e *Engine) HandleOriginSync(frame model.OriginSyncFrame) *model.G2AError {
 			view.RecordSettledExecution(settled)
 		}
 
-		// Adaptive quiet-period sleep throttling
+		// Adaptive quiet-period sleep throttling (§3.4 & Pseudocode §3.3):
+		// Push immediately on significant_event, OR wake up at throttled backoff cadence once IdleBackoffMs has elapsed.
+		now := e.cfg.ClockNowMs()
 		outPushes := make([]pendingPush, 0)
 		for _, sess := range d.ActiveSessionsForSlot(frame.SlotID) {
 			if frame.SignificantEvent {
 				sess.IdleBackoffMs = e.cfg.MinSyncIntervalMs
 				sess.NextAllowedPullMs = 0
+				sess.LastContextPushMs = now
 				outPushes = append(outPushes, pendingPush{
 					sessionID: sess.SessionID,
 					ctx:       e.projectContextInTx(d, sess, nil),
 				})
 			} else {
-				next := sess.IdleBackoffMs * 2
-				if next < e.cfg.MinSyncIntervalMs {
-					next = e.cfg.MinSyncIntervalMs
+				backoff := sess.IdleBackoffMs
+				if backoff < e.cfg.MinSyncIntervalMs {
+					backoff = e.cfg.MinSyncIntervalMs
 				}
+				// Never emit unsolicited quiet-period wakeup pushes mid-queue while ActiveQueueID is executing;
+				// QueueReceipt already returns LatestContext upon settlement!
+				if sess.ActiveQueueID == nil && sess.LastContextPushMs > 0 && now-sess.LastContextPushMs >= backoff {
+					sess.LastContextPushMs = now
+					outPushes = append(outPushes, pendingPush{
+						sessionID: sess.SessionID,
+						ctx:       e.projectContextInTx(d, sess, nil),
+					})
+				}
+				next := backoff * 2
 				if next > e.cfg.MaxIdleSleepIntervalMs {
 					next = e.cfg.MaxIdleSleepIntervalMs
 				}
@@ -714,10 +804,14 @@ func (e *Engine) HandleOriginPlayerEvent(ev model.OriginPlayerEvent) *model.G2AE
 			sessionID string
 			ctx       model.ProjectedContext
 		}
-		pushes, gErr := store.ReadOnly(e.persistence, func(d *store.HubStoreData) ([]cmdPush, *model.G2AError) {
+		pushes, gErr := store.MutateVolatile(e.persistence, func(d *store.HubStoreData) ([]cmdPush, *model.G2AError) {
+			now := e.cfg.ClockNowMs()
 			cmd := ev.Text
 			var list []cmdPush
 			for _, sess := range d.ActiveSessionsForSlot(ev.SlotID) {
+				sess.IdleBackoffMs = e.cfg.MinSyncIntervalMs
+				sess.NextAllowedPullMs = 0
+				sess.LastContextPushMs = now
 				list = append(list, cmdPush{
 					sessionID: sess.SessionID,
 					ctx:       e.projectContextInTx(d, sess, &cmd),
@@ -748,9 +842,79 @@ func (e *Engine) HandleOriginPlayerEvent(ev model.OriginPlayerEvent) *model.G2AE
 		e.OnTrustedConfirmationResult(ev.SessionID, ev.QueueID, ev.QueueDigest, ev.Fingerprint, ev.Approved)
 		return nil
 
+	case "host_handoff":
+		return e.HandoffMeteredNPCSlot(ev.SlotID, ev.NewPlayerID)
+
 	default:
 		return model.NewError(model.ErrInvalidArguments, 400, "Unknown player_event kind: "+ev.Kind)
 	}
+}
+
+// HandoffMeteredNPCSlot implements G2A V0.0.1 Section 4.3 privacy-isolated host handoff for player_metered independent_npc slots:
+// stops billing and closes all sessions/queues bound to the previous host before rebinding the NPC slot to newPlayerID.
+func (e *Engine) HandoffMeteredNPCSlot(slotID, newPlayerID string) *model.G2AError {
+	newPlayerID = strings.TrimSpace(newPlayerID)
+	if slotID == "" || newPlayerID == "" {
+		return model.NewError(model.ErrInvalidArguments, 400, "slot_id and new_player_id are required for host_handoff")
+	}
+	type handoffResult struct {
+		cancels     []cancelTarget
+		closedIDs   []string
+		poppedPairs [][2]string
+	}
+	res, gErr := store.Atomic(e.persistence, func(d *store.HubStoreData) (handoffResult, *model.G2AError) {
+		var zr handoffResult
+		slot, ok := d.Slots[slotID]
+		if !ok {
+			return zr, model.NewError(model.ErrNotFound, 404, "Unknown slot_id")
+		}
+		if slot.RoleKind != "independent_npc" || slot.BillingMode != "player_metered" {
+			return zr, model.NewError(model.ErrPermissionDenied, 403, "host_handoff is only permitted on player_metered independent_npc slots")
+		}
+		prevHost := slot.PlayerID
+		if prevHost != newPlayerID {
+			for _, sess := range d.SessionsForSlot(slotID) {
+				for _, rec := range d.Queues {
+					if rec.SessionID == sess.SessionID && rec.State == "awaiting_confirmation" {
+						zr.poppedPairs = append(zr.poppedPairs, [2]string{sess.SessionID, rec.QueueID})
+					}
+				}
+				if sess.State != "closed" {
+					zr.cancels = append(zr.cancels, e.cancelAndFenceSessionQueuesInTx(d, sess)...)
+					sess.State = "closed"
+					sess.PlayerOnline = false
+					zr.closedIDs = append(zr.closedIDs, sess.SessionID)
+				}
+			}
+			slot.PlayerID = newPlayerID
+			if len(zr.closedIDs) > 0 {
+				d.PruneClosedSessions()
+			}
+		}
+		slot.PlayerOnline = true
+		d.AppendAudit(e.cfg.ClockNowMs(), "slot.npc_host_handoff", slotID, "", "",
+			fmt.Sprintf("Metered NPC host handed off from %s to %s", prevHost, newPlayerID))
+		return zr, nil
+	})
+	if gErr != nil {
+		return gErr
+	}
+	for _, pair := range res.poppedPairs {
+		e.consent.PopQueuePrompt(pair[0], pair[1])
+	}
+	for _, sid := range res.closedIDs {
+		e.consent.PopResumePrompt(sid)
+	}
+	e.broadcastWakeup()
+	for _, c := range res.cancels {
+		_, _ = e.originClient.Execute(c.targetURL, model.OriginExecuteRequest{
+			SlotID: c.slotID, Epoch: c.epoch, Kind: "cancel", ExecutionID: c.execID, Args: map[string]any{},
+		})
+	}
+	for _, sid := range res.closedIDs {
+		e.pushStream.PushEvent(sid, "session.closed", map[string]any{"reason": "npc_host_handoff"})
+	}
+	return nil
 }
 
 func (e *Engine) OnPlayerPresenceChanged(slotID string, online bool, remainingOnlineHumans int) {
@@ -902,6 +1066,7 @@ func (e *Engine) HandleSessionAuthorize(g2aVersion, callerCoreID string, req mod
 			LeaseDeadlineMs:        now + e.cfg.LeaseTTLMs,
 			IdleBackoffMs:          e.cfg.MinSyncIntervalMs,
 			NextAllowedPullMs:      0,
+			LastContextPushMs:      now,
 			ConsumptionUsed:        0,
 			ConsumptionCap:         req.ConsumptionCap,
 			NegotiatedExtensions:   negotiatedExts,
@@ -1047,6 +1212,19 @@ func (e *Engine) HandleContextPull(callerCoreID, sessionID string) (model.Projec
 }
 
 func (e *Engine) HandleChatSend(callerCoreID, sessionID string, msg model.ChatMessage) *model.G2AError {
+	if strings.TrimSpace(msg.MessageID) == "" {
+		return model.NewError(model.ErrInvalidArguments, 400, "message_id is required")
+	}
+	if strings.TrimSpace(msg.Text) == "" || utf8.RuneCountInString(msg.Text) > 4096 {
+		return model.NewError(model.ErrInvalidArguments, 400, "chat text must be non-empty and at most 4096 characters")
+	}
+	audience := msg.Audience
+	if audience == "" {
+		audience = "player_only"
+	}
+	if audience != "player_only" && audience != "party" && audience != "public" {
+		return model.NewError(model.ErrInvalidArguments, 400, "audience must be player_only, party, or public")
+	}
 	type chatDispatch struct {
 		url string
 		req model.OriginExecuteRequest
@@ -1073,7 +1251,7 @@ func (e *Engine) HandleChatSend(callerCoreID, sessionID string, msg model.ChatMe
 				Kind:        "deliver_chat",
 				ExecutionID: "chat-" + msg.MessageID,
 				Args: map[string]any{
-					"audience":      msg.Audience,
+					"audience":      audience,
 					"text":          msg.Text,
 					"ai_provenance": true,
 				},
@@ -1126,6 +1304,15 @@ type submitDecision struct {
 
 func (e *Engine) HandleQueueSubmit(callerCoreID, sessionID string, q model.MethodCallQueue) (model.QueueReceipt, *model.G2AError) {
 	var zero model.QueueReceipt
+	if strings.TrimSpace(q.QueueID) == "" {
+		return zero, model.NewError(model.ErrInvalidArguments, 400, "queue_id is required")
+	}
+	if q.Trigger != "player_command" && q.Trigger != "proactive" {
+		return zero, model.NewError(model.ErrInvalidArguments, 400, "trigger must be player_command or proactive")
+	}
+	// Lazily expire unanswered confirmation prompts before evaluating queue deduplication & refusal cooldowns (§5.2 Item 2).
+	e.ReapExpiredConfirmationsOnce()
+
 	queueDigest, err := jcs.DigestSHA256("g2a.confirm.v1", map[string]any{
 		"session_id": sessionID,
 		"queue_id":   q.QueueID,
@@ -1271,8 +1458,12 @@ func (e *Engine) HandleQueueSubmit(callerCoreID, sessionID string, q model.Metho
 			}
 		}
 		initialState := "running"
+		var confirmDeadline int64
 		if needsConfirm {
 			initialState = "awaiting_confirmation"
+			if e.cfg.ConfirmPromptTimeoutMs > 0 {
+				confirmDeadline = now + e.cfg.ConfirmPromptTimeoutMs
+			}
 		}
 		rec := &store.QueueLedgerRecord{
 			SessionID:           sessionID,
@@ -1282,6 +1473,7 @@ func (e *Engine) HandleQueueSubmit(callerCoreID, sessionID string, q model.Metho
 			Queue:               q,
 			State:               initialState,
 			RequiresRealMoneyUI: requiresRealMoneyUI,
+			ConfirmDeadlineMs:   confirmDeadline,
 			StepReceipts:        receipts,
 		}
 		d.RegisterQueue(qKey, rec)
@@ -1489,7 +1681,7 @@ func (e *Engine) waitUntilStepReadyOrAbort(sessionID, queueID string, stepIndex 
 	}
 }
 
-func (e *Engine) awaitStepSettlementOrCancel(sessionID, queueID, executionID string) model.OriginExecuteReply {
+func (e *Engine) awaitStepSettlementOrCancel(sessionID, queueID, executionID, targetURL, slotID string, epoch int64) model.OriginExecuteReply {
 	deadlineMs := e.cfg.ClockNowMs() + e.cfg.SustainedStepTimeoutMs
 	for {
 		settled, done := func() (model.OriginExecuteReply, bool) {
@@ -1520,6 +1712,10 @@ func (e *Engine) awaitStepSettlementOrCancel(sessionID, queueID, executionID str
 			return settled
 		}
 		if e.cfg.ClockNowMs() >= deadlineMs {
+			// Halt the timed-out sustained step at the Interaction Origin so no zombie in-flight task continues in-game!
+			_, _ = e.originClient.Execute(targetURL, model.OriginExecuteRequest{
+				SlotID: slotID, Epoch: epoch, Kind: "cancel", ExecutionID: executionID, Args: map[string]any{},
+			})
 			reason := "sustained_step_timed_out"
 			return model.OriginExecuteReply{
 				ExecutionID:   executionID,
@@ -1556,7 +1752,9 @@ func (e *Engine) dispatchQueueSteps(sessionID, queueID string) (model.QueueRecei
 				FailureReason: &reason,
 			}
 		} else if execReply.State == "executing" {
-			execReply = e.awaitStepSettlementOrCancel(sessionID, queueID, execReply.ExecutionID)
+			execReply = e.awaitStepSettlementOrCancel(
+				sessionID, queueID, execReply.ExecutionID, prep.targetURL, prep.execReq.SlotID, prep.execReq.Epoch,
+			)
 		}
 
 		e.recordStepOutcome(sessionID, queueID, i, execReply)
@@ -1605,6 +1803,7 @@ func (e *Engine) abortRemainingSteps(sessionID, queueID string, fromIndex int, r
 		if sess.ActiveQueueID != nil && *sess.ActiveQueueID == queueID {
 			sess.ActiveQueueID = nil
 		}
+		sess.LastContextPushMs = e.cfg.ClockNowMs()
 		d.PruneTerminalQueues()
 		return e.toReceiptInTx(d, sess, rec), nil
 	})
@@ -1622,6 +1821,7 @@ func (e *Engine) finalizeCompletedQueue(sessionID, queueID string) model.QueueRe
 		if sess.ActiveQueueID != nil && *sess.ActiveQueueID == queueID {
 			sess.ActiveQueueID = nil
 		}
+		sess.LastContextPushMs = e.cfg.ClockNowMs()
 		d.PruneTerminalQueues()
 		return e.toReceiptInTx(d, sess, rec), nil
 	})
@@ -1829,7 +2029,62 @@ func (e *Engine) CheckSessionRateLimit(sessionID string) *model.G2AError {
 	return gErr
 }
 
+// ReapExpiredConfirmationsOnce enforces Section 5.2 Item 2: unanswered confirmation prompts upon timeout
+// are treated as declined, cancelling the queue and activating the target refusal cooldown.
+func (e *Engine) ReapExpiredConfirmationsOnce() int {
+	if e.cfg.ConfirmPromptTimeoutMs <= 0 {
+		return 0
+	}
+	type expiredItem struct {
+		sessionID string
+		queueID   string
+	}
+	expired, _ := store.MutateVolatile(e.persistence, func(d *store.HubStoreData) ([]expiredItem, *model.G2AError) {
+		now := e.cfg.ClockNowMs()
+		var out []expiredItem
+		reason := "confirmation_timed_out"
+		for _, rec := range d.Queues {
+			if rec.State == "awaiting_confirmation" && rec.ConfirmDeadlineMs > 0 && now >= rec.ConfirmDeadlineMs {
+				rec.State = "cancelled"
+				for i := range rec.StepReceipts {
+					if rec.StepReceipts[i].State == "pending" {
+						rec.StepReceipts[i].State = "cancelled"
+						rCopy := reason
+						rec.StepReceipts[i].FailureReason = &rCopy
+					}
+				}
+				if rec.Fingerprint != "" {
+					d.ConfirmCooldowns[rec.SessionID+"|"+rec.Fingerprint] = now + e.cfg.DefaultConfirmCooldownMs
+				}
+				slotID := ""
+				if sess := d.Sessions[rec.SessionID]; sess != nil {
+					slotID = sess.Scope.SlotID
+				}
+				d.AppendAudit(now, "queue.confirm_timeout", slotID, rec.SessionID, rec.QueueID, "Unanswered confirmation prompt timed out into cooldown")
+				out = append(out, expiredItem{sessionID: rec.SessionID, queueID: rec.QueueID})
+			}
+		}
+		if len(out) > 0 {
+			d.PruneTerminalQueues()
+		}
+		return out, nil
+	})
+	for _, item := range expired {
+		e.consent.PopQueuePrompt(item.sessionID, item.queueID)
+		e.pushStream.PushEvent(item.sessionID, "queue.declined", map[string]any{
+			"queue_id":    item.queueID,
+			"cooldown_ms": e.cfg.DefaultConfirmCooldownMs,
+			"reason":      "confirmation_timed_out",
+		})
+	}
+	if len(expired) > 0 {
+		e.NotifyDashboard()
+	}
+	return len(expired)
+}
+
 func (e *Engine) ReapExpiredSessionLeasesOnce() int {
+	e.ReapExpiredConfirmationsOnce()
 	reaped, _ := store.MutateVolatile(e.persistence, func(d *store.HubStoreData) (int, *model.G2AError) {
 		now := e.cfg.ClockNowMs()
 		count := 0

@@ -186,6 +186,27 @@ int main() {
     }
     assert(caught_lone);
 
+    // 7. Verify required schema argument guard & player_metered independent_npc host_handoff
+    std::vector<std::pair<std::string, JsonValue>> handoff_posts;
+    OriginSdk boss_sdk(
+        "slot-boss-cpp",
+        [&](const std::string& op, const JsonValue& p) { handoff_posts.emplace_back(op, p); },
+        "independent_npc",
+        "player_metered");
+    boss_sdk.bind_actor_subject("boss");
+    boss_sdk.register_capability(
+        {"#07", "cast_aoe", "Cast AOE", {"boss"}, JsonObject{{"required", JsonArray{"sector_id"}}}, false, {}, "allow"},
+        [](const std::string&, const JsonObject&, const std::string&) { return EffectOutcome::ImmediateSucceeded(); });
+
+    auto miss_rep = boss_sdk.handle_origin_execute({"slot-boss-cpp", 1, "invoke", "exec-miss-1", "#07", "boss", {}});
+    assert(miss_rep.state == "failed" && miss_rep.failure_reason.value_or("") == "missing_required_arg:sector_id");
+
+    boss_sdk.report_npc_host_handoff("teammate-2");
+    assert(handoff_posts.back().first == "origin.player_event");
+    const auto& ho_obj = std::get<JsonObject>(handoff_posts.back().second.data);
+    assert(std::get<std::string>(ho_obj.at("kind").data) == "host_handoff");
+    assert(std::get<std::string>(ho_obj.at("new_player_id").data) == "teammate-2");
+
     std::cout << "C++17 G2A OriginSdk SelfTest PASSED | JCS=" << digest << "\n";
     return 0;
 }

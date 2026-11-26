@@ -146,6 +146,16 @@ class SQLiteCompanionStore:
             ).fetchall()
             return [self._row_to_record(r) for r in rows]
 
+    def is_record_protected(self, player_id: str, memory_id: str) -> bool:
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT pinned_by_player, epistemic_source FROM memory_records WHERE player_id = ? AND memory_id = ?;",
+                (player_id, memory_id),
+            ).fetchone()
+            return bool(
+                existing and (existing["pinned_by_player"] == 1 or existing["epistemic_source"] == "player_edited")
+            )
+
     def upsert_preserving_pins(self, player_id: str, incoming: MemoryRecord) -> None:
         with self._lock:
             existing = self._conn.execute(

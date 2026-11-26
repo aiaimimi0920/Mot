@@ -570,3 +570,292 @@ func TestOutboundOriginNewestSubscriberPriorityAndEventStreamLRU(t *testing.T) {
 	default:
 	}
 }
+
+func TestConfirmationTimeoutQuietBackoffSustainedCancelCapRefreshAndNpcHandoff(t *testing.T) {
+	var mu sync.Mutex
+	nowMs := int64(200000)
+	advanceClock := func(delta int64) {
+		mu.Lock()
+		nowMs += delta
+		mu.Unlock()
+	}
+
+	p, err := store.NewPersistencePort("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := hub.DefaultConfig()
+	cfg.AutoApproveScope = true
+	cfg.MinSyncIntervalMs = 100
+	cfg.MaxIdleSleepIntervalMs = 800
+	cfg.ConfirmPromptTimeoutMs = 500
+	cfg.DefaultConfirmCooldownMs = 5000
+	cfg.SustainedStepTimeoutMs = 60
+	cfg.ClockNowMs = func() int64 {
+		mu.Lock()
+		defer mu.Unlock()
+		return nowMs
+	}
+
+	fo := &fakeOrigin{}
+	eng := hub.NewEngine(cfg, p, fo, nil, nil)
+
+	caps := []model.CapabilityEntry{
+		{
+			MethodID: "#01", Name: "warp_charge", Description: "Sustained warp charge",
+			PermittedActors: []string{"companion"},
+			ParamsSchema:    map[string]any{"type": "object"},
+			Sustained:       true, DefaultPolicy: "allow",
+		},
+		{
+			MethodID: "#04", Name: "flashlight", Description: "Toggle flashlight",
+			PermittedActors: []string{"companion"},
+			ParamsSchema:    map[string]any{"type": "object"},
+			DefaultPolicy:   "allow",
+		},
+		{
+			MethodID: "#05", Name: "buy_supply", Description: "Spend player gold",
+			PermittedActors: []string{"player"},
+			ParamsSchema:    map[string]any{"type": "object", "required": []any{"qty"}},
+			DefaultPolicy:   "allow",
+		},
+	}
+	capDigest, _ := jcs.DigestSHA256("g2a.cap.v1", caps)
+	if gErr := eng.HandleOriginCapabilities(model.OriginCapabilitiesPayload{
+		SlotID: "slot-wave14", RoleKind: "companion", BillingMode: "player_metered",
+		PlayerID: "player-A", CapabilityTableDigest: capDigest, Capabilities: caps, OriginExecuteURL: "mem://wave14",
+	}); gErr != nil {
+		t.Fatalf("capabilities: %v", gErr)
+	}
+	_ = eng.HandleOriginSync(model.OriginSyncFrame{
+		SlotID: "slot-wave14", Epoch: 1, Rev: 1, Mode: "full", SignificantEvent: true,
+		StateBrief: map[string]any{"tick": 1},
+		UpsertedMethods: []model.ActiveMethodGrant{
+			{MethodID: "#01", Actor: "companion", Readiness: "ready"},
+			{MethodID: "#04", Actor: "companion", Readiness: "ready"},
+			{MethodID: "#05", Actor: "player", Readiness: "ready"},
+		},
+	})
+	authRep, gErr := eng.HandleSessionAuthorize("0.0.1", "core-wave14", model.AuthorizeRequest{
+		SlotID:         "slot-wave14",
+		PlayerID:       "player-A",
+		RequestedScope: model.RequestedScopeSpec{AllowChat: true},
+	})
+	if gErr != nil {
+		t.Fatalf("authorize: %v", gErr)
+	}
+	evCh, unsub := eng.PushStream().Subscribe(authRep.SessionID, false)
+	defer unsub()
+
+	// 1. Strict ChatMessage & MethodCallQueue validation
+	if cErr := eng.HandleChatSend("core-wave14", authRep.SessionID, model.ChatMessage{
+		MessageID: "m-bad", Audience: "all_channels_invalid", Text: "hi",
+	}); cErr == nil || cErr.Code != model.ErrInvalidArguments {
+		t.Fatalf("expected invalid_arguments for bad chat audience, got %v", cErr)
+	}
+	if _, qErr := eng.HandleQueueSubmit("core-wave14", authRep.SessionID, model.MethodCallQueue{
+		QueueID: "Q-bad-trig", Epoch: 1, BasedOnRev: 1, Trigger: "auto_hack",
+		Steps: []model.QueueStep{{StepIndex: 0, MethodID: "#04", Actor: "companion"}},
+	}); qErr == nil || qErr.Code != model.ErrInvalidArguments {
+		t.Fatalf("expected invalid_arguments for bad trigger, got %v", qErr)
+	}
+
+	// 2. Unanswered confirmation prompt timeout -> cancelled + queue.declined + refusal cooldown (§5.2 Item 2)
+	proactiveSteps := []model.QueueStep{
+		{StepIndex: 0, MethodID: "#05", Actor: "player", Args: map[string]any{"qty": 10}},
+	}
+	_, holdErr := eng.HandleQueueSubmit("core-wave14", authRep.SessionID, model.MethodCallQueue{
+		QueueID: "Q-unanswered", Epoch: 1, BasedOnRev: 1, Trigger: "proactive",
+		IntentSummary: "Auto-buy 10 supply", Steps: proactiveSteps,
+	})
+	if holdErr == nil || holdErr.Code != model.ErrConfirmationRequired {
+		t.Fatalf("expected confirmation_required, got %v", holdErr)
+	}
+	advanceClock(600) // Exceeds ConfirmPromptTimeoutMs (500ms)
+
+	// Attempting to submit a new proactive queue with the same target fingerprint lazily reaps Q-unanswered into cooldown!
+	_, cdErr := eng.HandleQueueSubmit("core-wave14", authRep.SessionID, model.MethodCallQueue{
+		QueueID: "Q-repeat-spam", Epoch: 1, BasedOnRev: 1, Trigger: "proactive",
+		IntentSummary: "Spam prompt again", Steps: proactiveSteps,
+	})
+	if cdErr == nil || cdErr.Code != model.ErrResourceLimit || cdErr.CooldownMs == nil {
+		t.Fatalf("expected 429 resource_limit refusal cooldown after prompt timeout, got %v", cdErr)
+	}
+	qExpired, _ := eng.HandleQueueQuery("core-wave14", authRep.SessionID, "Q-unanswered")
+	if qExpired.QueueState != "cancelled" || *qExpired.StepReceipts[0].FailureReason != "confirmation_timed_out" {
+		t.Fatalf("expected Q-unanswered cancelled with confirmation_timed_out, got %+v", qExpired)
+	}
+	select {
+	case ev := <-evCh:
+		if ev.Event != "queue.declined" {
+			t.Fatalf("expected queue.declined push event on prompt timeout, got %s", ev.Event)
+		}
+	default:
+		t.Fatal("expected queue.declined event on push stream")
+	}
+
+	// 3. Quiet-period adaptive wakeup push: silent within backoff, wakes once elapsed (§3.4 & Pseudocode §3.3)
+	// Sync at +10ms (still < backoff) -> reset baseline with a significant sync first:
+	base1 := int64(1)
+	_ = eng.HandleOriginSync(model.OriginSyncFrame{
+		SlotID: "slot-wave14", Epoch: 1, Rev: 2, BaseRev: &base1, Mode: "delta", SignificantEvent: true,
+		StateBrief: map[string]any{"tick": 2},
+	})
+	<-evCh // Drain significant context.push
+
+	advanceClock(20) // 20ms < 100ms MinSyncIntervalMs -> quiet delta MUST NOT push!
+	base2 := int64(2)
+	_ = eng.HandleOriginSync(model.OriginSyncFrame{
+		SlotID: "slot-wave14", Epoch: 1, Rev: 3, BaseRev: &base2, Mode: "delta", SignificantEvent: false,
+		StateBrief: map[string]any{"tick": 3},
+	})
+	select {
+	case unexpected := <-evCh:
+		t.Fatalf("expected zero push during quiet window, got %+v", unexpected)
+	default:
+	}
+
+	advanceClock(200) // Now elapsed >= doubled backoff (200ms) -> quiet delta MUST emit throttled wakeup push!
+	base3 := int64(3)
+	_ = eng.HandleOriginSync(model.OriginSyncFrame{
+		SlotID: "slot-wave14", Epoch: 1, Rev: 4, BaseRev: &base3, Mode: "delta", SignificantEvent: false,
+		StateBrief: map[string]any{"tick": 4},
+	})
+	select {
+	case wakeEv := <-evCh:
+		if wakeEv.Event != "context.push" {
+			t.Fatalf("expected throttled context.push wakeup, got %s", wakeEv.Event)
+		}
+	default:
+		t.Fatal("expected throttled quiet-period context.push once IdleBackoffMs elapsed")
+	}
+
+	// 4. Sustained-step timeout MUST dispatch origin.execute(kind="cancel") to halt zombie Origin tasks
+	fo.handler = func(req model.OriginExecuteRequest) model.OriginExecuteReply {
+		if req.Kind == "invoke" && req.MethodID != nil && *req.MethodID == "#01" {
+			go func() {
+				time.Sleep(15 * time.Millisecond)
+				advanceClock(100) // Trigger SustainedStepTimeoutMs (60ms)
+			}()
+			return model.OriginExecuteReply{ExecutionID: req.ExecutionID, State: "executing"}
+		}
+		return model.OriginExecuteReply{ExecutionID: req.ExecutionID, State: "succeeded"}
+	}
+	base4 := int64(4)
+	_ = eng.HandleOriginSync(model.OriginSyncFrame{
+		SlotID: "slot-wave14", Epoch: 1, Rev: 5, BaseRev: &base4, Mode: "delta", SignificantEvent: true,
+		StateBrief: map[string]any{"tick": 5},
+	})
+	<-evCh
+	timedOutReceipt, gErr := eng.HandleQueueSubmit("core-wave14", authRep.SessionID, model.MethodCallQueue{
+		QueueID: "Q-sustained-timeout", Epoch: 1, BasedOnRev: 5, Trigger: "player_command",
+		Steps: []model.QueueStep{
+			{StepIndex: 0, MethodID: "#01", Actor: "companion", Args: map[string]any{}},
+			{StepIndex: 1, MethodID: "#04", Actor: "companion", Args: map[string]any{}},
+		},
+	})
+	if gErr != nil || timedOutReceipt.QueueState != "aborted" {
+		t.Fatalf("expected aborted receipt on sustained timeout, got %+v err=%v", timedOutReceipt, gErr)
+	}
+	if timedOutReceipt.StepReceipts[0].State != "failed" || timedOutReceipt.StepReceipts[1].State != "aborted" {
+		t.Fatalf("expected step 0 failed and step 1 aborted, got %+v", timedOutReceipt.StepReceipts)
+	}
+	sawOriginCancel := false
+	fo.mu.Lock()
+	for _, call := range fo.calls {
+		if call.Kind == "cancel" {
+			sawOriginCancel = true
+		}
+	}
+	fo.mu.Unlock()
+	if !sawOriginCancel {
+		t.Fatal("expected Hub to send origin.execute(kind='cancel') when sustained step timed out")
+	}
+
+	// 5. Dynamic mid-session capability update: narrows removed #04, updates digest, NEVER auto-grants new #99 (§3.3 & §4.1)
+	updatedCaps := []model.CapabilityEntry{
+		caps[0], // #01
+		caps[2], // #05
+		{
+			MethodID: "#99", Name: "admin_nuke", Description: "New unlocked capability not in frozen scope",
+			PermittedActors: []string{"companion"},
+			ParamsSchema:    map[string]any{"type": "object"},
+			DefaultPolicy:   "allow",
+		},
+	}
+	newCapDigest, _ := jcs.DigestSHA256("g2a.cap.v1", updatedCaps)
+	if gErr := eng.HandleOriginCapabilities(model.OriginCapabilitiesPayload{
+		SlotID: "slot-wave14", RoleKind: "companion", BillingMode: "player_metered",
+		PlayerID: "player-A", CapabilityTableDigest: newCapDigest, Capabilities: updatedCaps, OriginExecuteURL: "mem://wave14",
+	}); gErr != nil {
+		t.Fatalf("dynamic capabilities err: %v", gErr)
+	}
+	select {
+	case capEv := <-evCh:
+		if capEv.Event != "capabilities.updated" {
+			t.Fatalf("expected capabilities.updated event, got %s", capEv.Event)
+		}
+	default:
+		t.Fatal("expected capabilities.updated event on dynamic capability publish")
+	}
+	base5 := int64(5)
+	_ = eng.HandleOriginSync(model.OriginSyncFrame{
+		SlotID: "slot-wave14", Epoch: 1, Rev: 6, BaseRev: &base5, Mode: "delta", SignificantEvent: true,
+		StateBrief: map[string]any{"tick": 6},
+		UpsertedMethods: []model.ActiveMethodGrant{
+			{MethodID: "#99", Actor: "companion", Readiness: "ready"},
+		},
+	})
+	<-evCh
+	if _, escErr := eng.HandleQueueSubmit("core-wave14", authRep.SessionID, model.MethodCallQueue{
+		QueueID: "Q-escalate-99", Epoch: 1, BasedOnRev: 6, Trigger: "player_command",
+		Steps: []model.QueueStep{{StepIndex: 0, MethodID: "#99", Actor: "companion"}},
+	}); escErr == nil || escErr.Code != model.ErrPermissionDenied {
+		t.Fatalf("expected permission_denied on unapproved newly added #99 capability, got %v", escErr)
+	}
+
+	// 6. Multiplayer player_metered independent_npc privacy-isolated host handoff (§4.3)
+	npcCaps := []model.CapabilityEntry{
+		{
+			MethodID: "#10", Name: "command_boss", Description: "Boss move",
+			PermittedActors: []string{"npc_boss"},
+			ParamsSchema:    map[string]any{"type": "object"},
+			DefaultPolicy:   "allow",
+		},
+	}
+	npcDigest, _ := jcs.DigestSHA256("g2a.cap.v1", npcCaps)
+	_ = eng.HandleOriginCapabilities(model.OriginCapabilitiesPayload{
+		SlotID: "slot-npc-boss", RoleKind: "independent_npc", BillingMode: "player_metered",
+		PlayerID: "host-player-1", RoomID: "room-raid-1", CapabilityTableDigest: npcDigest,
+		Capabilities: npcCaps, OriginExecuteURL: "mem://npc",
+	})
+	_ = eng.HandleOriginSync(model.OriginSyncFrame{
+		SlotID: "slot-npc-boss", Epoch: 1, Rev: 1, Mode: "full", SignificantEvent: true,
+		StateBrief: map[string]any{"phase": 1},
+		UpsertedMethods: []model.ActiveMethodGrant{
+			{MethodID: "#10", Actor: "npc_boss", Readiness: "ready"},
+		},
+	})
+	npcAuth1, gErr := eng.HandleSessionAuthorize("0.0.1", "core-host-1", model.AuthorizeRequest{
+		SlotID: "slot-npc-boss", PlayerID: "host-player-1",
+	})
+	if gErr != nil {
+		t.Fatalf("npc host-1 authorize: %v", gErr)
+	}
+
+	// Handoff to teammate host-player-2 -> closes host-1 session immediately & rebinds slot to host-player-2!
+	if hErr := eng.HandleOriginPlayerEvent(model.OriginPlayerEvent{
+		SlotID: "slot-npc-boss", Kind: "host_handoff", NewPlayerID: "host-player-2",
+	}); hErr != nil {
+		t.Fatalf("host_handoff failed: %v", hErr)
+	}
+	if _, hbErr := eng.HandleSessionHeartbeat("core-host-1", npcAuth1.SessionID); hbErr == nil || hbErr.Code != model.ErrRevoked {
+		t.Fatalf("expected previous host session to be revoked after handoff, got %v", hbErr)
+	}
+	npcAuth2, gErr := eng.HandleSessionAuthorize("0.0.1", "core-host-2", model.AuthorizeRequest{
+		SlotID: "slot-npc-boss", PlayerID: "host-player-2",
+	})
+	if gErr != nil || npcAuth2.FrozenScope.PlayerID != "host-player-2" {
+		t.Fatalf("expected host-player-2 to authorize cleanly onto handed-off NPC slot, got %+v err=%v", npcAuth2, gErr)
+	}
+}

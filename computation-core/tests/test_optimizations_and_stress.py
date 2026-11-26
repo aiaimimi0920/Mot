@@ -809,6 +809,8 @@ class TestOptimizationsAndStress(unittest.TestCase):
 
                 self.assertLess(elapsed, 0.6)  # Single SQLite WAL transaction instead of 202 fsync commits!
                 self.assertEqual(len(receipt.record_statuses), 200)
+                self.assertEqual(receipt.record_statuses["mem-005"], "rejected")  # Protected pinned record!
+                self.assertEqual(receipt.record_statuses["mem-199"], "transformed")
                 self.assertEqual(receipt.applied_settings, ["tone"])
                 self.assertEqual(receipt.unsupported_settings, ["unsupported_vendor_knob"])
 
@@ -860,6 +862,228 @@ class TestOptimizationsAndStress(unittest.TestCase):
             unity_src = fu.read()
         self.assertIn("G2ASpatialInteractable.ActiveInstances", unity_src)
         self.assertNotIn("FindObjectsByType", unity_src)
+
+    def test_live_capabilities_refresh_pull_backoff_llm_schema_and_npc_handoff(self) -> None:
+        from g2a_core.llm_planner import OpenAICompatibleLLMPlanner
+        from g2a_core.memory import InMemoryCompanionStore, MemoryBundleV1, MemoryService
+        from g2a_core.schemas import ActiveMethodGrant as CoreGrant, CapabilityEntry as CoreCap, ProjectedContext
+        from g2a_origin import (
+            ActiveMethodGrant as OrigGrant,
+            CapabilityEntry as OrigCap,
+            ImmediateSucceeded,
+            LoopbackHTTPTransportClient,
+            OriginSDK,
+        )
+
+        # 1. Verify MemoryService truthful "rejected" status & InMemoryCompanionStore full CRUD parity
+        mem_in = InMemoryCompanionStore()
+        mem_in.upsert_player_record(
+            "alice",
+            MemoryRecord(
+                memory_id="m-edit-1",
+                created_at_ms=10,
+                epistemic_source="player_stated",
+                pinned_by_player=False,
+                max_disclosure_scope="same_game_companion",
+                content="Original note",
+            ),
+        )
+        self.assertTrue(mem_in.edit_player_record("alice", "m-edit-1", "Player edited sacred note"))
+        self.assertTrue(mem_in.set_pinned("alice", "m-edit-1", True))
+        self.assertEqual(len(mem_in.list_records("alice")), 1)
+
+        bundle = MemoryBundleV1(
+            exported_at_ms=999,
+            persona_settings={"tone": "warm"},
+            autonomy_preferences={"#05": "confirm", "#99": "auto_spend_illegal"},
+            records=[
+                MemoryRecord("m-edit-1", 20, "agent_summary", False, "same_game_companion", "Attempt overwrite"),
+                MemoryRecord("m-bad-src", 21, "forged_source", False, "same_game_companion", "Forged"),
+                MemoryRecord("m-blank", 22, "player_stated", False, "same_game_companion", "   "),
+                MemoryRecord("m-good", 23, "player_stated", False, "cross_game_companion", "Valid cross-game memory"),
+            ],
+        )
+        svc = MemoryService(mem_in, platform_ceiling="same_game_companion")
+        imp = svc.import_bundle("alice", bundle, ["m-edit-1", "m-bad-src", "m-blank", "m-good"])
+        self.assertEqual(imp.record_statuses["m-edit-1"], "rejected")
+        self.assertEqual(imp.record_statuses["m-bad-src"], "rejected")
+        self.assertEqual(imp.record_statuses["m-blank"], "rejected")
+        self.assertEqual(imp.record_statuses["m-good"], "transformed")
+        self.assertIn("autonomy:#99", imp.unsupported_settings)
+        self.assertEqual(mem_in._autonomy["alice"], {"#05": "confirm"})
+
+        # 2. Verify OpenAICompatibleLLMPlanner recursive array/string/nested-object firewall
+        cap_recipe = CoreCap(
+            method_id="#08",
+            name="brew_potion",
+            description="Brew potion at cauldron coord",
+            permitted_actors=["companion"],
+            params_schema={
+                "type": "object",
+                "required": ["code", "herbs", "cell"],
+                "additionalProperties": False,
+                "properties": {
+                    "code": {"type": "string", "minLength": 4, "maxLength": 6},
+                    "herbs": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 2,
+                        "items": {"type": "string", "enum": ["sage", "mint"]},
+                    },
+                    "cell": {
+                        "type": "object",
+                        "required": ["x", "y"],
+                        "additionalProperties": False,
+                        "properties": {
+                            "x": {"type": "integer", "minimum": 0, "maximum": 7},
+                            "y": {"type": "integer", "minimum": 0, "maximum": 7},
+                        },
+                    },
+                },
+            },
+        )
+        ctx_brew = ProjectedContext(
+            slot_id="s-brew",
+            epoch=1,
+            rev=1,
+            capability_table_digest="sha256:aa",
+            state_brief={},
+            active_methods=[CoreGrant("#08", "companion", "ready", [])],
+        )
+        bad_llm_array = {
+            "intent_summary": "Inject poison",
+            "steps": [{"method_id": "#08", "actor": "companion", "args": {"code": "1234", "herbs": ["nightshade"], "cell": {"x": 1, "y": 2}}}],
+        }
+        self.assertEqual(OpenAICompatibleLLMPlanner._sanitize_llm_plan(bad_llm_array, {"#08": cap_recipe}, ctx_brew).planned_steps, [])
+
+        ok_llm = {
+            "intent_summary": "Brew mint",
+            "steps": [{"method_id": "#08", "actor": "companion", "args": {"code": "1234", "herbs": ["mint", "sage"], "cell": {"x": 2, "y": 5}}}],
+        }
+        self.assertEqual(len(OpenAICompatibleLLMPlanner._sanitize_llm_plan(ok_llm, {"#08": cap_recipe}, ctx_brew).planned_steps), 1)
+
+        # 3. Live Hub + OriginSDK + CoreSDK E2E: pull_context_if_due shield, dynamic capabilities.updated, & NPC host_handoff
+        hub_bin = resolve_hub_binary(ROOT_DIR)
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_path = os.path.join(tmp, "w14_ledger.json")
+            runtime_path = os.path.join(tmp, "w14_runtime.json")
+            hub_proc = subprocess.Popen(
+                [
+                    hub_bin,
+                    "-origin-addr", "127.0.0.1:0",
+                    "-core-addr", "127.0.0.1:0",
+                    "-consent-addr", "127.0.0.1:0",
+                    "-ledger", ledger_path,
+                    "-runtime-file", runtime_path,
+                    "-auto-approve-scope",
+                    "-print-ports-json",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert hub_proc.stdout is not None
+                ports = json.loads(hub_proc.stdout.readline().strip())
+                origin_url = f"http://{ports['origin_addr']}"
+                core_url = ports["core_url"]
+
+                tx_comp = LoopbackHTTPTransportClient(origin_url)
+                comp_orig = OriginSDK(slot_id="slot-dyn-cap", hub_transport=tx_comp, player_id="p-1")
+                comp_orig.start_loopback_execute_listener()
+                comp_orig.bind_actor_subject("companion", {})
+                comp_orig.register_capability(
+                    OrigCap("#01", "scan", "Scan room", ["companion"], {"type": "object"}),
+                    effect_handler=lambda a, s, args, t: ImmediateSucceeded({"scanned": True}),
+                )
+                comp_orig.bind_state_module(
+                    "room", lambda: {"light": "dim"}, lambda: [OrigGrant("#01", "companion", "ready", [])]
+                )
+                comp_orig.publish_capabilities_and_baseline()
+
+                core_comp = CoreSDK(planner=_NoOpPlanner(), allow_loopback=True)
+                try:
+                    core_comp.connect(core_url, "core-dyn-1", "slot-dyn-cap", player_id="p-1")
+                    old_digest = core_comp.slot_digest_index["slot-dyn-cap"]
+
+                    # First pull succeeds; immediate back-to-back pull_context_if_due during backoff returns None cleanly!
+                    p1 = core_comp.pull_context_if_due()
+                    self.assertIsNotNone(p1)
+                    # Trigger several non-significant delta syncs to raise IdleBackoffMs, then verify shield avoids 429 crash
+                    for step_i in range(4):
+                        comp_orig.bind_state_module(
+                            "room", lambda v=step_i: {"light": f"step-{v}"}, lambda: [OrigGrant("#01", "companion", "ready", [])]
+                        )
+                        comp_orig.flush_dirty_sync(significant_event=False)
+                    _ = core_comp.pull_context_if_due()
+                    shielded = core_comp.pull_context_if_due()
+                    self.assertIsNone(shielded)
+                    self.assertGreater(core_comp.next_allowed_pull_ms, 0)
+
+                    # Mid-session chapter unlock registers #02 -> Hub pushes capabilities.updated -> CoreSDK refreshes cache!
+                    comp_orig.register_capability(
+                        OrigCap("#02", "unlock_rune", "New chapter capability", ["companion"], {"type": "object"}),
+                        effect_handler=lambda a, s, args, t: ImmediateSucceeded({}),
+                    )
+                    comp_orig.publish_capabilities_and_baseline()
+
+                    deadline = time.time() + 2.0
+                    while time.time() < deadline and core_comp.slot_digest_index.get("slot-dyn-cap") == old_digest:
+                        time.sleep(0.02)
+                    new_digest = core_comp.slot_digest_index["slot-dyn-cap"]
+                    self.assertNotEqual(new_digest, old_digest)
+                    self.assertEqual(len(core_comp.capability_cache[new_digest]), 2)
+                finally:
+                    core_comp.shutdown_session_cleanly(notify_hub=True)
+                    comp_orig.stop_loopback_execute_listener()
+
+                # Live player_metered independent_npc host handoff from host-1 to host-2
+                tx_npc = LoopbackHTTPTransportClient(origin_url)
+                npc_orig = OriginSDK(
+                    slot_id="slot-raid-boss",
+                    hub_transport=tx_npc,
+                    slot_role_kind="independent_npc",
+                    billing_mode="player_metered",
+                    player_id="host-1",
+                    room_id="raid-room-7",
+                )
+                npc_orig.start_loopback_execute_listener()
+                npc_orig.bind_actor_subject("boss", {})
+                npc_orig.register_capability(
+                    OrigCap("#10", "roar", "Boss roar", ["boss"], {"type": "object"}),
+                    effect_handler=lambda a, s, args, t: ImmediateSucceeded({"roared": True}),
+                )
+                npc_orig.bind_state_module(
+                    "boss_ai", lambda: {"rage": 50}, lambda: [OrigGrant("#10", "boss", "ready", [])]
+                )
+                npc_orig.publish_capabilities_and_baseline()
+
+                core_h1 = CoreSDK(planner=_NoOpPlanner(), allow_loopback=True)
+                core_h2 = CoreSDK(planner=_NoOpPlanner(), allow_loopback=True)
+                try:
+                    core_h1.connect(core_url, "core-host-1", "slot-raid-boss", player_id="host-1")
+                    self.assertFalse(core_h1.closed)
+
+                    # Host-1 hands off metered NPC slot to teammate host-2
+                    npc_orig.report_npc_host_handoff("host-2")
+                    deadline = time.time() + 2.0
+                    while time.time() < deadline and not core_h1.closed:
+                        time.sleep(0.02)
+                    self.assertTrue(core_h1.closed)
+
+                    scope_h2 = core_h2.connect(core_url, "core-host-2", "slot-raid-boss", player_id="host-2")
+                    self.assertEqual(scope_h2.player_id, "host-2")
+                finally:
+                    core_h1.shutdown_session_cleanly(notify_hub=False)
+                    core_h2.shutdown_session_cleanly(notify_hub=True)
+                    npc_orig.stop_loopback_execute_listener()
+            finally:
+                hub_proc.terminate()
+                hub_proc.wait(timeout=3)
+                if hub_proc.stdout:
+                    hub_proc.stdout.close()
+                if hub_proc.stderr:
+                    hub_proc.stderr.close()
 
 
 if __name__ == "__main__":

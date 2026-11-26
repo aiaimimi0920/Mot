@@ -9,6 +9,9 @@ DISCLOSURE_ORDER = {
     "same_game_companion": 1,
     "cross_game_companion": 2,
 }
+VALID_EPISTEMIC_SOURCES = {"game_observed", "player_stated", "agent_summary", "player_edited"}
+VALID_POLICY_MODES = {"allow", "confirm", "prohibit"}
+MAX_MEMORY_CONTENT_CHARS = 16384
 
 
 def min_disclosure(scope_a: str, scope_b: str) -> str:
@@ -163,6 +166,30 @@ class InMemoryCompanionStore:
     def upsert_player_record(self, player_id: str, rec: MemoryRecord) -> None:
         self._records.setdefault(player_id, {})[rec.memory_id] = rec
 
+    def edit_player_record(self, player_id: str, memory_id: str, new_content: str) -> bool:
+        bucket = self._records.get(player_id, {})
+        rec = bucket.get(memory_id)
+        if rec is None:
+            return False
+        rec.content = new_content
+        rec.epistemic_source = "player_edited"
+        return True
+
+    def set_pinned(self, player_id: str, memory_id: str, pinned: bool) -> bool:
+        bucket = self._records.get(player_id, {})
+        rec = bucket.get(memory_id)
+        if rec is None:
+            return False
+        rec.pinned_by_player = bool(pinned)
+        return True
+
+    def list_records(self, player_id: str) -> List[MemoryRecord]:
+        return sorted(self._records.get(player_id, {}).values(), key=lambda r: r.created_at_ms)
+
+    def is_record_protected(self, player_id: str, memory_id: str) -> bool:
+        existing = self._records.get(player_id, {}).get(memory_id)
+        return bool(existing and (existing.pinned_by_player or existing.epistemic_source == "player_edited"))
+
     def delete_player_record(self, player_id: str, memory_id: str) -> bool:
         return self._records.get(player_id, {}).pop(memory_id, None) is not None
 
@@ -222,8 +249,22 @@ class MemoryService:
         statuses: Dict[str, str] = {}
         staged_records: List[MemoryRecord] = []
         now_ms = int(time.time() * 1000)
+        is_protected_fn = getattr(self.store, "is_record_protected", None)
         for rec in bundle.records:
             if rec.memory_id not in selected:
+                continue
+            if (
+                rec.epistemic_source not in VALID_EPISTEMIC_SOURCES
+                or rec.max_disclosure_scope not in DISCLOSURE_ORDER
+                or not isinstance(rec.content, str)
+                or not rec.content.strip()
+                or len(rec.content) > MAX_MEMORY_CONTENT_CHARS
+            ):
+                statuses[rec.memory_id] = "rejected"
+                continue
+            if callable(is_protected_fn) and is_protected_fn(verified_player_id, rec.memory_id):
+                # Never overwrite a locally pinned or player-edited record, and report truthful "rejected" status (§7.2)!
+                statuses[rec.memory_id] = "rejected"
                 continue
             narrowed_scope = min_disclosure(rec.max_disclosure_scope, self.platform_ceiling)
             transformed = narrowed_scope != rec.max_disclosure_scope
@@ -253,14 +294,21 @@ class MemoryService:
             else:
                 unsupported.append(k)
 
+        applied_autonomy: Dict[str, str] = {}
+        for ak, av in bundle.autonomy_preferences.items():
+            if av in VALID_POLICY_MODES:
+                applied_autonomy[ak] = av
+            else:
+                unsupported.append(f"autonomy:{ak}")
+
         batch_fn = getattr(self.store, "batch_import_records_and_settings", None)
         if callable(batch_fn):
-            batch_fn(verified_player_id, staged_records, applied_persona, dict(bundle.autonomy_preferences))
+            batch_fn(verified_player_id, staged_records, applied_persona, applied_autonomy)
         else:
             for imp_rec in staged_records:
                 self.store.upsert_preserving_pins(verified_player_id, imp_rec)
             self.store._persona.setdefault(verified_player_id, {}).update(applied_persona)
-            self.store._autonomy.setdefault(verified_player_id, {}).update(bundle.autonomy_preferences)
+            self.store._autonomy.setdefault(verified_player_id, {}).update(applied_autonomy)
         return ImportReceiptV1(
             record_statuses=statuses,
             applied_settings=applied,

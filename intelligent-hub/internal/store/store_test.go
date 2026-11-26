@@ -257,3 +257,86 @@ func BenchmarkActiveSessionsForSlot500Closed(b *testing.B) {
 		}
 	}
 }
+
+func TestRecursiveValidateArgsAgainstSchema(t *testing.T) {
+	schema := map[string]any{
+		"type":                 "object",
+		"required":             []any{"passcode", "ratio", "ingredients", "grid_pos"},
+		"additionalProperties": false,
+		"properties": map[string]any{
+			"passcode": map[string]any{
+				"type":      "string",
+				"minLength": 4,
+				"maxLength": 8,
+			},
+			"ratio": map[string]any{
+				"type":             "number",
+				"exclusiveMinimum": 0.0,
+				"maximum":          1.0,
+			},
+			"ingredients": map[string]any{
+				"type":     "array",
+				"minItems": 1,
+				"maxItems": 3,
+				"items": map[string]any{
+					"type": "string",
+					"enum": []any{"herb", "crystal", "water"},
+				},
+			},
+			"grid_pos": map[string]any{
+				"type":                 "object",
+				"required":             []any{"x", "y"},
+				"additionalProperties": false,
+				"properties": map[string]any{
+					"x": map[string]any{"type": "integer", "minimum": 0, "maximum": 15},
+					"y": map[string]any{"type": "integer", "minimum": 0, "maximum": 15},
+				},
+			},
+		},
+	}
+
+	valid := map[string]any{
+		"passcode":    "7391",
+		"ratio":       0.5,
+		"ingredients": []any{"herb", "water"},
+		"grid_pos":    map[string]any{"x": 3, "y": 12},
+	}
+	if err := store.ValidateArgsAgainstSchema(valid, schema); err != nil {
+		t.Fatalf("expected valid composite args to pass, got %v", err)
+	}
+
+	invalidCases := []struct {
+		name string
+		args map[string]any
+	}{
+		{
+			name: "passcode too short",
+			args: map[string]any{"passcode": "12", "ratio": 0.5, "ingredients": []any{"herb"}, "grid_pos": map[string]any{"x": 1, "y": 1}},
+		},
+		{
+			name: "ratio not above exclusiveMinimum",
+			args: map[string]any{"passcode": "1234", "ratio": 0.0, "ingredients": []any{"herb"}, "grid_pos": map[string]any{"x": 1, "y": 1}},
+		},
+		{
+			name: "array item outside enum",
+			args: map[string]any{"passcode": "1234", "ratio": 0.5, "ingredients": []any{"herb", "poison_injected"}, "grid_pos": map[string]any{"x": 1, "y": 1}},
+		},
+		{
+			name: "array exceeds maxItems",
+			args: map[string]any{"passcode": "1234", "ratio": 0.5, "ingredients": []any{"herb", "water", "crystal", "herb"}, "grid_pos": map[string]any{"x": 1, "y": 1}},
+		},
+		{
+			name: "nested object out-of-bounds coordinate",
+			args: map[string]any{"passcode": "1234", "ratio": 0.5, "ingredients": []any{"herb"}, "grid_pos": map[string]any{"x": 99, "y": 1}},
+		},
+		{
+			name: "nested object unexpected property",
+			args: map[string]any{"passcode": "1234", "ratio": 0.5, "ingredients": []any{"herb"}, "grid_pos": map[string]any{"x": 1, "y": 1, "z": 2}},
+		},
+	}
+	for _, tc := range invalidCases {
+		if err := store.ValidateArgsAgainstSchema(tc.args, schema); err == nil || err.Code != model.ErrInvalidArguments {
+			t.Fatalf("case %q expected invalid_arguments, got %v", tc.name, err)
+		}
+	}
+}

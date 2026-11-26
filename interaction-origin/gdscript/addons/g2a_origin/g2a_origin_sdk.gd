@@ -168,6 +168,22 @@ func report_queue_approval(session_id: String, queue_id: String, queue_digest: S
 		"approved": approved,
 	})
 
+func report_npc_host_handoff(new_player_id: String) -> void:
+	if slot_role_kind != "independent_npc" or billing_mode != "player_metered":
+		push_error("G2A: report_npc_host_handoff requires player_metered independent_npc slot")
+		return
+	var cleaned := new_player_id.strip_edges()
+	if cleaned == "":
+		return
+	for exec_id in _in_flight_steps.keys():
+		cancel_in_flight_step(exec_id)
+	sync_enabled = true
+	_post_to_hub("origin.player_event", {
+		"slot_id": slot_id,
+		"kind": "host_handoff",
+		"new_player_id": cleaned,
+	})
+
 func flush_dirty_sync(significant_event: bool = false) -> bool:
 	if not sync_enabled and _pending_settled.is_empty():
 		return false
@@ -276,8 +292,13 @@ func handle_origin_execute(req: Dictionary) -> Dictionary:
 	var permitted: Array = reg["def"].get("permitted_actors", [])
 	if not permitted.has(actor):
 		return {"execution_id": exec_id, "state": "failed", "failure_reason": "permission_denied"}
+	var step_args: Dictionary = req.get("args", {})
+	var schema: Dictionary = reg["def"].get("params_schema", {})
+	for req_key in schema.get("required", []):
+		if not step_args.has(req_key):
+			return {"execution_id": exec_id, "state": "failed", "failure_reason": "missing_required_arg:" + str(req_key)}
 
-	var outcome: Dictionary = reg["effect_handler"].call(actor, _actors[actor], req.get("args", {}), exec_id)
+	var outcome: Dictionary = reg["effect_handler"].call(actor, _actors[actor], step_args, exec_id)
 	var state: String = outcome.get("state", "succeeded")
 	if state == "executing":
 		_in_flight_steps[exec_id] = outcome.get("cancel_fn", Callable())

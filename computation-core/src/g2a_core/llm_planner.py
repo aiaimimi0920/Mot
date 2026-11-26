@@ -231,6 +231,86 @@ class OpenAICompatibleLLMPlanner:
         return s
 
     @staticmethod
+    def _validate_schema_value(val: Any, spec: Dict[str, Any], depth: int = 0) -> bool:
+        if depth > 16:
+            return False
+        ptype = spec.get("type")
+        if ptype == "string":
+            if not isinstance(val, str):
+                return False
+            if "minLength" in spec and len(val) < int(spec["minLength"]):
+                return False
+            if "maxLength" in spec and len(val) > int(spec["maxLength"]):
+                return False
+            enums = spec.get("enum")
+            if isinstance(enums, list) and val not in enums:
+                return False
+        elif ptype == "boolean":
+            if not isinstance(val, bool):
+                return False
+        elif ptype == "integer":
+            if isinstance(val, bool) or not isinstance(val, int):
+                return False
+            if "minimum" in spec and val < spec["minimum"]:
+                return False
+            if "maximum" in spec and val > spec["maximum"]:
+                return False
+            if "exclusiveMinimum" in spec and val <= spec["exclusiveMinimum"]:
+                return False
+            if "exclusiveMaximum" in spec and val >= spec["exclusiveMaximum"]:
+                return False
+        elif ptype == "number":
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(float(val)):
+                return False
+            fval = float(val)
+            if "minimum" in spec and fval < float(spec["minimum"]):
+                return False
+            if "maximum" in spec and fval > float(spec["maximum"]):
+                return False
+            if "exclusiveMinimum" in spec and fval <= float(spec["exclusiveMinimum"]):
+                return False
+            if "exclusiveMaximum" in spec and fval >= float(spec["exclusiveMaximum"]):
+                return False
+        elif ptype == "array":
+            if not isinstance(val, list):
+                return False
+            if "minItems" in spec and len(val) < int(spec["minItems"]):
+                return False
+            if "maxItems" in spec and len(val) > int(spec["maxItems"]):
+                return False
+            item_spec = spec.get("items")
+            if isinstance(item_spec, dict):
+                for elem in val:
+                    if not OpenAICompatibleLLMPlanner._validate_schema_value(elem, item_spec, depth + 1):
+                        return False
+        elif ptype == "object":
+            if not isinstance(val, dict):
+                return False
+            if not OpenAICompatibleLLMPlanner._validate_object_schema(val, spec, depth + 1):
+                return False
+        return True
+
+    @staticmethod
+    def _validate_object_schema(args: Dict[str, Any], schema: Dict[str, Any], depth: int = 0) -> bool:
+        if depth > 16:
+            return False
+        for req_field in schema.get("required", []):
+            if req_field not in args:
+                return False
+        props = schema.get("properties")
+        if isinstance(props, dict):
+            if schema.get("additionalProperties") is False:
+                for arg_k in args:
+                    if arg_k not in props:
+                        return False
+            for arg_k, arg_v in args.items():
+                prop_spec = props.get(arg_k)
+                if isinstance(prop_spec, dict):
+                    if not OpenAICompatibleLLMPlanner._validate_schema_value(arg_v, prop_spec, depth + 1):
+                        return False
+        return True
+
+    @staticmethod
     def _sanitize_llm_plan(
         raw_plan: Dict[str, Any],
         cap_by_id: Dict[str, CapabilityEntry],
@@ -259,48 +339,8 @@ class OpenAICompatibleLLMPlanner:
                     # Drop entire tainted queue if LLM attempted an unauthorized/injected method or actor!
                     return PlanDecision()
 
-                for req_field in cap.params_schema.get("required", []):
-                    if req_field not in args:
-                        return PlanDecision()
-
-                props = cap.params_schema.get("properties")
-                if isinstance(props, dict):
-                    if cap.params_schema.get("additionalProperties") is False:
-                        for arg_k in args:
-                            if arg_k not in props:
-                                return PlanDecision()
-                    for arg_k, arg_v in args.items():
-                        prop_spec = props.get(arg_k)
-                        if not isinstance(prop_spec, dict):
-                            continue
-                        ptype = prop_spec.get("type")
-                        if ptype == "string":
-                            if not isinstance(arg_v, str):
-                                return PlanDecision()
-                            enums = prop_spec.get("enum")
-                            if isinstance(enums, list) and arg_v not in enums:
-                                return PlanDecision()
-                        elif ptype == "boolean":
-                            if not isinstance(arg_v, bool):
-                                return PlanDecision()
-                        elif ptype == "integer":
-                            if isinstance(arg_v, bool) or not isinstance(arg_v, int):
-                                return PlanDecision()
-                            if "minimum" in prop_spec and arg_v < prop_spec["minimum"]:
-                                return PlanDecision()
-                            if "maximum" in prop_spec and arg_v > prop_spec["maximum"]:
-                                return PlanDecision()
-                        elif ptype == "number":
-                            if isinstance(arg_v, bool) or not isinstance(arg_v, (int, float)) or not math.isfinite(float(arg_v)):
-                                return PlanDecision()
-                            if "minimum" in prop_spec and float(arg_v) < float(prop_spec["minimum"]):
-                                return PlanDecision()
-                            if "maximum" in prop_spec and float(arg_v) > float(prop_spec["maximum"]):
-                                return PlanDecision()
-                        elif ptype == "array" and not isinstance(arg_v, list):
-                            return PlanDecision()
-                        elif ptype == "object" and not isinstance(arg_v, dict):
-                            return PlanDecision()
+                if not OpenAICompatibleLLMPlanner._validate_object_schema(args, cap.params_schema):
+                    return PlanDecision()
 
                 step_readiness = grant.readiness
                 if grant.targets and "target_id" in args:

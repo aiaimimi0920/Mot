@@ -18,6 +18,11 @@
 
 #include "jcs.hpp"
 
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
+
 namespace g2a {
 
 struct CapabilityEntry {
@@ -238,7 +243,10 @@ public:
         }
         for (const auto& [key, _] : last_sent_methods_) {
             if (cur_canon.find(key) == cur_canon.end()) {
-                removed.push_back(JsonObject{{"method_id", key.first}, {"actor", key.second}});
+                JsonObject rem_entry;
+                rem_entry.emplace("method_id", key.first);
+                rem_entry.emplace("actor", key.second);
+                removed.emplace_back(std::move(rem_entry));
             }
         }
 
@@ -319,6 +327,18 @@ public:
         const auto& allowed = cap_it->second.def.permitted_actors;
         if (std::find(allowed.begin(), allowed.end(), *req.actor) == allowed.end()) {
             return {req.execution_id, "failed", std::nullopt, "permission_denied"};
+        }
+        auto req_it = cap_it->second.def.params_schema.find("required");
+        if (req_it != cap_it->second.def.params_schema.end()) {
+            if (const auto* req_arr = std::get_if<JsonArray>(&req_it->second.data)) {
+                for (const auto& item : *req_arr) {
+                    if (const auto* key_str = std::get_if<std::string>(&item.data)) {
+                        if (req.args.find(*key_str) == req.args.end()) {
+                            return {req.execution_id, "failed", std::nullopt, "missing_required_arg:" + *key_str};
+                        }
+                    }
+                }
+            }
         }
 
         EffectOutcome out = cap_it->second.handler(*req.actor, req.args, req.execution_id);
@@ -426,6 +446,24 @@ public:
             {"queue_digest", queue_digest},
             {"fingerprint", fingerprint},
             {"approved", approved},
+        });
+    }
+
+    void report_npc_host_handoff(const std::string& new_player_id) {
+        std::lock_guard<std::recursive_mutex> lk(mu_);
+        if (role_kind_ != "independent_npc" || billing_mode_ != "player_metered") {
+            throw std::logic_error("host_handoff is only permitted on player_metered independent_npc slots");
+        }
+        if (new_player_id.empty()) {
+            throw std::invalid_argument("new_player_id is required");
+        }
+        cancel_all_in_flight("npc_host_handoff");
+        sync_enabled_ = true;
+        flush_dirty_sync(false);
+        transport_("origin.player_event", JsonObject{
+            {"slot_id", slot_id_},
+            {"kind", "host_handoff"},
+            {"new_player_id", new_player_id},
         });
     }
 
@@ -601,3 +639,7 @@ private:
 };
 
 } // namespace g2a
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
