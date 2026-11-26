@@ -5,13 +5,28 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "g2a-computation-core"
 version = "0.0.1"
-description = "G2A V0.0.1 Computation Core SDK and standalone agent runtime"
+description = "Zero-dependency G2A V0.0.1 Computation Core SDK, LLM structural firewall, NAT cloud relay, and SQLite portable companion memory"
 readme = "README.md"
+license = { text = "LGPL-3.0-only" }
 requires-python = ">=3.11"
 dependencies = []
+keywords = ["g2a", "ai-agent", "game-companion", "computation-core", "jcs"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/aiaimimi0920/Mot"
+Repository = "https://github.com/aiaimimi0920/Mot.git"
 
 [project.scripts]
 g2a-core = "g2a_core.cli:main"
+
+[tool.setuptools.package-data]
+g2a_core = ["py.typed"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

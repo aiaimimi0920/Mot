@@ -8,7 +8,7 @@ namespace G2A.ComputationCore;
 
 /// <summary>
 /// Tier 3 Computation Core SDK for .NET 8 / C# AI Agents (G2A V0.0.1).
-/// Supports capability-digest caching, ClientWebSocket & SSE event streams with Last-Event-ID cursor replay,
+/// Supports capability-digest caching, ClientWebSocket &amp; SSE event streams with Last-Event-ID cursor replay,
 /// proactive refusal cooldown shield, early-push confirmation race safety, stale_context replanning,
 /// and mandatory 504 outcome_unknown -> queue.query reconciliation.
 /// </summary>

@@ -4,7 +4,7 @@ using System.Net.Sockets;
 namespace G2A.ComputationCore;
 
 /// <summary>
-/// Enforces G2A Section 7.1 Outbound SSRF & TLS 1.3 transport policy for Computation Core endpoints.
+/// Enforces G2A Section 7.1 Outbound SSRF &amp; TLS 1.3 transport policy for Computation Core endpoints.
 /// </summary>
 public static class SsrfGuard
 {

@@ -4,5 +4,23 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
+    <RootNamespace>G2A.ComputationCore</RootNamespace>
+    <AssemblyName>G2A.ComputationCore</AssemblyName>
+    <PackageId>G2A.ComputationCore</PackageId>
+    <Version>0.0.1</Version>
+    <Authors>G2A Reference Project</Authors>
+    <Description>Zero-dependency G2A V0.0.1 Computation Core SDK for .NET 8 AI Agents with WebSocket/SSE recovery, SSRF guard, portable memory, and LLM firewall.</Description>
+    <PackageLicenseExpression>LGPL-3.0-only</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/aiaimimi0920/Mot.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>g2a;ai-agent;companion;computation-core;jcs</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 </Project>

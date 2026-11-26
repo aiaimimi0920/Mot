@@ -5,6 +5,10 @@
   "type": "module",
   "main": "./esm/index.mjs",
   "types": "./esm/index.d.ts",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "exports": {
     ".": {
       "types": "./esm/index.d.ts",
@@ -12,9 +16,22 @@
     }
   },
   "files": [
+    "esm",
     "src",
-    "esm"
+    "README.md"
   ],
+  "keywords": [
+    "g2a",
+    "ai-agent",
+    "companion",
+    "computation-core",
+    "jcs"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aiaimimi0920/Mot.git",
+    "directory": "computation-core/typescript"
+  },
   "scripts": {
     "test": "node ./tests/self_test.mjs"
   },

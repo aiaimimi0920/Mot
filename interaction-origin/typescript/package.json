@@ -5,6 +5,10 @@
   "type": "module",
   "main": "./esm/index.mjs",
   "types": "./esm/index.d.ts",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "exports": {
     ".": {
       "types": "./esm/index.d.ts",
@@ -12,9 +16,25 @@
     }
   },
   "files": [
+    "esm",
     "src",
-    "esm"
+    "web_demo",
+    "README.md"
   ],
+  "keywords": [
+    "g2a",
+    "game-ai",
+    "companion",
+    "npc",
+    "interaction-origin",
+    "webgl",
+    "tauri"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aiaimimi0920/Mot.git",
+    "directory": "interaction-origin/typescript"
+  },
   "scripts": {
     "test": "node ./tests/self_test.mjs"
   },

@@ -2,8 +2,13 @@
 name = "g2a-origin"
 version = "0.0.1"
 edition = "2021"
+rust-version = "1.75"
 license = "Apache-2.0"
 description = "Zero-dependency Rust Interaction Origin SDK for G2A V0.0.1 (Bevy, Fyrox, Tauri, and custom Rust game hosts)"
+readme = "README.md"
+repository = "https://github.com/aiaimimi0920/Mot"
+keywords = ["g2a", "game-ai", "companion", "npc", "bevy"]
+categories = ["game-development", "network-programming"]
 
 [lib]
 name = "g2a_origin"

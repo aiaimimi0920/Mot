@@ -1,0 +1,7 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: g2a-origin
+Description: Zero-dependency C++17 Header-Only G2A V0.0.1 Interaction Origin SDK
+Version: @PROJECT_VERSION@
+Cflags: -I${includedir}
