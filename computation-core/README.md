@@ -1,34 +1,29 @@
 # Computation Core (`V0.0.1`)
 
-Standalone G2A `V0.0.1` **Computation Core** SDK, OpenAI/Ollama-compatible LLM cognitive planner with prompt-injection firewall, and SQLite portable companion memory manager in Python 3.11+ (zero mandatory third-party dependencies).
+Standalone G2A `V0.0.1` **Computation Core** polyglot SDK suite, OpenAI/Ollama-compatible LLM cognitive planner with prompt-injection firewall, NAT outbound cloud relay, and SQLite/portable companion memory manager.
 
-Implements Tier 3 of [G2A_SPECIFICATION.zh-CN.md](../G2A/docs/standard/G2A_SPECIFICATION.zh-CN.md) and Chapter 4 of [G2A_PSEUDOCODE_API.zh-CN.md](../G2A/docs/standard/G2A_PSEUDOCODE_API.zh-CN.md):
+Implements Tier 3 of [G2A_SPECIFICATION.zh-CN.md](../G2A/docs/standard/G2A_SPECIFICATION.zh-CN.md) and Chapter 4 of [G2A_PSEUDOCODE_API.zh-CN.md](../G2A/docs/standard/G2A_PSEUDOCODE_API.zh-CN.md) across **4 languages** with zero mandatory third-party dependencies:
 
-- **Outbound SSRF Guard & RFC 8785 (JCS) Digests:** `ssrf.py` & `jcs.py`.
-- **`CoreSDK` Client State Machine (`core_sdk.py`):** `session.authorize` with `cached_capability_digest` + multiplayer `player_id` / `faction_id`, background `session.heartbeat`, **SSE (`stream_mode="sse"`) & RFC 6455 WebSocket (`stream_mode="websocket"`, including TLS 1.3 `wss://`)** push stream consumers, two-tier `session.resume` (`actions_paused` enforcement), `409 confirmation_required` `queue_id` preservation, `409 stale_context` `fresh_context` replanning, and `504 outcome_unknown` mandatory `queue.query` reconciliation.
-- **TypeScript / Node / Deno / Browser `CoreSDK` (`typescript/` — `@g2a/computation-core`):** Zero-dependency ES2022 TypeScript SDK implementing WebCrypto JCS SHA-256 (`g2a.confirm.v1` / `g2a.capabilities.v1`), SSRF guard, SSE & WebSocket streams, `submitActionQueue` digest preservation, and `g2a.memory.bundle.v1` portability.
-- **Cloud NAT Relay & Cross-Vendor Memory HTTP Server (`relay_server.py`, `memory_server.py`):** Accepts outbound Hub NAT tunnels for cloud-hosted Cores and exposes standard HTTP `g2a.memory.bundle.v1` export/import endpoints.
-- **LLM Planner & Post-LLM Structural Firewall (`llm_planner.py`):** Connects to Ollama / OpenAI / vLLM / Gemini OpenAI-compatible `/v1/chat/completions`, isolates untrusted game text inside `<UNTRUSTED_GAME_DATA>`, and drops any hallucinated or injected step outside active grants before `queue.submit`.
-- **SQLite Durable Companion Memory & Open Portability (`sqlite_memory.py`, `memory.py`):** ACID WAL SQLite store supporting player `list / add / edit / pin / unpin / delete / export / import`, `g2a.memory.bundle.v1` unrestricted export, conservative disclosure narrowing on import, and save-reload anti-spoiler guards.
+- **Python 3.11+ Core Runtime & SDK (`src/g2a_core/`):**
+  - `CoreSDK` (`core_sdk.py`), SSRF guard (`ssrf.py`), C-accelerated RFC 8785 JCS (`jcs.py`), `pull_context_if_due()`, SSE & RFC 6455 WebSocket (`wss://` TLS 1.3) consumers with `Last-Event-ID` cursor replay, early-push confirmation race protection, `409` / `504` standard recovery, NAT `CloudRelayServer` (`relay_server.py`), `OpenAICompatibleLLMPlanner` (`llm_planner.py`), and ACID WAL `SQLiteCompanionStore` + `MemoryHTTPServer` (`sqlite_memory.py`, `memory_server.py`).
+- **TypeScript / Node 20+ / Deno / Bun / Browser SDK (`typescript/` — `@g2a/computation-core`):**
+  - Zero-build `esm/index.mjs` + TypeScript `src/index.ts` implementing WebCrypto JCS SHA-256, SSRF guard, Browser WebSocket + Node 20 native RFC 6455 WebSocket + universal `fetch` `ReadableStream` SSE consumer, `pullContextIfDue()`, `MemoryService` (`g2a.memory.bundle.v1`), and `OpenAICompatibleLLMPlanner` (`<UNTRUSTED_GAME_DATA>` firewall).
+- **Go 1.22+ Core SDK (`go/` — `github.com/aiaimimi0920/g2a-computation-core`):**
+  - High-concurrency zero-dependency Go `CoreSDK` (`core_sdk.go`), strict I-JSON + RFC 8785 UTF-16 JCS (`jcs.go`), `netip` SSRF guard (`ssrf.go`), SSE & RFC 6455 WebSocket consumers, `PullContextIfDue()`, `MemoryService` (`memory.go`), and `OpenAICompatibleLLMPlanner` (`llm_planner.go`).
+- **C# (.NET 8) Core SDK (`csharp/G2A.ComputationCore/`):**
+  - Zero-dependency .NET 8 `CoreSdk` (`ClientWebSocket` + SSE streaming with `Last-Event-ID` replay, `PullContextIfDueAsync()`, `SubmitQueueWithRecoveryAsync()`), `JcsDigest`, `SsrfGuard`, `MemoryService` (`g2a.memory.bundle.v1`), and `OpenAICompatibleLlmPlanner`.
 
 ## Test & CLI Usage
 
 ```sh
+# Python E2E, 14-error conformance, NAT relay, & stress suite
 python -m unittest discover -s tests -v
 
-# One-command 3-tier full-stack CLI demo across all 5 canonical game genres via zero-config auto-discovery
-PYTHONPATH=src python -m g2a_core.cli demo --genre all
+# Go, C#, & TypeScript Node 20 Core SDK self-tests & live 3-tier E2E suites
+cd go && go test -v ./...
+dotnet run --project csharp/G2A.ComputationCore.SelfTest
+node typescript/tests/self_test.mjs
 
-# Launch live 3-application visual browser playground (HTML5 Game + Go Hub Dashboard + Core Console)
+# Launch live 3-application visual browser playground
 PYTHONPATH=src python -m g2a_core.cli playground
-
-# Verify all 14 normative G2A V0.0.1 error codes against a running Intelligent Hub
-PYTHONPATH=src python -m g2a_core.cli conformance
-
-# Connect via zero-config auto-discovery (--hub auto) with local Ollama / OpenAI LLM planner
-PYTHONPATH=src python -m g2a_core.cli run --hub auto --slot slot-spatial --planner llm --llm-url http://127.0.0.1:11434/v1 --llm-model qwen2.5:7b
-
-# Manage & export player-owned companion memories
-PYTHONPATH=src python -m g2a_core.cli memory add --db companion.db --content "Prefers stealth approach" --pin
-PYTHONPATH=src python -m g2a_core.cli memory export --db companion.db --file bundle.json
 ```

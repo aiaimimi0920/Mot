@@ -7,6 +7,137 @@ export const MAX_EXECUTION_LEDGER_ENTRIES = 512;
 export type PolicyMode = "allow" | "confirm" | "prohibit";
 export type Readiness = "ready" | "staged";
 
+export interface Pose3D {
+  x: number;
+  y: number;
+  z: number;
+  yaw_deg?: number;
+}
+
+export function formatPlayerDeicticAnchor(player: Pose3D, target: Pose3D, isPointed = false): string {
+  const dx = target.x - player.x;
+  const dy = target.y - player.y;
+  const dz = target.z - player.z;
+  const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  const distStr = `${dist.toFixed(1)}m`;
+  if (isPointed) return `pointed_ray ${distStr}`;
+  if (dx * dx + dz * dz < 1e-6) return `here ${distStr}`;
+  const worldDeg = Math.atan2(dx, dz) * (180 / Math.PI);
+  let rel = (worldDeg - (player.yaw_deg ?? 0)) % 360;
+  if (rel > 180) rel -= 360;
+  else if (rel <= -180) rel += 360;
+
+  let sector = "behind";
+  if (rel >= -22.5 && rel <= 22.5) sector = "ahead";
+  else if (rel > 22.5 && rel <= 67.5) sector = "front-right";
+  else if (rel > 67.5 && rel <= 112.5) sector = "right";
+  else if (rel > 112.5 && rel <= 157.5) sector = "back-right";
+  else if (rel >= -67.5 && rel < -22.5) sector = "front-left";
+  else if (rel >= -112.5 && rel < -67.5) sector = "left";
+  else if (rel >= -157.5 && rel < -112.5) sector = "back-left";
+  return `${sector} ${distStr}`;
+}
+
+export function validateArgsAgainstSchema(
+  args: Record<string, unknown>,
+  schema?: Record<string, unknown>,
+  prefix = "",
+  depth = 0
+): string | null {
+  if (depth > 16) return "schema_depth_exceeded";
+  if (!schema || Object.keys(schema).length === 0) return null;
+  if (Array.isArray(schema.required)) {
+    for (const f of schema.required) {
+      if (typeof f === "string" && !(f in args)) {
+        return `missing_required_arg:${prefix ? `${prefix}.${f}` : f}`;
+      }
+    }
+  }
+  const props = schema.properties as Record<string, Record<string, unknown>> | undefined;
+  if (props && typeof props === "object") {
+    if (schema.additionalProperties === false) {
+      for (const k of Object.keys(args)) {
+        if (!(k in props)) return `unexpected_arg:${prefix ? `${prefix}.${k}` : k}`;
+      }
+    }
+    for (const [k, v] of Object.entries(args)) {
+      if (props[k]) {
+        const qual = prefix ? `${prefix}.${k}` : k;
+        const err = validateFieldSchema(qual, v, props[k], depth + 1);
+        if (err) return err;
+      }
+    }
+  }
+  return null;
+}
+
+function validateFieldSchema(name: string, val: unknown, spec: Record<string, unknown>, depth: number): string | null {
+  if (depth > 16) return "schema_depth_exceeded";
+  const ptype = spec.type;
+  if (ptype === "string") {
+    if (typeof val !== "string") return `invalid_type:${name}`;
+    const len = [...val].length;
+    if (typeof spec.minLength === "number" && len < spec.minLength) return `min_length:${name}`;
+    if (typeof spec.maxLength === "number" && len > spec.maxLength) return `max_length:${name}`;
+    if (Array.isArray(spec.enum) && !spec.enum.includes(val)) return `invalid_enum:${name}`;
+    return null;
+  }
+  if (ptype === "boolean") return typeof val === "boolean" ? null : `invalid_type:${name}`;
+  if (ptype === "integer") {
+    if (typeof val !== "number" || !Number.isInteger(val)) return `invalid_type:${name}`;
+    return checkNumBounds(name, val, spec);
+  }
+  if (ptype === "number") {
+    if (typeof val !== "number" || !Number.isFinite(val)) return `invalid_type:${name}`;
+    return checkNumBounds(name, val, spec);
+  }
+  if (ptype === "array") {
+    if (!Array.isArray(val)) return `invalid_type:${name}`;
+    if (typeof spec.minItems === "number" && val.length < spec.minItems) return `min_items:${name}`;
+    if (typeof spec.maxItems === "number" && val.length > spec.maxItems) return `max_items:${name}`;
+    if (spec.items && typeof spec.items === "object") {
+      for (let i = 0; i < val.length; i++) {
+        const err = validateFieldSchema(`${name}[${i}]`, val[i], spec.items as Record<string, unknown>, depth + 1);
+        if (err) return err;
+      }
+    }
+    return null;
+  }
+  if (ptype === "object") {
+    if (!val || typeof val !== "object" || Array.isArray(val)) return `invalid_type:${name}`;
+    return validateArgsAgainstSchema(val as Record<string, unknown>, spec, name, depth + 1);
+  }
+  return null;
+}
+
+function checkNumBounds(name: string, v: number, spec: Record<string, unknown>): string | null {
+  if (typeof spec.minimum === "number" && v < spec.minimum) return `below_minimum:${name}`;
+  if (typeof spec.maximum === "number" && v > spec.maximum) return `above_maximum:${name}`;
+  if (typeof spec.exclusiveMinimum === "number" && v <= spec.exclusiveMinimum) return `below_exclusive_minimum:${name}`;
+  if (typeof spec.exclusiveMaximum === "number" && v >= spec.exclusiveMaximum) return `above_exclusive_maximum:${name}`;
+  return null;
+}
+
+export async function discoverLocalHubOriginUrl(explicitPath?: string): Promise<string> {
+  const fsMod = await import("node:fs/promises");
+  const pathMod = await import("node:path");
+  const osMod = await import("node:os");
+  let p = explicitPath || process.env.G2A_HUB_RUNTIME_FILE || "";
+  if (!p) {
+    if (process.platform === "win32" && process.env.LOCALAPPDATA) {
+      p = pathMod.join(process.env.LOCALAPPDATA, "G2A", "hub.runtime.json");
+    } else {
+      p = pathMod.join(osMod.homedir(), ".g2a", "hub.runtime.json");
+    }
+  }
+  const raw = await fsMod.readFile(p, "utf8");
+  const doc = parseStrictJson<Record<string, any>>(raw);
+  if (typeof doc.origin_url !== "string" || !doc.origin_url) {
+    throw new Error("Missing origin_url in Hub runtime manifest");
+  }
+  return doc.origin_url.replace(/\/$/, "");
+}
+
 export interface CapabilityEntry {
   method_id: string;
   name: string;
@@ -64,9 +195,17 @@ export type DomainEffectHandler = (
   executionId: string
 ) => EffectInvocationResult;
 
+export interface SlotPublishOptions {
+  disabled?: boolean;
+  max_sessions?: number;
+  shared_cooldown_ms?: number;
+  allowlisted_cores?: string[];
+  allowlist_criteria_url?: string;
+}
+
 /**
- * Tier 1 Interaction Origin SDK for Browser / HTML5 / WebGL / Tauri games.
- * Uses zero-inbound-port `EventSource` ("pull://origin.execute") so sandboxed browser tabs never bind TCP sockets.
+ * Tier 1 Interaction Origin SDK for Browser / HTML5 / Three.js / Tauri / Node 20+ games (G2A V0.0.1).
+ * Uses zero-inbound-port streaming ("pull://origin.execute") over EventSource or universal fetch ReadableStream.
  */
 export class OriginSDK {
   private capabilities = new Map<string, { def: Required<CapabilityEntry>; handler: DomainEffectHandler }>();
@@ -79,6 +218,7 @@ export class OriginSDK {
   private lastBriefDigest = "";
   private extensionsData: Record<string, Record<string, unknown>> = {};
   private eventSource: EventSource | null = null;
+  private streamAbort: AbortController | null = null;
 
   public currentEpoch = 1;
   public currentRev = 0;
@@ -96,9 +236,10 @@ export class OriginSDK {
   ) {}
 
   registerCapability(def: CapabilityEntry, handler: DomainEffectHandler): void {
-    const actors = this.roleKind === "independent_npc"
-      ? def.permitted_actors.filter((a) => a !== "player")
-      : [...def.permitted_actors];
+    const actors =
+      this.roleKind === "independent_npc"
+        ? def.permitted_actors.filter((a) => a !== "player")
+        : [...def.permitted_actors];
     this.capabilities.set(def.method_id, {
       def: {
         ...def,
@@ -127,8 +268,8 @@ export class OriginSDK {
     this.extensionsData[extName] = { ...data };
   }
 
-  async publishCapabilitiesAndStartOutboundStream(): Promise<void> {
-    this.startOutboundExecuteStream();
+  async publishCapabilitiesAndStartOutboundStream(options?: SlotPublishOptions): Promise<void> {
+    await this.startOutboundExecuteStream();
     const sortedDefs = [...this.capabilities.values()]
       .sort((a, b) => (a.def.method_id < b.def.method_id ? -1 : 1))
       .map((c) => c.def);
@@ -141,23 +282,26 @@ export class OriginSDK {
       capability_table_digest: capDigest,
       capabilities: sortedDefs,
     };
+    if (options?.disabled) capPayload.disabled = true;
+    if (options?.max_sessions && options.max_sessions > 0) capPayload.max_sessions = options.max_sessions;
+    if (options?.shared_cooldown_ms && options.shared_cooldown_ms > 0) capPayload.shared_cooldown_ms = options.shared_cooldown_ms;
+    if (options?.allowlisted_cores?.length) capPayload.allowlisted_cores = [...options.allowlisted_cores];
+    if (options?.allowlist_criteria_url) capPayload.allowlist_criteria_url = options.allowlist_criteria_url;
     if (this.roomId) capPayload.room_id = this.roomId;
     if (this.factionId) capPayload.faction_id = this.factionId;
     await this.postToHub("origin.capabilities", capPayload);
     await this.flushFullSync();
   }
 
-  startOutboundExecuteStream(): void {
-    if (typeof EventSource === "undefined" || this.eventSource) return;
-    const tokenParam = this.originToken ? `&access_token=${encodeURIComponent(this.originToken)}` : "";
-    const url = `${this.hubOriginBaseUrl.replace(/\/$/, "")}/g2a/v1/origin/execute-stream?slot_id=${encodeURIComponent(this.slotId)}${tokenParam}`;
-    this.eventSource = new EventSource(url);
-    this.eventSource.addEventListener("origin.execute", async (ev: MessageEvent) => {
-      const env = parseStrictJson<Record<string, any>>(String(ev.data));
+  async startOutboundExecuteStream(): Promise<void> {
+    if (this.eventSource || this.streamAbort) return;
+    const base = this.hubOriginBaseUrl.replace(/\/$/, "");
+    const dispatchStreamedEnv = async (rawData: string) => {
+      const env = parseStrictJson<Record<string, any>>(rawData);
       const reply = await this.handleOriginExecute(env.payload as OriginExecuteRequest);
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       if (this.originToken) headers.Authorization = `Bearer ${this.originToken}`;
-      await fetch(`${this.hubOriginBaseUrl.replace(/\/$/, "")}/g2a/v1/origin/execute-reply`, {
+      await fetch(`${base}/g2a/v1/origin/execute-reply`, {
         method: "POST",
         headers,
         body: JSON.stringify({
@@ -169,12 +313,62 @@ export class OriginSDK {
           error: null,
         }),
       });
+    };
+
+    if (typeof EventSource !== "undefined") {
+      const tokenParam = this.originToken ? `&access_token=${encodeURIComponent(this.originToken)}` : "";
+      const url = `${base}/g2a/v1/origin/execute-stream?slot_id=${encodeURIComponent(this.slotId)}${tokenParam}`;
+      this.eventSource = new EventSource(url);
+      this.eventSource.addEventListener("origin.execute", (ev: MessageEvent) => {
+        void dispatchStreamedEnv(String(ev.data));
+      });
+      return;
+    }
+
+    // Universal fetch ReadableStream SSE consumer for Node 20+, Deno, Bun, & Workers
+    const abort = new AbortController();
+    this.streamAbort = abort;
+    const headers: Record<string, string> = { Accept: "text/event-stream" };
+    if (this.originToken) headers.Authorization = `Bearer ${this.originToken}`;
+    const resp = await fetch(`${base}/g2a/v1/origin/execute-stream?slot_id=${encodeURIComponent(this.slotId)}`, {
+      headers,
+      signal: abort.signal,
     });
+    if (!resp.ok || !resp.body) return;
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    void (async () => {
+      let leftover = "";
+      let dataLines: string[] = [];
+      try {
+        while (!abort.signal.aborted) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          leftover += dec.decode(value, { stream: true });
+          let nl: number;
+          while ((nl = leftover.indexOf("\n")) >= 0) {
+            const ln = leftover.slice(0, nl).replace(/\r$/, "");
+            leftover = leftover.slice(nl + 1);
+            if (ln === "") {
+              if (dataLines.length > 0) {
+                const joined = dataLines.join("\n");
+                dataLines = [];
+                await dispatchStreamedEnv(joined);
+              }
+            } else if (ln.startsWith("data:")) {
+              dataLines.push(ln.slice(5).replace(/^ /, ""));
+            }
+          }
+        }
+      } catch {}
+    })();
   }
 
   stopOutboundExecuteStream(): void {
     this.eventSource?.close();
     this.eventSource = null;
+    this.streamAbort?.abort();
+    this.streamAbort = null;
   }
 
   async flushDirtySync(significantEvent = false): Promise<boolean> {
@@ -198,6 +392,7 @@ export class OriginSDK {
         removed.push({ method_id, actor });
       }
     }
+
     const settledBatch = this.pendingSettled.splice(0, this.pendingSettled.length);
     if (briefDigest === this.lastBriefDigest && upserted.length === 0 && removed.length === 0 && settledBatch.length === 0) {
       return false;
@@ -260,11 +455,9 @@ export class OriginSDK {
     if (!reg.def.permitted_actors.includes(req.actor)) {
       return { execution_id: req.execution_id, state: "failed", failure_reason: "permission_denied" };
     }
-    const reqFields = Array.isArray(reg.def.params_schema?.required) ? (reg.def.params_schema.required as string[]) : [];
-    for (const f of reqFields) {
-      if (!(f in (req.args ?? {}))) {
-        return { execution_id: req.execution_id, state: "failed", failure_reason: `missing_required_arg:${f}` };
-      }
+    const schemaErr = validateArgsAgainstSchema(req.args ?? {}, reg.def.params_schema);
+    if (schemaErr) {
+      return { execution_id: req.execution_id, state: "failed", failure_reason: schemaErr };
     }
     const out = reg.handler(req.actor, this.actors.get(req.actor), req.args, req.execution_id);
     if (out.kind === "executing") {
@@ -273,9 +466,10 @@ export class OriginSDK {
       this.storeLedgerReply(rep);
       return rep;
     }
-    const rep: OriginExecuteReply = out.kind === "succeeded"
-      ? { execution_id: req.execution_id, state: "succeeded", effect_summary: out.effect_summary }
-      : { execution_id: req.execution_id, state: "failed", failure_reason: out.reason };
+    const rep: OriginExecuteReply =
+      out.kind === "succeeded"
+        ? { execution_id: req.execution_id, state: "succeeded", effect_summary: out.effect_summary }
+        : { execution_id: req.execution_id, state: "failed", failure_reason: out.reason };
     this.storeLedgerReply(rep);
     await this.flushDirtySync(false);
     return rep;
@@ -377,6 +571,11 @@ export class OriginSDK {
   }
 
   async reportNpcHostHandoff(newPlayerId: string): Promise<void> {
+    if (this.roleKind !== "independent_npc" || this.billingMode !== "player_metered") {
+      throw new Error("host_handoff requires player_metered independent_npc slot");
+    }
+    const cleaned = newPlayerId.trim();
+    if (!cleaned) throw new Error("new_player_id is required");
     for (const execId of [...this.inFlight.keys()]) {
       await this.cancelInFlightStep(execId);
     }
@@ -384,7 +583,7 @@ export class OriginSDK {
     await this.postToHub("origin.player_event", {
       slot_id: this.slotId,
       kind: "host_handoff",
-      new_player_id: newPlayerId.trim(),
+      new_player_id: cleaned,
     });
   }
 
@@ -449,7 +648,7 @@ export class OriginSDK {
   private async postToHub(operation: string, payload: unknown): Promise<void> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (this.originToken) headers.Authorization = `Bearer ${this.originToken}`;
-    await fetch(`${this.hubOriginBaseUrl.replace(/\/$/, "")}/g2a/v1/origin`, {
+    const resp = await fetch(`${this.hubOriginBaseUrl.replace(/\/$/, "")}/g2a/v1/origin`, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -461,6 +660,9 @@ export class OriginSDK {
         extensions: {},
       }),
     });
+    if (!resp.ok) {
+      throw new Error(`Hub rejected ${operation} (${resp.status}): ${await resp.text()}`);
+    }
   }
 }
 

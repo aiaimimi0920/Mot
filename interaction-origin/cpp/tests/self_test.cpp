@@ -4,6 +4,7 @@
 #include <iostream>
 #include <vector>
 
+#include "../include/g2a/http_transport.hpp"
 #include "../include/g2a/origin_sdk.hpp"
 
 int main() {
@@ -225,6 +226,48 @@ int main() {
     const auto& ext_sync = std::get<JsonObject>(ext_posts[1].second.data);
     const auto& ext_map = std::get<JsonObject>(ext_sync.at("extensions_data").data);
     assert(std::get<std::string>(std::get<JsonObject>(ext_map.at("org.g2a.sim.batch_blueprint.v1").data).at("grid").data) == "8x8");
+
+    // 9. Verify Pose3D 360-degree yaw-relative deictics, recursive JSON Schema bounds, & HTTP/1.1 Keep-Alive listener
+    Pose3D player_pose{0.0, 0.0, 0.0, 0.0};
+    assert(player_pose.format_player_deictic_anchor({3.0, 0.0, 0.0, 0.0}, false) == "right 3.0m");
+    assert(player_pose.format_player_deictic_anchor({0.0, 0.0, 4.0, 0.0}, true) == "pointed_ray 4.0m");
+
+    JsonObject qty_prop{{"type", "integer"}, {"minimum", int64_t(1)}, {"maximum", int64_t(50)}};
+    JsonObject strict_schema{
+        {"type", "object"},
+        {"required", JsonArray{"qty"}},
+        {"additionalProperties", false},
+        {"properties", JsonObject{{"qty", qty_prop}}},
+    };
+    ext_sdk.bind_actor_subject("companion");
+    ext_sdk.register_capability(
+        {"#09", "buy_logs", "Buy logs", {"companion"}, strict_schema, false, {}, "allow"},
+        [](const std::string&, const JsonObject&, const std::string&) {
+            return EffectOutcome::ImmediateSucceeded(JsonObject{{"bought", true}});
+        });
+    auto over_max = ext_sdk.handle_origin_execute({"slot-ext-cpp", 1, "invoke", "ex-max", "#09", "companion", JsonObject{{"qty", int64_t(999)}}});
+    assert(over_max.state == "failed" && over_max.failure_reason.value_or("") == "above_maximum:qty");
+
+    http::LoopbackExecuteListener listener(ext_sdk, 0, "cpp-ka-tok");
+    http::detail::SocketHandle cli = http::detail::connect_ipv4("127.0.0.1", listener.bound_port());
+    assert(cli != http::detail::kInvalidSocket);
+    std::string ex_body = R"({"g2a_version":"0.0.1","request_id":"c1","timestamp_ms":1,"operation":"origin.execute","payload":{"slot_id":"slot-ext-cpp","epoch":1,"kind":"invoke","execution_id":"ex-ka-ok","method_id":"#09","actor":"companion","args":{"qty":12}},"extensions":{}})";
+    std::string r_bad = "POST /g2a/v1/origin/execute HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer wrong\r\nContent-Length: "
+                      + std::to_string(ex_body.size()) + "\r\n\r\n" + ex_body;
+    assert(http::detail::send_all(cli, r_bad.data(), r_bad.size()));
+    std::string lo;
+    http::detail::HttpRawMessage m_bad;
+    assert(http::detail::read_http_message(cli, lo, m_bad));
+    assert(m_bad.first_line.find(" 401 ") != std::string::npos);
+
+    std::string r_ok = "POST /g2a/v1/origin/execute HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer cpp-ka-tok\r\nConnection: close\r\nContent-Length: "
+                     + std::to_string(ex_body.size()) + "\r\n\r\n" + ex_body;
+    assert(http::detail::send_all(cli, r_ok.data(), r_ok.size()));
+    http::detail::HttpRawMessage m_ok;
+    assert(http::detail::read_http_message(cli, lo, m_ok));
+    assert(m_ok.first_line.find(" 200 ") != std::string::npos);
+    assert(m_ok.body.find("\"succeeded\"") != std::string::npos);
+    http::detail::close_socket(cli);
 
     std::cout << "C++17 G2A OriginSdk SelfTest PASSED | JCS=" << digest << "\n";
     return 0;

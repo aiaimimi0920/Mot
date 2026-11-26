@@ -1,13 +1,22 @@
 {
   "name": "@g2a/interaction-origin",
   "version": "0.0.1",
-  "description": "G2A V0.0.1 Interaction Origin SDK for Web / HTML5 / Three.js / Phaser / Cocos / Tauri games",
+  "description": "Zero-dependency G2A V0.0.1 Interaction Origin SDK for Web / HTML5 / Three.js / Phaser / Tauri / Node 20+ hosts",
   "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "./esm/index.mjs",
+  "types": "./esm/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./esm/index.d.ts",
+      "default": "./esm/index.mjs"
+    }
+  },
   "files": [
     "src",
-    "dist"
+    "esm"
   ],
+  "scripts": {
+    "test": "node ./tests/self_test.mjs"
+  },
   "license": "LGPL-3.0-only"
 }

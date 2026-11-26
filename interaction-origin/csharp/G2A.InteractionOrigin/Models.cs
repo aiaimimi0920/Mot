@@ -86,3 +86,40 @@ public interface IHubTransportClientPort
 {
     void PostToHub(string operation, object payload);
 }
+
+public readonly record struct Pose3D(double X, double Y, double Z, double YawDeg = 0.0)
+{
+    public double DistanceTo(Pose3D other)
+    {
+        double dx = other.X - X, dy = other.Y - Y, dz = other.Z - Z;
+        return Math.Sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    public string FormatPlayerDeicticAnchor(Pose3D target, bool isPointed = false)
+    {
+        double dist = DistanceTo(target);
+        string distStr = string.Format(System.Globalization.CultureInfo.InvariantCulture, "{0:F1}m", dist);
+        if (isPointed) return $"pointed_ray {distStr}";
+        double dx = target.X - X;
+        double dz = target.Z - Z;
+        if (dx * dx + dz * dz < 1e-6) return $"here {distStr}";
+
+        double worldDeg = Math.Atan2(dx, dz) * (180.0 / Math.PI);
+        double rel = (worldDeg - YawDeg) % 360.0;
+        if (rel > 180.0) rel -= 360.0;
+        else if (rel <= -180.0) rel += 360.0;
+
+        string sector = rel switch
+        {
+            >= -22.5 and <= 22.5 => "ahead",
+            > 22.5 and <= 67.5 => "front-right",
+            > 67.5 and <= 112.5 => "right",
+            > 112.5 and <= 157.5 => "back-right",
+            >= -67.5 and < -22.5 => "front-left",
+            >= -112.5 and < -67.5 => "left",
+            >= -157.5 and < -112.5 => "back-left",
+            _ => "behind"
+        };
+        return $"{sector} {distStr}";
+    }
+}

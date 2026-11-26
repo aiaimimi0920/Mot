@@ -1,0 +1,10 @@
+[package]
+name = "g2a-origin"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Zero-dependency Rust Interaction Origin SDK for G2A V0.0.1 (Bevy, Fyrox, Tauri, and custom Rust game hosts)"
+
+[lib]
+name = "g2a_origin"
+path = "src/lib.rs"

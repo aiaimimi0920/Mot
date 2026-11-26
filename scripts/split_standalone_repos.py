@@ -13,8 +13,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 REPOS = ("interaction-origin", "intelligent-hub", "computation-core")
-SKIP_DIRS = {"__pycache__", "bin", "obj", "build", "dist", "node_modules", ".git", ".pytest_cache"}
-SKIP_SUFFIXES = {".pyc", ".pyo", ".exe", ".dll", ".pdb", ".db", ".db-wal", ".db-shm"}
+SKIP_DIRS = {"__pycache__", "bin", "obj", "build", "dist", "target", "node_modules", ".git", ".pytest_cache"}
+SKIP_SUFFIXES = {".pyc", ".pyo", ".exe", ".dll", ".pdb", ".db", ".db-wal", ".db-shm", ".lock"}
 
 
 def copy_clean_tree(src: Path, dst: Path) -> None:

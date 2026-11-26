@@ -307,6 +307,35 @@ internal static class Program
         if ((string?)extData["org.g2a.sim.batch_blueprint.v1"]["grid"] != "6x6")
             throw new Exception("Expected modular extensions_data in C# OriginSdk");
 
+        // Verify Pose3D 360-degree yaw-relative deictics & recursive JSON Schema validation
+        var pPose = new Pose3D(0, 0, 0, 0);
+        if (pPose.FormatPlayerDeicticAnchor(new Pose3D(3, 0, 0, 0), false) != "right 3.0m")
+            throw new Exception("Unexpected Pose3D right deictic anchor");
+        if (pPose.FormatPlayerDeicticAnchor(new Pose3D(0, 0, 4, 0), true) != "pointed_ray 4.0m")
+            throw new Exception("Unexpected Pose3D pointed_ray anchor");
+
+        bool caughtOverMax = false;
+        try
+        {
+            OriginSdk.ValidateArgsAgainstSchema(
+                new Dictionary<string, object?> { ["qty"] = 999 },
+                new Dictionary<string, object?>
+                {
+                    ["type"] = "object",
+                    ["required"] = new[] { "qty" },
+                    ["additionalProperties"] = false,
+                    ["properties"] = new Dictionary<string, object?>
+                    {
+                        ["qty"] = new Dictionary<string, object?> { ["type"] = "integer", ["minimum"] = 1, ["maximum"] = 50 }
+                    }
+                });
+        }
+        catch (G2AOriginException gex) when (gex.Code == "invalid_arguments")
+        {
+            caughtOverMax = true;
+        }
+        if (!caughtOverMax) throw new Exception("Expected recursive JSON Schema maximum bound rejection");
+
         Console.WriteLine($"C# G2A.InteractionOrigin SelfTest PASSED | JCS={d1}");
         return 0;
     }

@@ -1,25 +1,45 @@
 from __future__ import annotations
 
+import http.client
 import json
-import urllib.error
-import urllib.request
+import time
+import urllib.parse
 from typing import Any, Dict, Set
 
 from .schemas import G2A_WIRE_VERSION, VALID_ERROR_CODES
 
 
 def _raw_post(url: str, raw_bytes: bytes, token: str = "core-conf") -> tuple[int, Dict[str, Any]]:
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    headers = {"Content-Type": "application/json"}
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    headers = {"Content-Type": "application/json", "Connection": "close"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, data=raw_bytes, method="POST", headers=headers)
-    try:
-        with opener.open(req, timeout=4.0) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as herr:
-        body = herr.read().decode("utf-8")
-        return herr.code, json.loads(body) if body else {}
+
+    last_err: Exception | None = None
+    for attempt in range(3):
+        conn = (
+            http.client.HTTPSConnection(host, port, timeout=4.0)
+            if parsed.scheme == "https"
+            else http.client.HTTPConnection(host, port, timeout=4.0)
+        )
+        try:
+            conn.request("POST", path, body=raw_bytes, headers=headers)
+            resp = conn.getresponse()
+            body = resp.read().decode("utf-8")
+            return resp.status, json.loads(body) if body else {}
+        except (ConnectionError, http.client.HTTPException, OSError) as exc:
+            last_err = exc
+            if attempt < 2:
+                time.sleep(0.03)
+        finally:
+            conn.close()
+    assert last_err is not None
+    raise last_err
 
 
 def verify_all_14_error_codes_live(core_base_url: str, origin_base_url: str) -> Dict[str, int]:

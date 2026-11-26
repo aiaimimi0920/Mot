@@ -258,16 +258,8 @@ public sealed class OriginSdk
             if (!_actors.TryGetValue(req.Actor, out var subject))
                 throw new G2AOriginException("not_found", 404, "Actor subject not present");
 
-            if (reg.Def.ParamsSchema is not null &&
-                reg.Def.ParamsSchema.TryGetValue("required", out var reqObj) &&
-                reqObj is IEnumerable<string> reqList)
-            {
-                foreach (string reqKey in reqList)
-                {
-                    if (!req.Args.ContainsKey(reqKey))
-                        throw new G2AOriginException("invalid_arguments", 400, $"Missing required argument '{reqKey}'");
-                }
-            }
+            if (reg.Def.ParamsSchema is not null)
+                ValidateArgsAgainstSchema(req.Args, reg.Def.ParamsSchema, "", 0);
 
             var outcome = reg.Handler(req.Actor, subject, req.Args, req.ExecutionId);
             switch (outcome)
@@ -481,5 +473,145 @@ public sealed class OriginSdk
         {
             grants[key] = incoming with { Targets = PrioritizeTargets(incoming.Targets) };
         }
+    }
+
+    public static void ValidateArgsAgainstSchema(
+        Dictionary<string, object?> args,
+        Dictionary<string, object?> schema,
+        string prefix = "",
+        int depth = 0)
+    {
+        if (depth > 16)
+            throw new G2AOriginException("invalid_arguments", 400, "Schema nesting depth exceeded");
+        if (schema.Count == 0) return;
+
+        if (schema.TryGetValue("required", out var reqObj) && reqObj is System.Collections.IEnumerable reqEnum and not string)
+        {
+            foreach (var item in reqEnum)
+            {
+                string? reqKey = item?.ToString();
+                if (!string.IsNullOrEmpty(reqKey) && !args.ContainsKey(reqKey))
+                {
+                    string qual = string.IsNullOrEmpty(prefix) ? reqKey : $"{prefix}.{reqKey}";
+                    throw new G2AOriginException("invalid_arguments", 400, $"Missing required argument '{qual}'");
+                }
+            }
+        }
+
+        if (schema.TryGetValue("properties", out var propsObj) && propsObj is Dictionary<string, object?> props)
+        {
+            if (schema.TryGetValue("additionalProperties", out var apObj) && apObj is false)
+            {
+                foreach (string k in args.Keys)
+                {
+                    if (!props.ContainsKey(k))
+                    {
+                        string qual = string.IsNullOrEmpty(prefix) ? k : $"{prefix}.{k}";
+                        throw new G2AOriginException("invalid_arguments", 400, $"Unexpected argument '{qual}'");
+                    }
+                }
+            }
+            foreach (var (k, v) in args)
+            {
+                if (props.TryGetValue(k, out var specObj) && specObj is Dictionary<string, object?> spec)
+                {
+                    string qual = string.IsNullOrEmpty(prefix) ? k : $"{prefix}.{k}";
+                    ValidateFieldSchema(qual, v, spec, depth + 1);
+                }
+            }
+        }
+    }
+
+    private static void ValidateFieldSchema(string name, object? val, Dictionary<string, object?> spec, int depth)
+    {
+        if (depth > 16)
+            throw new G2AOriginException("invalid_arguments", 400, "Schema nesting depth exceeded");
+        if (!spec.TryGetValue("type", out var tObj) || tObj is not string ptype) return;
+
+        switch (ptype)
+        {
+            case "string":
+                if (val is not string s)
+                    throw new G2AOriginException("invalid_arguments", 400, $"Argument '{name}' must be string");
+                if (TryGetDouble(spec, "minLength", out double minL) && s.Length < minL)
+                    throw new G2AOriginException("invalid_arguments", 400, $"Argument '{name}' shorter than minLength");
+                if (TryGetDouble(spec, "maxLength", out double maxL) && s.Length > maxL)
+                    throw new G2AOriginException("invalid_arguments", 400, $"Argument '{name}' exceeds maxLength");
+                if (spec.TryGetValue("enum", out var enumObj) && enumObj is System.Collections.IEnumerable enumList and not string)
+                {
+                    bool matched = false;
+                    foreach (var e in enumList)
+                    {
+                        if (string.Equals(e?.ToString(), s, StringComparison.Ordinal)) { matched = true; break; }
+                    }
+                    if (!matched)
+                        throw new G2AOriginException("invalid_arguments", 400, $"Argument '{name}' not in enum");
+                }
+                break;
+            case "boolean":
+                if (val is not bool)
+                    throw new G2AOriginException("invalid_arguments", 400, $"Argument '{name}' must be boolean");
+                break;
+            case "integer":
+                if (!TryConvertDouble(val, out double iv) || Math.Truncate(iv) != iv)
+                    throw new G2AOriginException("invalid_arguments", 400, $"Argument '{name}' must be integer");
+                CheckNumericBounds(name, iv, spec);
+                break;
+            case "number":
+                if (!TryConvertDouble(val, out double nv) || !double.IsFinite(nv))
+                    throw new G2AOriginException("invalid_arguments", 400, $"Argument '{name}' must be finite number");
+                CheckNumericBounds(name, nv, spec);
+                break;
+            case "array":
+                if (val is not System.Collections.IEnumerable arrEnum || val is string || val is System.Collections.IDictionary)
+                    throw new G2AOriginException("invalid_arguments", 400, $"Argument '{name}' must be array");
+                var items = arrEnum.Cast<object?>().ToList();
+                if (TryGetDouble(spec, "minItems", out double minI) && items.Count < minI)
+                    throw new G2AOriginException("invalid_arguments", 400, $"Argument '{name}' below minItems");
+                if (TryGetDouble(spec, "maxItems", out double maxI) && items.Count > maxI)
+                    throw new G2AOriginException("invalid_arguments", 400, $"Argument '{name}' exceeds maxItems");
+                if (spec.TryGetValue("items", out var itemSpecObj) && itemSpecObj is Dictionary<string, object?> itemSpec)
+                {
+                    for (int i = 0; i < items.Count; i++)
+                        ValidateFieldSchema($"{name}[{i}]", items[i], itemSpec, depth + 1);
+                }
+                break;
+            case "object":
+                if (val is not Dictionary<string, object?> subObj)
+                    throw new G2AOriginException("invalid_arguments", 400, $"Argument '{name}' must be object");
+                ValidateArgsAgainstSchema(subObj, spec, name, depth + 1);
+                break;
+        }
+    }
+
+    private static bool TryConvertDouble(object? v, out double d)
+    {
+        switch (v)
+        {
+            case int i: d = i; return true;
+            case long l: d = l; return true;
+            case double db: d = db; return true;
+            case float fl: d = fl; return true;
+            default: d = 0; return false;
+        }
+    }
+
+    private static bool TryGetDouble(Dictionary<string, object?> spec, string key, out double d)
+    {
+        if (spec.TryGetValue(key, out var raw)) return TryConvertDouble(raw, out d);
+        d = 0;
+        return false;
+    }
+
+    private static void CheckNumericBounds(string name, double val, Dictionary<string, object?> spec)
+    {
+        if (TryGetDouble(spec, "minimum", out double minV) && val < minV)
+            throw new G2AOriginException("invalid_arguments", 400, $"Argument '{name}' below minimum");
+        if (TryGetDouble(spec, "maximum", out double maxV) && val > maxV)
+            throw new G2AOriginException("invalid_arguments", 400, $"Argument '{name}' exceeds maximum");
+        if (TryGetDouble(spec, "exclusiveMinimum", out double exMin) && val <= exMin)
+            throw new G2AOriginException("invalid_arguments", 400, $"Argument '{name}' must exceed exclusiveMinimum");
+        if (TryGetDouble(spec, "exclusiveMaximum", out double exMax) && val >= exMax)
+            throw new G2AOriginException("invalid_arguments", 400, $"Argument '{name}' must be below exclusiveMaximum");
     }
 }

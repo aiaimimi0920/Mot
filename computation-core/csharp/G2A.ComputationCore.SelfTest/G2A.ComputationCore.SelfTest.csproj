@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\G2A.ComputationCore\G2A.ComputationCore.csproj" />
+    <ProjectReference Include="..\..\..\interaction-origin\csharp\G2A.InteractionOrigin\G2A.InteractionOrigin.csproj" />
+  </ItemGroup>
+</Project>

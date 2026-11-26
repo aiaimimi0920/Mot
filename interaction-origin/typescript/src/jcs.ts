@@ -1,7 +1,21 @@
 /**
- * RFC 8785 (JCS) Canonical JSON, Strict RFC 8259 Duplicate-Key Validator,
+ * RFC 8785 (JCS) Canonical JSON, Strict RFC 8259 Duplicate-Key & Lone-Surrogate Validator,
  * & Domain-Separated WebCrypto SHA-256 for Browser / WebGL / Node 20+ (G2A V0.0.1).
  */
+
+function assertNoLoneSurrogates(s: string): void {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      if (i + 1 >= s.length) throw new Error("Lone high UTF-16 surrogate in strict JSON");
+      const low = s.charCodeAt(i + 1);
+      if (low < 0xdc00 || low > 0xdfff) throw new Error("Unpaired high UTF-16 surrogate in strict JSON");
+      i++;
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      throw new Error("Lone low UTF-16 surrogate in strict JSON");
+    }
+  }
+}
 
 export function parseStrictJson<T = unknown>(raw: string): T {
   let pos = 0;
@@ -17,12 +31,15 @@ export function parseStrictJson<T = unknown>(raw: string): T {
       if (ch === "\\") {
         pos += raw[pos] === "u" ? 5 : 1;
       } else if (ch === '"') {
-        return JSON.parse(raw.slice(start, pos)) as string;
+        const decoded = JSON.parse(raw.slice(start, pos)) as string;
+        assertNoLoneSurrogates(decoded);
+        return decoded;
       }
     }
     throw new Error("Unterminated JSON string");
   };
-  const scanValue = (): void => {
+  const scanValue = (depth: number): void => {
+    if (depth > 64) throw new Error("JSON nesting depth exceeds 64");
     skipWs();
     if (pos >= n) throw new Error("Unexpected end of JSON");
     const c = raw[pos];
@@ -44,7 +61,7 @@ export function parseStrictJson<T = unknown>(raw: string): T {
         seen.add(key);
         skipWs();
         if (raw[pos++] !== ":") throw new Error("Expected ':' after JSON key");
-        scanValue();
+        scanValue(depth + 1);
         skipWs();
         const sep = raw[pos++];
         if (sep === "}") break;
@@ -58,7 +75,7 @@ export function parseStrictJson<T = unknown>(raw: string): T {
         return;
       }
       while (pos < n) {
-        scanValue();
+        scanValue(depth + 1);
         skipWs();
         const sep = raw[pos++];
         if (sep === "]") break;
@@ -68,7 +85,7 @@ export function parseStrictJson<T = unknown>(raw: string): T {
       while (pos < n && !",]} \t\r\n".includes(raw[pos])) pos++;
     }
   };
-  scanValue();
+  scanValue(0);
   skipWs();
   if (pos !== n) throw new Error("Trailing characters in strict JSON");
   return JSON.parse(raw) as T;
@@ -81,9 +98,10 @@ export function canonicalizeJcs(val: unknown): string {
     if (!Number.isFinite(val)) {
       throw new Error("G2A strict JSON forbids NaN or Infinity");
     }
-    return Object.is(val, -0) ? "0" : JSON.stringify(val); // ECMAScript Number::toString IS the normative reference of RFC 8785!
+    return Object.is(val, -0) ? "0" : JSON.stringify(val);
   }
   if (typeof val === "string") {
+    assertNoLoneSurrogates(val);
     return JSON.stringify(val);
   }
   if (Array.isArray(val)) {
@@ -94,7 +112,16 @@ export function canonicalizeJcs(val: unknown): string {
     const keys = Object.keys(obj)
       .filter((k) => obj[k] !== undefined)
       .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-    return "{" + keys.map((k) => `${JSON.stringify(k)}:${canonicalizeJcs(obj[k])}`).join(",") + "}";
+    return (
+      "{" +
+      keys
+        .map((k) => {
+          assertNoLoneSurrogates(k);
+          return `${JSON.stringify(k)}:${canonicalizeJcs(obj[k])}`;
+        })
+        .join(",") +
+      "}"
+    );
   }
   throw new Error(`Unsupported JCS value type: ${typeof val}`);
 }

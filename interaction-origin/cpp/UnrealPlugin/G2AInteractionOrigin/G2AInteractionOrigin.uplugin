@@ -1,0 +1,20 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.0.1",
+  "FriendlyName": "G2A Interaction Origin (V0.0.1)",
+  "Description": "Zero-dependency Unreal Engine 5 Interaction Origin Subsystem implementing the G2A V0.0.1 specification.",
+  "Category": "AI",
+  "CreatedBy": "G2A Reference Project",
+  "CreatedByURL": "https://github.com/aiaimimi0920/Mot",
+  "CanContainContent": false,
+  "IsBetaVersion": false,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "G2AInteractionOrigin",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ]
+}

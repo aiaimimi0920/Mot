@@ -1,0 +1,873 @@
+package g2acore
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha1"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	wsMagicGUID     = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	maxSeenEventIDs = 1024
+)
+
+type ConnectOptions struct {
+	PlayerID            string
+	FactionID           string
+	RequestedScope      map[string]any
+	Extensions          map[string]any
+	SkipBackgroundLoops bool
+}
+
+// CoreSDK implements the Tier 3 Computation Core state machine (G2A V0.0.1).
+type CoreSDK struct {
+	Planner       CognitivePlanner
+	Memory        *InMemoryCompanionStore
+	AllowLoopback bool
+	StreamMode    string // "websocket" (default) | "sse"
+
+	mu                  sync.Mutex
+	hubEndpoint         string
+	authToken           string
+	sessionID           string
+	frozenScope         *FrozenScope
+	actionsPaused       bool
+	closed              bool
+	nextAllowedPullMs   int64
+	lastEventID         string
+	seenOrder           []string
+	seenSet             map[string]struct{}
+	slotDigests         map[string]string
+	capabilityCache     map[string][]CapabilityEntry
+	pendingConfirm      map[string]MethodCallQueue
+	earlyConfirmed      map[string]struct{}
+	earlyDeclined       map[string]int64
+	refusalCooldowns    map[string]int64
+	streamReady         chan struct{}
+	cancelBg            context.CancelFunc
+	httpClient          *http.Client
+	CustomPostTransport func(ctx context.Context, op string, payload any, sessionID string) (json.RawMessage, error)
+}
+
+func NewCoreSDK(planner CognitivePlanner, allowLoopback bool) *CoreSDK {
+	if planner == nil {
+		planner = NoOpPlanner{}
+	}
+	return &CoreSDK{
+		Planner:          planner,
+		AllowLoopback:    allowLoopback,
+		StreamMode:       "websocket",
+		seenSet:          make(map[string]struct{}),
+		slotDigests:      make(map[string]string),
+		capabilityCache:  make(map[string][]CapabilityEntry),
+		pendingConfirm:   make(map[string]MethodCallQueue),
+		earlyConfirmed:   make(map[string]struct{}),
+		earlyDeclined:    make(map[string]int64),
+		refusalCooldowns: make(map[string]int64),
+		streamReady:      make(chan struct{}),
+		httpClient: &http.Client{
+			Timeout: 12 * time.Second,
+			Transport: &http.Transport{
+				Proxy:               nil,
+				MaxIdleConnsPerHost: 8,
+				TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS13},
+			},
+		},
+	}
+}
+
+func (c *CoreSDK) SessionID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sessionID
+}
+
+func (c *CoreSDK) CapabilityCacheCount(digest string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.capabilityCache[digest])
+}
+
+func (c *CoreSDK) SlotDigest(slotID string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.slotDigests[slotID]
+}
+
+func (c *CoreSDK) Connect(
+	ctx context.Context,
+	hubEndpoint string,
+	authToken string,
+	slotID string,
+	opts ConnectOptions,
+) (*FrozenScope, error) {
+	if err := ValidateOutboundURLAgainstSSRF(hubEndpoint, c.AllowLoopback); err != nil {
+		return nil, err
+	}
+	base := strings.TrimRight(hubEndpoint, "/")
+
+	c.mu.Lock()
+	cachedDigest := c.slotDigests[slotID]
+	c.hubEndpoint = base
+	c.authToken = authToken
+	c.closed = false
+	c.streamReady = make(chan struct{})
+	c.mu.Unlock()
+
+	reqScope := opts.RequestedScope
+	if reqScope == nil {
+		reqScope = map[string]any{"allow_chat": true}
+	}
+	authPayload := map[string]any{
+		"slot_id":         slotID,
+		"requested_scope": reqScope,
+	}
+	if opts.PlayerID != "" {
+		authPayload["player_id"] = opts.PlayerID
+	}
+	if opts.FactionID != "" {
+		authPayload["faction_id"] = opts.FactionID
+	}
+	if cachedDigest != "" {
+		authPayload["cached_capability_digest"] = cachedDigest
+	}
+
+	rawRes, err := c.postEnvelope(ctx, "session.authorize", authPayload, "", opts.Extensions)
+	if err != nil {
+		return nil, err
+	}
+	var authRes struct {
+		SessionID             string            `json:"session_id"`
+		CapabilityTableDigest string            `json:"capability_table_digest"`
+		CapabilityTable       []CapabilityEntry `json:"capability_table"`
+		FrozenScope           FrozenScope       `json:"frozen_scope"`
+	}
+	if err := UnmarshalStrict(rawRes, &authRes); err != nil {
+		return nil, err
+	}
+	if authRes.CapabilityTable != nil {
+		verified, err := DigestSHA256("g2a.cap.v1", authRes.CapabilityTable)
+		if err != nil || verified != authRes.CapabilityTableDigest {
+			return nil, &G2AError{Code: "invalid_arguments", HTTPStatus: 400, Message: "capability_table_digest mismatch"}
+		}
+		c.mu.Lock()
+		c.capabilityCache[authRes.CapabilityTableDigest] = authRes.CapabilityTable
+		c.mu.Unlock()
+	}
+
+	bgCtx, cancel := context.WithCancel(context.Background())
+	c.mu.Lock()
+	c.sessionID = authRes.SessionID
+	c.frozenScope = &authRes.FrozenScope
+	c.slotDigests[slotID] = authRes.CapabilityTableDigest
+	c.cancelBg = cancel
+	c.mu.Unlock()
+
+	if !opts.SkipBackgroundLoops {
+		go c.heartbeatLoop(bgCtx)
+		if c.StreamMode == "sse" {
+			go c.sseStreamLoop(bgCtx)
+		} else {
+			go c.wsStreamLoop(bgCtx)
+		}
+		select {
+		case <-c.streamReady:
+		case <-time.After(1500 * time.Millisecond):
+		case <-ctx.Done():
+		}
+	}
+	return &authRes.FrozenScope, nil
+}
+
+func (c *CoreSDK) PullContext(ctx context.Context) (*ProjectedContext, error) {
+	sid := c.SessionID()
+	raw, err := c.postEnvelope(ctx, "context.pull", map[string]any{}, sid, nil)
+	if err != nil {
+		var gerr *G2AError
+		if errors.As(err, &gerr) && gerr.Code == "resource_limit" && gerr.RetryAfterMs != nil {
+			c.mu.Lock()
+			c.nextAllowedPullMs = time.Now().UnixMilli() + *gerr.RetryAfterMs
+			c.mu.Unlock()
+		}
+		return nil, err
+	}
+	var pc ProjectedContext
+	if err := UnmarshalStrict(raw, &pc); err != nil {
+		return nil, err
+	}
+	return &pc, nil
+}
+
+func (c *CoreSDK) PullContextIfDue(ctx context.Context) (*ProjectedContext, error) {
+	c.mu.Lock()
+	if c.closed || c.sessionID == "" || time.Now().UnixMilli() < c.nextAllowedPullMs {
+		c.mu.Unlock()
+		return nil, nil
+	}
+	c.mu.Unlock()
+
+	pc, err := c.PullContext(ctx)
+	if err != nil {
+		var gerr *G2AError
+		if errors.As(err, &gerr) && gerr.Code == "resource_limit" {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return pc, nil
+}
+
+func (c *CoreSDK) SubmitQueueWithRecovery(ctx context.Context, queue MethodCallQueue) (*QueueReceipt, error) {
+	return c.submitQueueDepth(ctx, queue, 0)
+}
+
+func (c *CoreSDK) submitQueueDepth(ctx context.Context, queue MethodCallQueue, depth int) (*QueueReceipt, error) {
+	now := time.Now().UnixMilli()
+	var fp string
+	if queue.Trigger == "proactive" {
+		fp, _ = DigestSHA256("g2a.fp.v1", queue.Steps)
+	}
+
+	c.mu.Lock()
+	if c.closed || c.sessionID == "" {
+		c.mu.Unlock()
+		return nil, nil
+	}
+	sid := c.sessionID
+	for k, until := range c.refusalCooldowns {
+		if now >= until {
+			delete(c.refusalCooldowns, k)
+		}
+	}
+	if queue.Trigger == "proactive" && fp != "" {
+		if until, blocked := c.refusalCooldowns[fp]; blocked && now < until {
+			c.mu.Unlock()
+			return nil, nil
+		}
+	}
+	c.mu.Unlock()
+
+	raw, err := c.postEnvelope(ctx, "queue.submit", queue, sid, nil)
+	if err == nil {
+		var rec QueueReceipt
+		if uErr := UnmarshalStrict(raw, &rec); uErr != nil {
+			return nil, uErr
+		}
+		return &rec, nil
+	}
+
+	var gerr *G2AError
+	if !errors.As(err, &gerr) {
+		return nil, err
+	}
+	switch gerr.Code {
+	case "confirmation_required":
+		c.mu.Lock()
+		if _, fastConfirmed := c.earlyConfirmed[queue.QueueID]; fastConfirmed {
+			delete(c.earlyConfirmed, queue.QueueID)
+			c.mu.Unlock()
+			return c.submitQueueDepth(ctx, queue, depth)
+		}
+		if cdMs, fastDeclined := c.earlyDeclined[queue.QueueID]; fastDeclined {
+			delete(c.earlyDeclined, queue.QueueID)
+			fpDecl, _ := DigestSHA256("g2a.fp.v1", queue.Steps)
+			if fpDecl != "" {
+				c.refusalCooldowns[fpDecl] = time.Now().UnixMilli() + cdMs
+			}
+			c.mu.Unlock()
+			return nil, nil
+		}
+		c.pendingConfirm[queue.QueueID] = queue
+		c.mu.Unlock()
+		return nil, nil
+	case "stale_context":
+		if gerr.FreshContext != nil && depth < 2 {
+			return c.onContextReceived(ctx, *gerr.FreshContext, depth+1)
+		}
+		return nil, nil
+	case "outcome_unknown":
+		return c.QueryQueue(ctx, queue.QueueID)
+	default:
+		return nil, err
+	}
+}
+
+func (c *CoreSDK) QueryQueue(ctx context.Context, queueID string) (*QueueReceipt, error) {
+	raw, err := c.postEnvelope(ctx, "queue.query", map[string]any{"queue_id": queueID}, c.SessionID(), nil)
+	if err != nil {
+		return nil, err
+	}
+	var rec QueueReceipt
+	if err := UnmarshalStrict(raw, &rec); err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
+func (c *CoreSDK) CancelQueue(ctx context.Context, queueID string) (*QueueReceipt, error) {
+	raw, err := c.postEnvelope(ctx, "queue.cancel", map[string]any{"queue_id": queueID}, c.SessionID(), nil)
+	if err != nil {
+		return nil, err
+	}
+	var rec QueueReceipt
+	if err := UnmarshalStrict(raw, &rec); err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
+func (c *CoreSDK) SendChat(ctx context.Context, audience, text string) error {
+	if audience == "" {
+		audience = "player_only"
+	}
+	_, err := c.postEnvelope(ctx, "chat.send", map[string]any{
+		"message_id": "msg-" + randomHex(6),
+		"audience":   audience,
+		"text":       text,
+		"provenance": "ai_companion",
+	}, c.SessionID(), nil)
+	return err
+}
+
+func (c *CoreSDK) OnEventQueueConfirmed(ctx context.Context, queueID string) (*QueueReceipt, error) {
+	c.mu.Lock()
+	q, exists := c.pendingConfirm[queueID]
+	if exists {
+		delete(c.pendingConfirm, queueID)
+		c.mu.Unlock()
+		return c.SubmitQueueWithRecovery(ctx, q)
+	}
+	c.earlyConfirmed[queueID] = struct{}{}
+	c.mu.Unlock()
+	return nil, nil
+}
+
+func (c *CoreSDK) OnEventQueueDeclined(queueID string, cooldownMs int64) {
+	if cooldownMs <= 0 {
+		cooldownMs = 60000
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if q, exists := c.pendingConfirm[queueID]; exists {
+		delete(c.pendingConfirm, queueID)
+		if fp, err := DigestSHA256("g2a.fp.v1", q.Steps); err == nil && fp != "" {
+			c.refusalCooldowns[fp] = time.Now().UnixMilli() + cooldownMs
+		}
+		return
+	}
+	c.earlyDeclined[queueID] = cooldownMs
+}
+
+func (c *CoreSDK) Shutdown(ctx context.Context, notifyHub bool) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	sid := c.sessionID
+	cancel := c.cancelBg
+	c.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if notifyHub && sid != "" {
+		_, _ = c.postEnvelope(ctx, "session.close", map[string]any{"reason": "client_shutdown"}, sid, nil)
+	}
+}
+
+func (c *CoreSDK) onContextReceived(ctx context.Context, pc ProjectedContext, depth int) (*QueueReceipt, error) {
+	c.mu.Lock()
+	if c.closed || c.actionsPaused || c.sessionID == "" {
+		c.mu.Unlock()
+		return nil, nil
+	}
+	caps := c.capabilityCache[pc.CapabilityTableDigest]
+	var playerID string
+	if c.frozenScope != nil {
+		playerID = c.frozenScope.PlayerID
+	}
+	c.mu.Unlock()
+
+	var recalled []MemoryRecord
+	if c.Memory != nil && playerID != "" {
+		hint := ""
+		if pc.PlayerCommand != nil {
+			hint = *pc.PlayerCommand
+		}
+		recalled = c.Memory.RecallSafe(playerID, SpoilerGuard{
+			CurrentEpoch:        pc.Epoch,
+			AllowedTimelineTags: pc.AllowedTimelineTags,
+			QueryHint:           hint,
+			MaxResults:          48,
+		})
+	}
+
+	decision, err := c.Planner.Plan(caps, pc, recalled)
+	if err != nil {
+		return nil, err
+	}
+	if decision.ReplyText != "" {
+		_ = c.SendChat(ctx, decision.Audience, decision.ReplyText)
+	}
+	if len(decision.PlannedSteps) > 0 {
+		isCmd := pc.PlayerCommand != nil && *pc.PlayerCommand != ""
+		trigger := "proactive"
+		if isCmd {
+			trigger = "player_command"
+		}
+		q := MethodCallQueue{
+			QueueID:       "Q-" + randomHex(6),
+			Epoch:         pc.Epoch,
+			BasedOnRev:    pc.Rev,
+			Trigger:       trigger,
+			Supersedes:    isCmd,
+			IntentSummary: decision.IntentSummary,
+			Steps:         decision.PlannedSteps,
+		}
+		return c.submitQueueDepth(ctx, q, depth)
+	}
+	return nil, nil
+}
+
+func (c *CoreSDK) handlePushFrame(ctx context.Context, raw []byte) {
+	var env struct {
+		EventID string          `json:"event_id"`
+		Event   string          `json:"event"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	if err := UnmarshalStrict(raw, &env); err != nil {
+		return
+	}
+	if env.EventID != "" {
+		c.mu.Lock()
+		if _, dup := c.seenSet[env.EventID]; dup {
+			c.mu.Unlock()
+			return
+		}
+		c.seenSet[env.EventID] = struct{}{}
+		c.seenOrder = append(c.seenOrder, env.EventID)
+		c.lastEventID = env.EventID
+		if len(c.seenOrder) > maxSeenEventIDs {
+			oldest := c.seenOrder[0]
+			c.seenOrder = c.seenOrder[1:]
+			delete(c.seenSet, oldest)
+		}
+		c.mu.Unlock()
+	}
+
+	switch env.Event {
+	case "context.push":
+		c.mu.Lock()
+		c.nextAllowedPullMs = 0
+		c.mu.Unlock()
+		var pc ProjectedContext
+		if err := UnmarshalStrict(env.Payload, &pc); err == nil {
+			_, _ = c.onContextReceived(ctx, pc, 0)
+		}
+	case "capabilities.updated":
+		var capEv struct {
+			SlotID                string            `json:"slot_id"`
+			CapabilityTableDigest string            `json:"capability_table_digest"`
+			CapabilityTable       []CapabilityEntry `json:"capability_table"`
+		}
+		if err := UnmarshalStrict(env.Payload, &capEv); err == nil && len(capEv.CapabilityTable) > 0 {
+			if verified, err := DigestSHA256("g2a.cap.v1", capEv.CapabilityTable); err == nil && verified == capEv.CapabilityTableDigest {
+				c.mu.Lock()
+				c.capabilityCache[capEv.CapabilityTableDigest] = capEv.CapabilityTable
+				if capEv.SlotID != "" {
+					c.slotDigests[capEv.SlotID] = capEv.CapabilityTableDigest
+				}
+				c.mu.Unlock()
+			}
+		}
+	case "queue.confirmed":
+		var p struct {
+			QueueID string `json:"queue_id"`
+		}
+		if err := UnmarshalStrict(env.Payload, &p); err == nil && p.QueueID != "" {
+			_, _ = c.OnEventQueueConfirmed(ctx, p.QueueID)
+		}
+	case "queue.declined":
+		var p struct {
+			QueueID    string `json:"queue_id"`
+			CooldownMs int64  `json:"cooldown_ms"`
+		}
+		if err := UnmarshalStrict(env.Payload, &p); err == nil && p.QueueID != "" {
+			c.OnEventQueueDeclined(p.QueueID, p.CooldownMs)
+		}
+	case "session.resumed":
+		c.mu.Lock()
+		c.actionsPaused = false
+		c.mu.Unlock()
+		var pc ProjectedContext
+		if err := UnmarshalStrict(env.Payload, &pc); err == nil {
+			_, _ = c.onContextReceived(ctx, pc, 0)
+		}
+	case "session.closed":
+		c.Shutdown(context.Background(), false)
+	}
+}
+
+func (c *CoreSDK) heartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sid := c.SessionID()
+			if sid == "" {
+				return
+			}
+			_, err := c.postEnvelope(ctx, "session.heartbeat", map[string]any{}, sid, nil)
+			var gerr *G2AError
+			if errors.As(err, &gerr) && (gerr.Code == "revoked" || gerr.Code == "permission_denied") {
+				c.Shutdown(context.Background(), false)
+				return
+			}
+		}
+	}
+}
+
+func (c *CoreSDK) sseStreamLoop(ctx context.Context) {
+	readyOnce := sync.Once{}
+	isReconnect := false
+	for ctx.Err() == nil {
+		c.mu.Lock()
+		base, tok, sid, lastID := c.hubEndpoint, c.authToken, c.sessionID, c.lastEventID
+		c.mu.Unlock()
+		if isReconnect {
+			if raw, err := c.postEnvelope(ctx, "session.resume", map[string]any{}, sid, nil); err == nil {
+				var res struct {
+					ActionsPaused bool `json:"actions_paused"`
+				}
+				_ = json.Unmarshal(raw, &res)
+				c.mu.Lock()
+				c.actionsPaused = res.ActionsPaused
+				c.mu.Unlock()
+			}
+		}
+		u := fmt.Sprintf("%s/g2a/v1/core/events?session_id=%s", base, url.QueryEscape(sid))
+		if isReconnect {
+			u += "&replay=1"
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Authorization", "Bearer "+tok)
+		if lastID != "" {
+			req.Header.Set("Last-Event-ID", lastID)
+		}
+		sseClient := &http.Client{Transport: c.httpClient.Transport}
+		resp, err := sseClient.Do(req)
+		if err != nil {
+			isReconnect = true
+			time.Sleep(150 * time.Millisecond)
+			continue
+		}
+		readyOnce.Do(func() { close(c.streamReady) })
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 64*1024), 2<<20)
+		var dataLines []string
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				if len(dataLines) > 0 {
+					joined := strings.Join(dataLines, "\n")
+					dataLines = dataLines[:0]
+					c.handlePushFrame(ctx, []byte(joined))
+				}
+			} else if strings.HasPrefix(line, "data:") {
+				dataLines = append(dataLines, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+			}
+		}
+		_ = resp.Body.Close()
+		isReconnect = true
+		time.Sleep(150 * time.Millisecond)
+	}
+}
+
+func (c *CoreSDK) wsStreamLoop(ctx context.Context) {
+	readyOnce := sync.Once{}
+	isReconnect := false
+	for ctx.Err() == nil {
+		c.mu.Lock()
+		base, tok, sid, lastID := c.hubEndpoint, c.authToken, c.sessionID, c.lastEventID
+		c.mu.Unlock()
+		if isReconnect {
+			_, _ = c.postEnvelope(ctx, "session.resume", map[string]any{}, sid, nil)
+		}
+		conn, reader, err := dialRFC6455(ctx, base, sid, tok, isReconnect, lastID)
+		if err != nil {
+			isReconnect = true
+			time.Sleep(150 * time.Millisecond)
+			continue
+		}
+		go func(cl net.Conn) {
+			<-ctx.Done()
+			_ = cl.Close()
+		}(conn)
+		readyOnce.Do(func() { close(c.streamReady) })
+		for ctx.Err() == nil {
+			opcode, payload, err := readWSServerFrame(reader)
+			if err != nil {
+				break
+			}
+			switch opcode {
+			case 0x1: // Text
+				c.handlePushFrame(ctx, payload)
+			case 0x9: // Ping -> masked Pong
+				_ = writeWSMaskedControlFrame(conn, 0xA, payload)
+			case 0x8: // Close
+				_ = writeWSMaskedControlFrame(conn, 0x8, nil)
+				_ = conn.Close()
+				goto reconnect
+			}
+		}
+	reconnect:
+		_ = conn.Close()
+		isReconnect = true
+		time.Sleep(150 * time.Millisecond)
+	}
+}
+
+func dialRFC6455(ctx context.Context, base, sid, tok string, isReconnect bool, lastID string) (net.Conn, *bufio.Reader, error) {
+	u, err := url.Parse(base)
+	if err != nil {
+		return nil, nil, err
+	}
+	hostPort := u.Host
+	if u.Port() == "" {
+		if u.Scheme == "https" {
+			hostPort = net.JoinHostPort(u.Hostname(), "443")
+		} else {
+			hostPort = net.JoinHostPort(u.Hostname(), "80")
+		}
+	}
+	var d net.Dialer
+	rawConn, err := d.DialContext(ctx, "tcp", hostPort)
+	if err != nil {
+		return nil, nil, err
+	}
+	conn := rawConn
+	if u.Scheme == "https" {
+		tlsConn := tls.Client(rawConn, &tls.Config{ServerName: u.Hostname(), MinVersion: tls.VersionTLS13})
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = rawConn.Close()
+			return nil, nil, err
+		}
+		conn = tlsConn
+	}
+
+	var keyBytes [16]byte
+	_, _ = rand.Read(keyBytes[:])
+	wsKey := base64.StdEncoding.EncodeToString(keyBytes[:])
+	sum := sha1.Sum([]byte(wsKey + wsMagicGUID))
+	expectedAccept := base64.StdEncoding.EncodeToString(sum[:])
+
+	path := strings.TrimRight(u.Path, "/") + "/g2a/v1/core/ws?session_id=" + url.QueryEscape(sid)
+	if isReconnect {
+		path += "&replay=1"
+	}
+	var reqBuf bytes.Buffer
+	fmt.Fprintf(&reqBuf, "GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nAuthorization: Bearer %s\r\n",
+		path, u.Host, wsKey, tok)
+	if lastID != "" {
+		fmt.Fprintf(&reqBuf, "Last-Event-ID: %s\r\n", lastID)
+	}
+	reqBuf.WriteString("\r\n")
+	if _, err := conn.Write(reqBuf.Bytes()); err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+
+	reader := bufio.NewReader(conn)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil || !strings.Contains(statusLine, " 101 ") {
+		_ = conn.Close()
+		return nil, nil, errors.New("WebSocket upgrade failed")
+	}
+	gotAccept := ""
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			_ = conn.Close()
+			return nil, nil, err
+		}
+		trimmed := strings.TrimRight(line, "\r\n")
+		if trimmed == "" {
+			break
+		}
+		if k, v, ok := strings.Cut(trimmed, ":"); ok && strings.EqualFold(strings.TrimSpace(k), "Sec-WebSocket-Accept") {
+			gotAccept = strings.TrimSpace(v)
+		}
+	}
+	if gotAccept != expectedAccept {
+		_ = conn.Close()
+		return nil, nil, errors.New("RFC 6455 Sec-WebSocket-Accept verification failed")
+	}
+	return conn, reader, nil
+}
+
+func readWSServerFrame(r *bufio.Reader) (byte, []byte, error) {
+	var hdr [2]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return 0, nil, err
+	}
+	opcode := hdr[0] & 0x0F
+	masked := (hdr[1] & 0x80) != 0
+	length := uint64(hdr[1] & 0x7F)
+	if length == 126 {
+		var ext [2]byte
+		if _, err := io.ReadFull(r, ext[:]); err != nil {
+			return 0, nil, err
+		}
+		length = uint64(binary.BigEndian.Uint16(ext[:]))
+	} else if length == 127 {
+		var ext [8]byte
+		if _, err := io.ReadFull(r, ext[:]); err != nil {
+			return 0, nil, err
+		}
+		length = binary.BigEndian.Uint64(ext[:])
+	}
+	if length > (2 << 20) {
+		return 0, nil, errors.New("WS frame exceeds 2 MiB")
+	}
+	var maskKey [4]byte
+	if masked {
+		if _, err := io.ReadFull(r, maskKey[:]); err != nil {
+			return 0, nil, err
+		}
+	}
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return 0, nil, err
+	}
+	if masked {
+		for i := range payload {
+			payload[i] ^= maskKey[i%4]
+		}
+	}
+	return opcode, payload, nil
+}
+
+func writeWSMaskedControlFrame(conn net.Conn, opcode byte, payload []byte) error {
+	if len(payload) > 125 {
+		payload = payload[:125]
+	}
+	var mask [4]byte
+	_, _ = rand.Read(mask[:])
+	frame := make([]byte, 0, 6+len(payload))
+	frame = append(frame, 0x80|opcode, 0x80|byte(len(payload)))
+	frame = append(frame, mask[:]...)
+	for i, b := range payload {
+		frame = append(frame, b^mask[i%4])
+	}
+	_, err := conn.Write(frame)
+	return err
+}
+
+func (c *CoreSDK) postEnvelope(
+	ctx context.Context,
+	operation string,
+	payload any,
+	sessionID string,
+	extensions map[string]any,
+) (json.RawMessage, error) {
+	if c.CustomPostTransport != nil {
+		return c.CustomPostTransport(ctx, operation, payload, sessionID)
+	}
+	c.mu.Lock()
+	base, tok := c.hubEndpoint, c.authToken
+	c.mu.Unlock()
+
+	if extensions == nil {
+		extensions = map[string]any{}
+	}
+	env := map[string]any{
+		"g2a_version":  G2AWireVersion,
+		"request_id":   "go-core-" + randomHex(6),
+		"timestamp_ms": time.Now().UnixMilli(),
+		"operation":    operation,
+		"payload":      payload,
+		"extensions":   extensions,
+	}
+	if sessionID != "" {
+		env["session_id"] = sessionID
+	}
+	rawReq, err := json.Marshal(env)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/g2a/v1/core", bytes.NewReader(rawReq))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	var reply struct {
+		Acceptance string          `json:"acceptance"`
+		Result     json.RawMessage `json:"result"`
+		Error      *G2AError       `json:"error"`
+	}
+	if err := UnmarshalStrict(respBytes, &reply); err != nil {
+		return nil, err
+	}
+	if reply.Acceptance == "accepted" {
+		return reply.Result, nil
+	}
+	gerr := reply.Error
+	if gerr == nil {
+		gerr = &G2AError{Code: "invalid_request", HTTPStatus: resp.StatusCode, Message: "Request not accepted"}
+	}
+	if gerr.RetryAfterMs == nil {
+		if ra := resp.Header.Get("Retry-After"); ra != "" {
+			if secs, pErr := strconv.ParseInt(strings.TrimSpace(ra), 10, 64); pErr == nil {
+				ms := secs * 1000
+				gerr.RetryAfterMs = &ms
+			}
+		}
+	}
+	return nil, gerr
+}
+
+func randomHex(nBytes int) string {
+	b := make([]byte, nBytes)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}

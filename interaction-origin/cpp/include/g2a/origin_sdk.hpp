@@ -131,6 +131,184 @@ struct EffectOutcome {
     static EffectOutcome StartedExecuting(std::function<void()> cancel) { return {"executing", {}, "", std::move(cancel)}; }
 };
 
+struct Pose3D {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+    double yaw_deg = 0.0;
+
+    double distance_to(const Pose3D& o) const {
+        double dx = o.x - x, dy = o.y - y, dz = o.z - z;
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    // Formats a 360-degree yaw-relative player deictic anchor ("ahead 2.4m", "front-right 4.0m", "pointed_ray 3.1m").
+    std::string format_player_deictic_anchor(const Pose3D& target, bool is_pointed = false) const {
+        double dist = distance_to(target);
+        char dist_buf[32];
+        std::snprintf(dist_buf, sizeof(dist_buf), "%.1fm", dist);
+        if (is_pointed) return std::string("pointed_ray ") + dist_buf;
+        double dx = target.x - x;
+        double dz = target.z - z;
+        if (dx * dx + dz * dz < 1e-6) return std::string("here ") + dist_buf;
+        constexpr double kRadToDeg = 180.0 / 3.14159265358979323846;
+        double world_deg = std::atan2(dx, dz) * kRadToDeg;
+        double rel = std::fmod(world_deg - yaw_deg, 360.0);
+        if (rel > 180.0) rel -= 360.0;
+        else if (rel <= -180.0) rel += 360.0;
+
+        const char* sector = "behind";
+        if (rel >= -22.5 && rel <= 22.5) sector = "ahead";
+        else if (rel > 22.5 && rel <= 67.5) sector = "front-right";
+        else if (rel > 67.5 && rel <= 112.5) sector = "right";
+        else if (rel > 112.5 && rel <= 157.5) sector = "back-right";
+        else if (rel >= -67.5 && rel < -22.5) sector = "front-left";
+        else if (rel >= -112.5 && rel < -67.5) sector = "left";
+        else if (rel >= -157.5 && rel < -112.5) sector = "back-left";
+        return std::string(sector) + " " + dist_buf;
+    }
+};
+
+namespace schema_detail {
+
+inline std::optional<double> as_num(const JsonValue& v) {
+    if (const auto* iv = std::get_if<int64_t>(&v.data)) return static_cast<double>(*iv);
+    if (const auto* fv = std::get_if<double>(&v.data)) return *fv;
+    return std::nullopt;
+}
+
+inline std::optional<int64_t> as_int(const JsonValue& v) {
+    if (const auto* iv = std::get_if<int64_t>(&v.data)) return *iv;
+    if (const auto* fv = std::get_if<double>(&v.data)) {
+        if (std::isfinite(*fv) && std::floor(*fv) == *fv) return static_cast<int64_t>(*fv);
+    }
+    return std::nullopt;
+}
+
+inline std::string check_bounds(const std::string& name, double val, const JsonObject& spec) {
+    if (auto it = spec.find("minimum"); it != spec.end()) {
+        if (auto m = as_num(it->second); m && val < *m) return "below_minimum:" + name;
+    }
+    if (auto it = spec.find("maximum"); it != spec.end()) {
+        if (auto m = as_num(it->second); m && val > *m) return "above_maximum:" + name;
+    }
+    if (auto it = spec.find("exclusiveMinimum"); it != spec.end()) {
+        if (auto m = as_num(it->second); m && val <= *m) return "below_exclusive_minimum:" + name;
+    }
+    if (auto it = spec.find("exclusiveMaximum"); it != spec.end()) {
+        if (auto m = as_num(it->second); m && val >= *m) return "above_exclusive_maximum:" + name;
+    }
+    return "";
+}
+
+inline std::string validate_object(const JsonObject& args, const JsonObject& schema, const std::string& prefix, int depth);
+
+inline std::string validate_field(const std::string& name, const JsonValue& val, const JsonObject& spec, int depth) {
+    if (depth > 16) return "schema_depth_exceeded";
+    auto t_it = spec.find("type");
+    if (t_it == spec.end()) return "";
+    const auto* ptype = std::get_if<std::string>(&t_it->second.data);
+    if (!ptype) return "";
+
+    if (*ptype == "string") {
+        const auto* s = std::get_if<std::string>(&val.data);
+        if (!s) return "invalid_type:" + name;
+        if (auto it = spec.find("minLength"); it != spec.end()) {
+            if (auto ml = as_int(it->second); ml && static_cast<int64_t>(s->size()) < *ml) return "min_length:" + name;
+        }
+        if (auto it = spec.find("maxLength"); it != spec.end()) {
+            if (auto ml = as_int(it->second); ml && static_cast<int64_t>(s->size()) > *ml) return "max_length:" + name;
+        }
+        if (auto it = spec.find("enum"); it != spec.end()) {
+            if (const auto* arr = std::get_if<JsonArray>(&it->second.data)) {
+                bool matched = false;
+                for (const auto& e : *arr) {
+                    if (const auto* es = std::get_if<std::string>(&e.data); es && *es == *s) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) return "invalid_enum:" + name;
+            }
+        }
+    } else if (*ptype == "boolean") {
+        if (!std::holds_alternative<bool>(val.data)) return "invalid_type:" + name;
+    } else if (*ptype == "integer") {
+        auto iv = as_int(val);
+        if (!iv) return "invalid_type:" + name;
+        return check_bounds(name, static_cast<double>(*iv), spec);
+    } else if (*ptype == "number") {
+        auto fv = as_num(val);
+        if (!fv || !std::isfinite(*fv)) return "invalid_type:" + name;
+        return check_bounds(name, *fv, spec);
+    } else if (*ptype == "array") {
+        const auto* arr = std::get_if<JsonArray>(&val.data);
+        if (!arr) return "invalid_type:" + name;
+        if (auto it = spec.find("minItems"); it != spec.end()) {
+            if (auto mi = as_int(it->second); mi && static_cast<int64_t>(arr->size()) < *mi) return "min_items:" + name;
+        }
+        if (auto it = spec.find("maxItems"); it != spec.end()) {
+            if (auto ma = as_int(it->second); ma && static_cast<int64_t>(arr->size()) > *ma) return "max_items:" + name;
+        }
+        if (auto it = spec.find("items"); it != spec.end()) {
+            if (const auto* item_spec = std::get_if<JsonObject>(&it->second.data)) {
+                for (size_t i = 0; i < arr->size(); ++i) {
+                    std::string err = validate_field(name + "[" + std::to_string(i) + "]", (*arr)[i], *item_spec, depth + 1);
+                    if (!err.empty()) return err;
+                }
+            }
+        }
+    } else if (*ptype == "object") {
+        const auto* sub = std::get_if<JsonObject>(&val.data);
+        if (!sub) return "invalid_type:" + name;
+        return validate_object(*sub, spec, name, depth + 1);
+    }
+    return "";
+}
+
+inline std::string validate_object(const JsonObject& args, const JsonObject& schema, const std::string& prefix, int depth) {
+    if (depth > 16) return "schema_depth_exceeded";
+    if (schema.empty()) return "";
+    if (auto req_it = schema.find("required"); req_it != schema.end()) {
+        if (const auto* req_arr = std::get_if<JsonArray>(&req_it->second.data)) {
+            for (const auto& item : *req_arr) {
+                if (const auto* k = std::get_if<std::string>(&item.data)) {
+                    if (args.find(*k) == args.end()) {
+                        return "missing_required_arg:" + (prefix.empty() ? *k : prefix + "." + *k);
+                    }
+                }
+            }
+        }
+    }
+    if (auto prop_it = schema.find("properties"); prop_it != schema.end()) {
+        if (const auto* props = std::get_if<JsonObject>(&prop_it->second.data)) {
+            bool no_extra = false;
+            if (auto ap_it = schema.find("additionalProperties"); ap_it != schema.end()) {
+                if (const auto* b = std::get_if<bool>(&ap_it->second.data)) no_extra = (*b == false);
+            }
+            if (no_extra) {
+                for (const auto& [k, _] : args) {
+                    if (props->find(k) == props->end()) {
+                        return "unexpected_arg:" + (prefix.empty() ? k : prefix + "." + k);
+                    }
+                }
+            }
+            for (const auto& [k, v] : args) {
+                if (auto s_it = props->find(k); s_it != props->end()) {
+                    if (const auto* spec = std::get_if<JsonObject>(&s_it->second.data)) {
+                        std::string qual = prefix.empty() ? k : prefix + "." + k;
+                        std::string err = validate_field(qual, v, *spec, depth + 1);
+                        if (!err.empty()) return err;
+                    }
+                }
+            }
+        }
+    }
+    return "";
+}
+
+} // namespace schema_detail
+
 using TransportPostFn = std::function<void(const std::string& operation, const JsonValue& payload)>;
 using DomainEffectFn = std::function<EffectOutcome(const std::string& actor, const JsonObject& args, const std::string& exec_id)>;
 
@@ -371,17 +549,9 @@ public:
         if (std::find(allowed.begin(), allowed.end(), *req.actor) == allowed.end()) {
             return {req.execution_id, "failed", std::nullopt, "permission_denied"};
         }
-        auto req_it = cap_it->second.def.params_schema.find("required");
-        if (req_it != cap_it->second.def.params_schema.end()) {
-            if (const auto* req_arr = std::get_if<JsonArray>(&req_it->second.data)) {
-                for (const auto& item : *req_arr) {
-                    if (const auto* key_str = std::get_if<std::string>(&item.data)) {
-                        if (req.args.find(*key_str) == req.args.end()) {
-                            return {req.execution_id, "failed", std::nullopt, "missing_required_arg:" + *key_str};
-                        }
-                    }
-                }
-            }
+        std::string schema_err = schema_detail::validate_object(req.args, cap_it->second.def.params_schema, "", 0);
+        if (!schema_err.empty()) {
+            return {req.execution_id, "failed", std::nullopt, schema_err};
         }
 
         EffectOutcome out = cap_it->second.handler(*req.actor, req.args, req.execution_id);
