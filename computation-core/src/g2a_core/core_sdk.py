@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.client
+import inspect
 import json
 import os
 import random
@@ -20,6 +21,14 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Protocol, Union
 
+from .agent_runtime import (
+    ActionOutcomeRecord,
+    AgentGoalState,
+    AgentGoalTracker,
+    GoalExecutionReport,
+    resolve_deictic_target,
+    resolve_prerequisite_steps,
+)
 from .jcs import jcs_sha256, parse_strict_json
 from .memory import InMemoryCompanionStore, MemoryRecord, SpoilerGuard
 from .schemas import (
@@ -78,20 +87,35 @@ class CognitivePlannerPort(Protocol):
 
 
 class FunctionCognitivePlanner:
-    """Ergonomic adapter wrapping a plain callable `(caps, ctx, memories) -> PlanDecision` into CognitivePlannerPort."""
+    """Ergonomic adapter wrapping a plain callable `(caps, ctx, memories[, active_goal, recent_outcomes]) -> PlanDecision`."""
 
     def __init__(
         self,
-        fn: Callable[[List[CapabilityEntry], ProjectedContext, List[MemoryRecord]], PlanDecision],
+        fn: Callable[..., PlanDecision],
     ) -> None:
         self._fn = fn
+        try:
+            params = inspect.signature(fn).parameters
+            self._accepts_goal = "active_goal" in params or "recent_outcomes" in params
+        except (TypeError, ValueError):
+            self._accepts_goal = False
 
     def plan(
         self,
         capabilities: List[CapabilityEntry],
         context: ProjectedContext,
         recalled_memories: List[MemoryRecord],
+        active_goal: Optional[AgentGoalState] = None,
+        recent_outcomes: Optional[List[ActionOutcomeRecord]] = None,
     ) -> PlanDecision:
+        if self._accepts_goal:
+            return self._fn(
+                capabilities,
+                context,
+                recalled_memories,
+                active_goal=active_goal,
+                recent_outcomes=recent_outcomes,
+            )
         return self._fn(capabilities, context, recalled_memories)
 
 
@@ -157,6 +181,23 @@ class QueueBuilder:
                     raise G2AError("invalid_arguments", 400, f"Arguments for {method_id} failed local JSON Schema check")
 
         self._steps.append(QueueStep(step_index=idx, method_id=method_id, actor=actor, args=step_args))
+        return self
+
+    def add_step_auto(
+        self,
+        method_id: str,
+        actor: str,
+        args: Optional[Dict[str, Any]] = None,
+        validate: bool = True,
+    ) -> "QueueBuilder":
+        """
+        Automatically unrolls `"staged"` targets/methods into a valid `[ready_prerequisite, ..., target_step]`
+        chain (e.g. prepending `#01 move_to` when `prerequisite_hint` requires proximity) before validation.
+        """
+        caps = list(self._cap_map.values())
+        chain = resolve_prerequisite_steps(method_id, actor, args, self._ctx, caps)
+        for c_mid, c_actor, c_args in chain:
+            self.add_step(c_mid, c_actor, c_args, validate=validate)
         return self
 
     def build(self, queue_id: Optional[str] = None) -> MethodCallQueue:
@@ -235,10 +276,13 @@ class CoreSDK:
 
         self._stop_event = threading.Event()
         self._stream_ready = threading.Event()
+        self._goal_wakeup = threading.Event()
+        self._in_execute_goal: bool = False
         self._hb_thread: Optional[threading.Thread] = None
         self._sse_thread: Optional[threading.Thread] = None
         self.on_receipt_callback: Optional[Callable[[QueueReceipt], None]] = None
         self.metrics = CoreMetrics()
+        self.goal_tracker = AgentGoalTracker()
 
     @property
     def is_stream_ready(self) -> bool:
@@ -496,23 +540,83 @@ class CoreSDK:
                 return None
             raise
 
+    def _call_planner(
+        self,
+        caps: List[CapabilityEntry],
+        ctx: ProjectedContext,
+        memories: List[MemoryRecord],
+    ) -> PlanDecision:
+        plan_fn = self.planner.plan
+        try:
+            sig = inspect.signature(plan_fn)
+            if "active_goal" in sig.parameters or "recent_outcomes" in sig.parameters:
+                return plan_fn(  # type: ignore[call-arg]
+                    caps,
+                    ctx,
+                    memories,
+                    active_goal=self.goal_tracker.active_goal,
+                    recent_outcomes=self.goal_tracker.recent_outcomes,
+                )
+        except (TypeError, ValueError):
+            pass
+        return plan_fn(caps, ctx, memories)
+
     def on_context_received(self, ctx: ProjectedContext, _replan_depth: int = 0) -> Optional[QueueReceipt]:
         if self.closed or self.actions_paused or not self.session_id or not self.scope:
             return None
         self.metrics.contexts_received += 1
         self.latest_context = ctx
-        caps = self.capability_cache.get(ctx.capability_table_digest, [])
-        allowed_tags = set(ctx.allowed_timeline_tags) if ctx.allowed_timeline_tags is not None else None
+        if self._in_execute_goal:
+            self._goal_wakeup.set()
+            return None
+
+        # If a new player_command arrives while an older autonomous goal was running, supersede it cleanly;
+        # conversely, if an autonomous multi-turn goal is in_progress and player_command is None, synthesize the objective!
+        active_goal = self.goal_tracker.active_goal
+        effective_ctx = ctx
+        if ctx.player_command:
+            if active_goal is not None and active_goal.objective != ctx.player_command:
+                self.goal_tracker.clear_goal(status="superseded")
+                active_goal = None
+        elif active_goal is not None and active_goal.status == "in_progress":
+            if active_goal.turns_used >= active_goal.max_turns:
+                self.goal_tracker.clear_goal(status="exhausted")
+            else:
+                effective_ctx = ProjectedContext(
+                    slot_id=ctx.slot_id,
+                    epoch=ctx.epoch,
+                    rev=ctx.rev,
+                    capability_table_digest=ctx.capability_table_digest,
+                    state_brief=ctx.state_brief,
+                    active_methods=ctx.active_methods,
+                    player_command=active_goal.objective,
+                    visual_ref=ctx.visual_ref,
+                    audio_ref=ctx.audio_ref,
+                    allowed_timeline_tags=ctx.allowed_timeline_tags,
+                    extensions_data=ctx.extensions_data,
+                )
+
+        caps = self.capability_cache.get(effective_ctx.capability_table_digest, [])
+        allowed_tags = set(effective_ctx.allowed_timeline_tags) if effective_ctx.allowed_timeline_tags is not None else None
         memories = self.memory_store.recall_safe(
             self.scope.player_id,
             SpoilerGuard(
-                current_epoch=ctx.epoch,
+                current_epoch=effective_ctx.epoch,
                 game_origin_id=self.scope.game_instance_id,
                 allowed_timeline_tags=allowed_tags,
-                query_hint=ctx.player_command,
+                query_hint=effective_ctx.player_command,
             ),
         )
-        decision = self.planner.plan(caps, ctx, memories)
+        decision = self._call_planner(caps, effective_ctx, memories)
+
+        if decision.memory_note:
+            AgentGoalTracker.record_episodic_observation(
+                self.memory_store,
+                self.scope.player_id,
+                self.scope.game_instance_id,
+                effective_ctx,
+                decision.memory_note,
+            )
 
         if decision.reply_text and self.scope.allow_chat:
             self._post_envelope(
@@ -526,27 +630,252 @@ class CoreSDK:
                 session_id=self.session_id,
             )
 
-        if decision.planned_steps:
-            is_cmd = ctx.player_command is not None
+        # Anti-infinite-loop guard: strip any step that already failed on the exact same state_brief!
+        filtered_steps: List[QueueStep] = []
+        for s in decision.planned_steps:
+            if self.goal_tracker.is_failed_repeat(effective_ctx.state_brief, s.method_id, s.actor, s.args):
+                break
+            filtered_steps.append(QueueStep(len(filtered_steps), s.method_id, s.actor, s.args))
+
+        if filtered_steps:
+            if decision.goal_status == "continue" and self.goal_tracker.active_goal is None and effective_ctx.player_command:
+                self.goal_tracker.start_goal(effective_ctx.player_command)
+            if self.goal_tracker.active_goal is not None:
+                self.goal_tracker.active_goal.turns_used += 1
+
+            is_cmd = effective_ctx.player_command is not None
             queue = MethodCallQueue(
                 queue_id=generate_id("Q"),
-                epoch=ctx.epoch,
-                based_on_rev=ctx.rev,
+                epoch=effective_ctx.epoch,
+                based_on_rev=effective_ctx.rev,
                 trigger="player_command" if is_cmd else "proactive",
                 supersedes=is_cmd,
                 intent_summary=decision.intent_summary or "Execute planned companion queue",
-                steps=decision.planned_steps,
+                steps=filtered_steps,
             )
-            return self.submit_queue_with_standard_recovery(queue, _replan_depth=_replan_depth)
+            rec = self.submit_queue_with_standard_recovery(queue, _replan_depth=_replan_depth, _submit_ctx=effective_ctx)
+            if rec is not None and rec.queue_state == "completed" and decision.goal_status == "completed":
+                self.goal_tracker.clear_goal(status="completed")
+            return rec
+
+        if decision.goal_status in ("completed", "blocked"):
+            self.goal_tracker.clear_goal(status=decision.goal_status)
         return None
+
+    def execute_goal(
+        self,
+        objective: str,
+        success_when: Optional[Callable[[ProjectedContext, Optional[QueueReceipt]], bool]] = None,
+        max_turns: int = 6,
+        timeout_sec: float = 10.0,
+    ) -> GoalExecutionReport:
+        """
+        Closed-loop autonomous goal executor: plans, executes, waits for sustained steps or confirmations,
+        feeds step failures back into the planner for self-healing replanning, and verifies completion.
+        """
+        goal = self.goal_tracker.start_goal(objective, max_turns=max_turns)
+        deadline = time.monotonic() + timeout_sec
+        last_receipt: Optional[QueueReceipt] = None
+        last_ctx: Optional[ProjectedContext] = None
+        last_planned_rev: int = -1
+        self._in_execute_goal = True
+
+        def _pull_fresh_with_backoff() -> Optional[ProjectedContext]:
+            p = self.pull_context_if_due()
+            if p is not None:
+                return p
+            now_ms = int(time.time() * 1000)
+            if self.next_allowed_pull_ms > now_ms and time.monotonic() < deadline:
+                wait_s = min((self.next_allowed_pull_ms - now_ms) / 1000.0 + 0.015, max(0.01, deadline - time.monotonic()))
+                self._goal_wakeup.clear()
+                self._goal_wakeup.wait(timeout=wait_s)
+                return self.pull_context_if_due()
+            return None
+
+        try:
+            while time.monotonic() < deadline and not self.closed and not self.actions_paused:
+                pulled = _pull_fresh_with_backoff()
+                ctx = pulled or self.latest_context
+                if ctx is None:
+                    ctx = self.pull_context()
+                last_ctx = ctx
+
+                if success_when is not None and success_when(ctx, last_receipt):
+                    goal.status = "completed"
+                    return GoalExecutionReport(
+                        goal_id=goal.goal_id,
+                        objective=objective,
+                        succeeded=True,
+                        status="completed",
+                        turns_used=goal.turns_used,
+                        submitted_queues=list(goal.submitted_queues),
+                        outcomes=list(goal.recent_outcomes),
+                        final_context=ctx,
+                    )
+
+                if goal.turns_used >= max_turns:
+                    goal.status = "exhausted"
+                    return GoalExecutionReport(
+                        goal_id=goal.goal_id,
+                        objective=objective,
+                        succeeded=False,
+                        status="exhausted",
+                        turns_used=goal.turns_used,
+                        submitted_queues=list(goal.submitted_queues),
+                        outcomes=list(goal.recent_outcomes),
+                        final_context=ctx,
+                        failure_reason=goal.last_failure_reason or "max_turns_exceeded",
+                    )
+
+                # Wait if a sustained step is still running/executing or awaiting player confirmation on the same rev
+                if (
+                    (last_receipt is not None and last_receipt.queue_state in ("running", "executing") and ctx.rev == last_planned_rev)
+                    or bool(self.pending_confirm_queues)
+                ):
+                    self._goal_wakeup.clear()
+                    self._goal_wakeup.wait(timeout=min(0.15, max(0.01, deadline - time.monotonic())))
+                    continue
+
+                last_planned_rev = ctx.rev
+                synth_ctx = ProjectedContext(
+                    slot_id=ctx.slot_id,
+                    epoch=ctx.epoch,
+                    rev=ctx.rev,
+                    capability_table_digest=ctx.capability_table_digest,
+                    state_brief=ctx.state_brief,
+                    active_methods=ctx.active_methods,
+                    player_command=objective,
+                    visual_ref=ctx.visual_ref,
+                    audio_ref=ctx.audio_ref,
+                    allowed_timeline_tags=ctx.allowed_timeline_tags,
+                    extensions_data=ctx.extensions_data,
+                )
+                caps = self.capability_cache.get(synth_ctx.capability_table_digest, [])
+                allowed_tags = set(synth_ctx.allowed_timeline_tags) if synth_ctx.allowed_timeline_tags is not None else None
+                memories = (
+                    self.memory_store.recall_safe(
+                        self.scope.player_id,
+                        SpoilerGuard(
+                            current_epoch=synth_ctx.epoch,
+                            game_origin_id=self.scope.game_instance_id,
+                            allowed_timeline_tags=allowed_tags,
+                            query_hint=objective,
+                        ),
+                    )
+                    if self.scope is not None
+                    else []
+                )
+                decision = self._call_planner(caps, synth_ctx, memories)
+
+                if decision.memory_note and self.scope is not None:
+                    AgentGoalTracker.record_episodic_observation(
+                        self.memory_store,
+                        self.scope.player_id,
+                        self.scope.game_instance_id,
+                        synth_ctx,
+                        decision.memory_note,
+                    )
+                if decision.reply_text and self.scope is not None and self.scope.allow_chat:
+                    self.send_chat(decision.reply_text, audience=decision.audience)
+
+                filtered_steps = []
+                for s in decision.planned_steps:
+                    if self.goal_tracker.is_failed_repeat(synth_ctx.state_brief, s.method_id, s.actor, s.args):
+                        break
+                    filtered_steps.append(QueueStep(len(filtered_steps), s.method_id, s.actor, s.args))
+
+                if not filtered_steps:
+                    status = "blocked" if decision.goal_status == "blocked" else "no_executable_steps"
+                    return GoalExecutionReport(
+                        goal_id=goal.goal_id,
+                        objective=objective,
+                        succeeded=False,
+                        status=status,
+                        turns_used=goal.turns_used,
+                        submitted_queues=list(goal.submitted_queues),
+                        outcomes=list(goal.recent_outcomes),
+                        final_context=ctx,
+                        failure_reason=goal.last_failure_reason or status,
+                    )
+
+                goal.turns_used += 1
+                queue = MethodCallQueue(
+                    queue_id=generate_id("Q"),
+                    epoch=synth_ctx.epoch,
+                    based_on_rev=synth_ctx.rev,
+                    trigger="player_command",
+                    supersedes=(goal.turns_used == 1),
+                    intent_summary=decision.intent_summary or objective,
+                    steps=filtered_steps,
+                )
+                last_receipt = self.submit_queue_with_standard_recovery(queue, _submit_ctx=synth_ctx)
+                if last_receipt is not None and last_receipt.latest_context is not None:
+                    last_ctx = last_receipt.latest_context
+
+                # Pull fresh state after step execution so success_when / next turn sees updated world!
+                fresh_after = _pull_fresh_with_backoff()
+                if fresh_after is not None:
+                    last_ctx = fresh_after
+                elif self.latest_context is not None and self.latest_context.rev > synth_ctx.rev:
+                    last_ctx = self.latest_context
+
+                if success_when is not None and last_ctx is not None and success_when(last_ctx, last_receipt):
+                    return GoalExecutionReport(
+                        goal_id=goal.goal_id,
+                        objective=objective,
+                        succeeded=True,
+                        status="completed",
+                        turns_used=goal.turns_used,
+                        submitted_queues=list(goal.submitted_queues),
+                        outcomes=list(goal.recent_outcomes),
+                        final_context=last_ctx,
+                    )
+                if (
+                    success_when is None
+                    and last_receipt is not None
+                    and last_receipt.queue_state == "completed"
+                    and decision.goal_status == "completed"
+                ):
+                    return GoalExecutionReport(
+                        goal_id=goal.goal_id,
+                        objective=objective,
+                        succeeded=True,
+                        status="completed",
+                        turns_used=goal.turns_used,
+                        submitted_queues=list(goal.submitted_queues),
+                        outcomes=list(goal.recent_outcomes),
+                        final_context=last_ctx,
+                    )
+
+                if last_receipt is None or last_receipt.queue_state in ("running", "executing"):
+                    self._goal_wakeup.clear()
+                    self._goal_wakeup.wait(timeout=min(0.15, max(0.01, deadline - time.monotonic())))
+
+            return GoalExecutionReport(
+                goal_id=goal.goal_id,
+                objective=objective,
+                succeeded=False,
+                status="timeout" if time.monotonic() >= deadline else "aborted",
+                turns_used=goal.turns_used,
+                submitted_queues=list(goal.submitted_queues),
+                outcomes=list(goal.recent_outcomes),
+                final_context=last_ctx,
+                failure_reason=goal.last_failure_reason or "goal_timeout",
+            )
+        finally:
+            self._in_execute_goal = False
+            self.goal_tracker.clear_goal()
 
     def submit_queue_with_standard_recovery(
         self,
         queue: MethodCallQueue,
         _replan_depth: int = 0,
+        _submit_ctx: Optional[ProjectedContext] = None,
     ) -> Optional[QueueReceipt]:
         if self.closed or not self.session_id:
             return None
+        submitted_tuples = [(s.method_id, s.actor, s.args) for s in queue.steps]
+        ctx_snap = _submit_ctx or self.latest_context
         # Client-side refusal cooldown pre-filter for proactive queues (avoids redundant 429 network round-trips)
         now_ms = int(time.time() * 1000)
         with self._state_lock:
@@ -561,6 +890,7 @@ class CoreSDK:
             self.metrics.queues_submitted += 1
             res = self._post_envelope("queue.submit", queue.to_dict(), session_id=self.session_id)
             receipt = QueueReceipt.from_dict(res)
+            self.goal_tracker.record_receipt(receipt, submitted_tuples, ctx_snap)
             self._record_receipt(receipt)
             return receipt
         except G2AError as err:
@@ -581,8 +911,10 @@ class CoreSDK:
                     return self.submit_queue_with_standard_recovery(queue, _replan_depth=_replan_depth)
                 return None
             if err.code == "stale_context":
-                if err.fresh_context is not None and _replan_depth < 2:
-                    return self.on_context_received(err.fresh_context, _replan_depth=_replan_depth + 1)
+                if err.fresh_context is not None:
+                    self.latest_context = err.fresh_context
+                    if not self._in_execute_goal and _replan_depth < 2:
+                        return self.on_context_received(err.fresh_context, _replan_depth=_replan_depth + 1)
                 return None
             if err.code == "outcome_unknown":
                 # 504 timeout rule: NEVER blindly resend queue.submit or mint a new queue_id; reconcile via queue.query!
@@ -676,6 +1008,7 @@ class CoreSDK:
             self.on_event_session_resumed(ProjectedContext.from_dict(payload))
         elif ev_name == "session.closed":
             self.shutdown_session_cleanly(notify_hub=False)
+        self._goal_wakeup.set()
 
     # --- Transport Internals ---
 

@@ -112,6 +112,19 @@ type PlanDecision struct {
 	PlannedSteps  []QueueStep
 	ReplyText     string
 	Audience      string
+	GoalStatus    string // "completed" | "continue" | "blocked"
+	MemoryNote    string
+}
+
+type GoalExecutionReport struct {
+	GoalID          string            `json:"goal_id"`
+	Objective       string            `json:"objective"`
+	Succeeded       bool              `json:"succeeded"`
+	Status          string            `json:"status"`
+	TurnsUsed       int               `json:"turns_used"`
+	SubmittedQueues []string          `json:"submitted_queues"`
+	FinalContext    *ProjectedContext `json:"final_context,omitempty"`
+	FailureReason   string            `json:"failure_reason,omitempty"`
 }
 
 type CognitivePlanner interface {

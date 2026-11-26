@@ -237,6 +237,7 @@ export interface ProjectedContext {
       target_id: string;
       label: string;
       readiness: "ready" | "staged";
+      prerequisite_hint?: string;
       actor_anchor?: string;
       player_anchor?: string;
       alert_tag?: string;
@@ -253,6 +254,19 @@ export interface PlanDecision {
   planned_steps?: QueueStep[];
   reply_text?: string;
   audience?: "player_only" | "party" | "public";
+  goal_status?: "completed" | "continue" | "blocked";
+  memory_note?: string;
+}
+
+export interface GoalExecutionReport {
+  goal_id: string;
+  objective: string;
+  succeeded: boolean;
+  status: string;
+  turns_used: number;
+  submitted_queues: string[];
+  final_context?: ProjectedContext | null;
+  failure_reason?: string;
 }
 
 export interface MemoryRecordV1 {
@@ -529,6 +543,11 @@ export class OpenAICompatibleLLMPlanner {
     const summary = typeof rawPlan?.intent_summary === "string" ? rawPlan.intent_summary : "";
     const replyText = typeof rawPlan?.reply_text === "string" ? rawPlan.reply_text : undefined;
     const audience = rawPlan?.audience ?? "player_only";
+    const rawGs = typeof rawPlan?.goal_status === "string" ? rawPlan.goal_status : "completed";
+    const goal_status: "completed" | "continue" | "blocked" =
+      rawGs === "continue" || rawGs === "blocked" ? rawGs : "completed";
+    const memory_note =
+      typeof rawPlan?.memory_note === "string" && rawPlan.memory_note.trim() ? rawPlan.memory_note.trim() : undefined;
     const grantIndex = new Map((ctx.active_methods ?? []).map((g) => [`${g.method_id}|${g.actor}`, g]));
 
     const validSteps: QueueStep[] = [];
@@ -539,19 +558,25 @@ export class OpenAICompatibleLLMPlanner {
         const args = step?.args && typeof step.args === "object" && !Array.isArray(step.args) ? step.args : {};
         const grant = grantIndex.get(`${mid}|${act}`);
         const cap = capById.get(mid);
-        if (!grant || !cap) return { intent_summary: summary, planned_steps: [], reply_text: replyText, audience };
+        if (!grant || !cap) return { intent_summary: summary, planned_steps: [], reply_text: replyText, audience, goal_status, memory_note };
+        let stepReadiness: "ready" | "staged" = grant.readiness;
         if (typeof args.target_id === "string" && grant.targets.length > 0) {
-          if (!grant.targets.some((t) => t.target_id === args.target_id)) {
-            return { intent_summary: summary, planned_steps: [], reply_text: replyText, audience };
+          const cand = grant.targets.find((t) => t.target_id === args.target_id);
+          if (!cand) {
+            return { intent_summary: summary, planned_steps: [], reply_text: replyText, audience, goal_status, memory_note };
           }
+          stepReadiness = cand.readiness;
+        }
+        if (validSteps.length === 0 && stepReadiness !== "ready") {
+          return { intent_summary: summary, planned_steps: [], reply_text: replyText, audience, goal_status, memory_note };
         }
         if (!validateSchemaObject(args, cap.params_schema)) {
-          return { intent_summary: summary, planned_steps: [], reply_text: replyText, audience };
+          return { intent_summary: summary, planned_steps: [], reply_text: replyText, audience, goal_status, memory_note };
         }
         validSteps.push({ step_index: validSteps.length, method_id: mid, actor: act, args });
       }
     }
-    return { intent_summary: summary, planned_steps: validSteps, reply_text: replyText, audience };
+    return { intent_summary: summary, planned_steps: validSteps, reply_text: replyText, audience, goal_status, memory_note };
   }
 
   async plan(
@@ -609,6 +634,76 @@ export async function discoverLocalHubCoreUrl(explicitPath?: string): Promise<st
   return doc.core_url.replace(/\/$/, "");
 }
 
+export function resolveDeicticTarget<
+  T extends { target_id: string; label?: string; readiness?: string; player_anchor?: string; alert_tag?: string }
+>(utterance: string, candidates: T[] = []): T | null {
+  if (!candidates.length) return null;
+  const q = (utterance ?? "").toLowerCase();
+  const wantsRay = ["pointed", "pointing", "crosshair", "指向", "指着", "准星"].some((w) => q.includes(w));
+  const wantsDemo = ["this", "that", "here", "这个", "那个"].some((w) => q.includes(w));
+  const wantsAlert = ["alert", "halted", "broken", "报警", "故障", "停机", "缺料"].some((w) => q.includes(w));
+  const dirs: Array<[string, string[], string]> = [
+    ["right", ["right", "右侧", "右边", "右方"], "left"],
+    ["left", ["left", "左侧", "左边", "左方"], "right"],
+    ["ahead", ["ahead", "front", "前方", "前面"], "behind"],
+    ["behind", ["behind", "back", "后方", "后面", "身后"], "ahead"],
+  ];
+  let best = candidates[0];
+  let bestScore = -1e9;
+  for (const c of candidates) {
+    let score = 0;
+    const pAnchor = (c.player_anchor ?? "").toLowerCase();
+    if (pAnchor.includes("pointed")) score += wantsRay ? 68 : wantsDemo ? 26 : 8;
+    for (const [canon, words, opp] of dirs) {
+      if (words.some((w) => q.includes(w))) {
+        if (pAnchor.includes(canon)) score += 48;
+        else if (pAnchor.includes(opp)) score -= 25;
+      }
+    }
+    if (c.alert_tag) score += wantsAlert ? 65 : 10;
+    if (c.label && q.includes(c.label.toLowerCase())) score += 30;
+    if (c.readiness === "ready") score += 5;
+    if (score > bestScore) {
+      bestScore = score;
+      best = c;
+    }
+  }
+  return best;
+}
+
+export function resolvePrerequisiteSteps(
+  methodId: string,
+  actor: string,
+  args: Record<string, unknown> = {},
+  ctx: ProjectedContext,
+  capabilities: CapabilityEntry[] = []
+): QueueStep[] {
+  const active = ctx.active_methods ?? [];
+  const grant = active.find((g) => g.method_id === methodId && g.actor === actor);
+  if (!grant) return [{ step_index: 0, method_id: methodId, actor, args: { ...args } }];
+  let effReady = grant.readiness;
+  const tid = typeof args.target_id === "string" ? args.target_id : "";
+  if (tid && grant.targets.length > 0) {
+    const cand = grant.targets.find((t) => t.target_id === tid);
+    if (cand) effReady = cand.readiness;
+  }
+  if (effReady === "ready" || !tid) return [{ step_index: 0, method_id: methodId, actor, args: { ...args } }];
+  const capMap = new Map(capabilities.map((c) => [c.method_id, c]));
+  for (const nav of active) {
+    if (nav.actor !== actor || nav.method_id === methodId || nav.readiness !== "ready") continue;
+    const cDef = capMap.get(nav.method_id);
+    const desc = `${cDef?.name ?? ""} ${cDef?.description ?? ""}`.toLowerCase();
+    const targetReady = nav.targets.some((t) => t.target_id === tid && t.readiness === "ready");
+    if (targetReady || (nav.targets.length === 0 && ["move", "walk", "goto", "navigate", "approach"].some((w) => desc.includes(w)))) {
+      return [
+        { step_index: 0, method_id: nav.method_id, actor, args: { target_id: tid } },
+        { step_index: 1, method_id: methodId, actor, args: { ...args } },
+      ];
+    }
+  }
+  return [{ step_index: 0, method_id: methodId, actor, args: { ...args } }];
+}
+
 export class QueueBuilder {
   private steps: QueueStep[] = [];
   private grantMap: Map<string, ProjectedContext["active_methods"][number]>;
@@ -656,6 +751,12 @@ export class QueueBuilder {
       }
     }
     this.steps.push({ step_index: idx, method_id: methodId, actor, args: { ...args } });
+    return this;
+  }
+
+  addStepAuto(methodId: string, actor: string, args: Record<string, unknown> = {}, validate = true): this {
+    const chain = resolvePrerequisiteSteps(methodId, actor, args, this.ctx, [...this.capMap.values()]);
+    for (const st of chain) this.addStep(st.method_id, st.actor, st.args, validate);
     return this;
   }
 
@@ -942,6 +1043,81 @@ export class CoreSDK {
     const tok = isShort ? this.connectedToken : (authToken ?? "");
     const qid = isShort ? baseOrQueueId : (queueId ?? "");
     return this.postEnvelope(base.replace(/\/$/, ""), tok, "queue.cancel", { queue_id: qid }, this.sessionId ?? undefined);
+  }
+
+  async executeGoal(
+    objective: string,
+    options?: {
+      maxTurns?: number;
+      timeoutMs?: number;
+      successWhen?: (ctx: ProjectedContext, lastReceipt: any) => boolean;
+    }
+  ): Promise<GoalExecutionReport> {
+    const maxTurns = options?.maxTurns ?? 6;
+    const timeoutMs = options?.timeoutMs ?? 10000;
+    const successWhen = options?.successWhen;
+    const deadline = Date.now() + timeoutMs;
+    const goalId = `goal-${crypto.randomUUID().slice(0, 10)}`;
+    const failedFps = new Set<string>();
+    const submittedQueues: string[] = [];
+    let lastReceipt: any = null;
+    let lastCtx: ProjectedContext | null = null;
+    let turnsUsed = 0;
+
+    while (Date.now() < deadline && !this.closed && !this.actionsPaused && turnsUsed < maxTurns) {
+      const pulled = (await this.pullContextIfDue()) ?? (await this.pullContext());
+      lastCtx = pulled;
+      if (successWhen && successWhen(pulled, lastReceipt)) {
+        return { goal_id: goalId, objective, succeeded: true, status: "completed", turns_used: turnsUsed, submitted_queues: submittedQueues, final_context: pulled };
+      }
+      const synth: ProjectedContext = { ...pulled, player_command: objective };
+      const caps = this.getCachedCapabilities(synth.slot_id);
+      const dec = await this.planner(caps, synth, []);
+      if (dec.reply_text) await this.sendChat(dec.reply_text, dec.audience ?? "player_only");
+
+      const filtered: QueueStep[] = [];
+      for (const s of dec.planned_steps ?? []) {
+        const fp = await jcsSha256("g2a.agent.loop.v1", { brief: synth.state_brief, method_id: s.method_id, actor: s.actor, args: s.args });
+        if (failedFps.has(fp)) break;
+        filtered.push({ step_index: filtered.length, method_id: s.method_id, actor: s.actor, args: s.args });
+      }
+      if (filtered.length === 0) {
+        const st = dec.goal_status === "blocked" ? "blocked" : "no_executable_steps";
+        return { goal_id: goalId, objective, succeeded: false, status: st, turns_used: turnsUsed, submitted_queues: submittedQueues, final_context: pulled, failure_reason: st };
+      }
+
+      turnsUsed++;
+      const qid = `Q-${crypto.randomUUID().slice(0, 12)}`;
+      submittedQueues.push(qid);
+      lastReceipt = await this.submitQueueWithRecovery(this.connectedBase, this.connectedToken, {
+        queue_id: qid,
+        epoch: synth.epoch,
+        based_on_rev: synth.rev,
+        trigger: "player_command",
+        supersedes: turnsUsed === 1,
+        intent_summary: dec.intent_summary || objective,
+        steps: filtered,
+      });
+
+      for (const sr of lastReceipt?.step_receipts ?? []) {
+        if (sr.state === "failed" && sr.step_index >= 0 && sr.step_index < filtered.length) {
+          const st = filtered[sr.step_index];
+          failedFps.add(await jcsSha256("g2a.agent.loop.v1", { brief: synth.state_brief, method_id: st.method_id, actor: st.actor, args: st.args }));
+        }
+      }
+
+      const fresh = await this.pullContextIfDue();
+      if (fresh) lastCtx = fresh;
+      if (successWhen && lastCtx && successWhen(lastCtx, lastReceipt)) {
+        return { goal_id: goalId, objective, succeeded: true, status: "completed", turns_used: turnsUsed, submitted_queues: submittedQueues, final_context: lastCtx };
+      }
+      if (!successWhen && lastReceipt?.queue_state === "completed" && dec.goal_status !== "continue") {
+        return { goal_id: goalId, objective, succeeded: true, status: "completed", turns_used: turnsUsed, submitted_queues: submittedQueues, final_context: lastCtx };
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+
+    return { goal_id: goalId, objective, succeeded: false, status: "exhausted", turns_used: turnsUsed, submitted_queues: submittedQueues, final_context: lastCtx, failure_reason: "max_turns_exceeded" };
   }
 
   async onContextReceived(base: string, authToken: string, ctx: ProjectedContext, depth = 0): Promise<unknown> {

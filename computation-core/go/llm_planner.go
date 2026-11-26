@@ -120,13 +120,18 @@ func SanitizeLLMPlan(rawPlan map[string]any, capByID map[string]CapabilityEntry,
 	if audience == "" {
 		audience = "player_only"
 	}
+	goalStatus, _ := rawPlan["goal_status"].(string)
+	if goalStatus != "completed" && goalStatus != "continue" && goalStatus != "blocked" {
+		goalStatus = "completed"
+	}
+	memNote, _ := rawPlan["memory_note"].(string)
 
 	rawSteps, _ := rawPlan["steps"].([]any)
 	validSteps := make([]QueueStep, 0, len(rawSteps))
 	for _, item := range rawSteps {
 		m, ok := item.(map[string]any)
 		if !ok {
-			return PlanDecision{IntentSummary: summary, ReplyText: replyText, Audience: audience}
+			return PlanDecision{IntentSummary: summary, ReplyText: replyText, Audience: audience, GoalStatus: goalStatus, MemoryNote: memNote}
 		}
 		mid, _ := m["method_id"].(string)
 		act, _ := m["actor"].(string)
@@ -137,22 +142,27 @@ func SanitizeLLMPlan(rawPlan map[string]any, capByID map[string]CapabilityEntry,
 		grant, granted := grantIndex[mid+"|"+act]
 		capDef, known := capByID[mid]
 		if !granted || !known {
-			return PlanDecision{IntentSummary: summary, ReplyText: replyText, Audience: audience}
+			return PlanDecision{IntentSummary: summary, ReplyText: replyText, Audience: audience, GoalStatus: goalStatus, MemoryNote: memNote}
 		}
+		stepReadiness := grant.Readiness
 		if tid, hasTID := args["target_id"].(string); hasTID && len(grant.Targets) > 0 {
 			found := false
 			for _, t := range grant.Targets {
 				if t.TargetID == tid {
 					found = true
+					stepReadiness = t.Readiness
 					break
 				}
 			}
 			if !found {
-				return PlanDecision{IntentSummary: summary, ReplyText: replyText, Audience: audience}
+				return PlanDecision{IntentSummary: summary, ReplyText: replyText, Audience: audience, GoalStatus: goalStatus, MemoryNote: memNote}
 			}
 		}
+		if len(validSteps) == 0 && stepReadiness != "ready" {
+			return PlanDecision{IntentSummary: summary, ReplyText: replyText, Audience: audience, GoalStatus: goalStatus, MemoryNote: memNote}
+		}
 		if !validateSchemaObject(args, capDef.ParamsSchema, 0) {
-			return PlanDecision{IntentSummary: summary, ReplyText: replyText, Audience: audience}
+			return PlanDecision{IntentSummary: summary, ReplyText: replyText, Audience: audience, GoalStatus: goalStatus, MemoryNote: memNote}
 		}
 		validSteps = append(validSteps, QueueStep{
 			StepIndex: len(validSteps),
@@ -166,7 +176,146 @@ func SanitizeLLMPlan(rawPlan map[string]any, capByID map[string]CapabilityEntry,
 		PlannedSteps:  validSteps,
 		ReplyText:     replyText,
 		Audience:      audience,
+		GoalStatus:    goalStatus,
+		MemoryNote:    memNote,
 	}
+}
+
+// ResolveDeicticTarget scores TargetCandidates against bilingual (EN/ZH) 360-degree spatial deictics, pointer rays, alerts, and labels.
+func ResolveDeicticTarget(utterance string, candidates []TargetCandidate) *TargetCandidate {
+	if len(candidates) == 0 {
+		return nil
+	}
+	q := strings.ToLower(utterance)
+	bestIdx := 0
+	bestScore := -1e9
+	wantsRay := containsAnySubstr(q, "pointed", "pointing", "crosshair", "指向", "指着", "准星")
+	wantsDemo := containsAnySubstr(q, "this", "that", "here", "这个", "那个")
+	wantsAlert := containsAnySubstr(q, "alert", "halted", "broken", "stalled", "报警", "故障", "停机", "缺料")
+
+	dirs := []struct {
+		canon string
+		words []string
+		opp   string
+	}{
+		{"right", []string{"right", "右侧", "右边", "右方"}, "left"},
+		{"left", []string{"left", "左侧", "左边", "左方"}, "right"},
+		{"ahead", []string{"ahead", "front", "forward", "前方", "前面"}, "behind"},
+		{"behind", []string{"behind", "back", "后方", "后面", "身后"}, "ahead"},
+	}
+
+	for i := range candidates {
+		c := &candidates[i]
+		score := 0.0
+		pAnchor := ""
+		if c.PlayerAnchor != nil {
+			pAnchor = strings.ToLower(*c.PlayerAnchor)
+		}
+		if strings.Contains(pAnchor, "pointed") {
+			if wantsRay {
+				score += 68
+			} else if wantsDemo {
+				score += 26
+			} else {
+				score += 8
+			}
+		}
+		for _, d := range dirs {
+			if containsAnySubstr(q, d.words...) {
+				if strings.Contains(pAnchor, d.canon) {
+					score += 48
+				} else if strings.Contains(pAnchor, d.opp) {
+					score -= 25
+				}
+			}
+		}
+		if c.AlertTag != nil && *c.AlertTag != "" {
+			if wantsAlert {
+				score += 65
+			} else {
+				score += 10
+			}
+		}
+		if c.Label != "" && strings.Contains(q, strings.ToLower(c.Label)) {
+			score += 30
+		}
+		if c.Readiness == "ready" {
+			score += 5
+		}
+		if score > bestScore {
+			bestScore = score
+			bestIdx = i
+		}
+	}
+	res := candidates[bestIdx]
+	return &res
+}
+
+func containsAnySubstr(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// ResolvePrerequisiteSteps automatically prepends a ready navigation/prerequisite step when the requested target is staged.
+func ResolvePrerequisiteSteps(
+	methodID, actor string,
+	args map[string]any,
+	ctx ProjectedContext,
+	caps []CapabilityEntry,
+) []QueueStep {
+	if args == nil {
+		args = map[string]any{}
+	}
+	grantMap := make(map[string]ActiveMethodGrant, len(ctx.ActiveMethods))
+	for _, g := range ctx.ActiveMethods {
+		grantMap[g.MethodID+"|"+g.Actor] = g
+	}
+	capMap := make(map[string]CapabilityEntry, len(caps))
+	for _, c := range caps {
+		capMap[c.MethodID] = c
+	}
+	grant, ok := grantMap[methodID+"|"+actor]
+	if !ok {
+		return []QueueStep{{StepIndex: 0, MethodID: methodID, Actor: actor, Args: args}}
+	}
+	effReady := grant.Readiness
+	tid, hasTID := args["target_id"].(string)
+	if hasTID {
+		for _, t := range grant.Targets {
+			if t.TargetID == tid {
+				effReady = t.Readiness
+				break
+			}
+		}
+	}
+	if effReady == "ready" || !hasTID {
+		return []QueueStep{{StepIndex: 0, MethodID: methodID, Actor: actor, Args: args}}
+	}
+	for _, candG := range ctx.ActiveMethods {
+		if candG.Actor != actor || candG.MethodID == methodID || candG.Readiness != "ready" {
+			continue
+		}
+		cDef := capMap[candG.MethodID]
+		desc := strings.ToLower(cDef.Name + " " + cDef.Description)
+		hasTargetReady := false
+		for _, t := range candG.Targets {
+			if t.TargetID == tid && t.Readiness == "ready" {
+				hasTargetReady = true
+				break
+			}
+		}
+		if hasTargetReady || (len(candG.Targets) == 0 && containsAnySubstr(desc, "move", "walk", "goto", "navigate", "approach")) {
+			return []QueueStep{
+				{StepIndex: 0, MethodID: candG.MethodID, Actor: actor, Args: map[string]any{"target_id": tid}},
+				{StepIndex: 1, MethodID: methodID, Actor: actor, Args: args},
+			}
+		}
+	}
+	return []QueueStep{{StepIndex: 0, MethodID: methodID, Actor: actor, Args: args}}
 }
 
 func validateSchemaObject(args map[string]any, schema map[string]any, depth int) bool {

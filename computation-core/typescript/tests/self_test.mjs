@@ -175,9 +175,17 @@ if (fs.existsSync(hubPath)) {
     assert.throws(() => coreSdk.createQueueBuilder(pulled).addStep("#99", "companion", {}));
     const builtQ = coreSdk
       .createQueueBuilder(pulled, "Pre-flight verified chest open")
-      .addStep("#02", "companion", { target_id: "chest_R" })
+      .addStepAuto("#02", "companion", { target_id: "chest_R" })
       .build("Q-ts-preflight");
     assert.equal(builtQ.steps.length, 1);
+
+    // Verify Step-0 readiness LLM firewall in TypeScript OpenAICompatibleLLMPlanner.sanitizePlan
+    const stagedFiltered = OpenAICompatibleLLMPlanner.sanitizePlan(
+      { intent_summary: "Staged step 0", steps: [{ method_id: "#02", actor: "companion", args: { target_id: "chest_R" } }] },
+      new Map([["#02", { method_id: "#02", name: "open", description: "Open", permitted_actors: ["companion"], params_schema: { type: "object", required: ["target_id"] } }]]),
+      { slot_id: "s1", epoch: 1, rev: 1, capability_table_digest: "sha256:00", state_brief: {}, active_methods: [{ method_id: "#02", actor: "companion", readiness: "staged", targets: [{ target_id: "chest_R", label: "Right Chest", readiness: "staged" }] }] }
+    );
+    assert.equal(stagedFiltered.planned_steps.length, 0);
 
     await origSdk.reportPlayerCommand("open right chest");
     const deadline = Date.now() + 3000;

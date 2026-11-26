@@ -87,6 +87,9 @@ public sealed class OpenAICompatibleLlmPlanner : ICognitivePlanner, IDisposable
         string summary = root.TryGetProperty("intent_summary", out var sEl) && sEl.ValueKind == JsonValueKind.String ? sEl.GetString() ?? "" : "";
         string? reply = root.TryGetProperty("reply_text", out var rEl) && rEl.ValueKind == JsonValueKind.String ? rEl.GetString() : null;
         string aud = root.TryGetProperty("audience", out var aEl) && aEl.ValueKind == JsonValueKind.String ? aEl.GetString() ?? "player_only" : "player_only";
+        string goalStatus = root.TryGetProperty("goal_status", out var gsEl) && gsEl.ValueKind == JsonValueKind.String ? gsEl.GetString() ?? "completed" : "completed";
+        if (goalStatus is not ("completed" or "continue" or "blocked")) goalStatus = "completed";
+        string? memNote = root.TryGetProperty("memory_note", out var mnEl) && mnEl.ValueKind == JsonValueKind.String ? mnEl.GetString() : null;
 
         var grantIndex = (ctx.ActiveMethods ?? new List<ActiveMethodGrant>())
             .ToDictionary(g => $"{g.MethodId}|{g.Actor}", StringComparer.Ordinal);
@@ -96,11 +99,11 @@ public sealed class OpenAICompatibleLlmPlanner : ICognitivePlanner, IDisposable
         {
             foreach (var stepEl in stepsEl.EnumerateArray())
             {
-                if (stepEl.ValueKind != JsonValueKind.Object) return new PlanDecision(summary, new(), reply, aud);
+                if (stepEl.ValueKind != JsonValueKind.Object) return new PlanDecision(summary, new(), reply, aud, goalStatus, memNote);
                 string mid = stepEl.TryGetProperty("method_id", out var m) && m.ValueKind == JsonValueKind.String ? m.GetString() ?? "" : "";
                 string act = stepEl.TryGetProperty("actor", out var a) && a.ValueKind == JsonValueKind.String ? a.GetString() ?? "" : "";
                 if (!grantIndex.TryGetValue($"{mid}|{act}", out var grant) || !capById.TryGetValue(mid, out var cap))
-                    return new PlanDecision(summary, new(), reply, aud);
+                    return new PlanDecision(summary, new(), reply, aud, goalStatus, memNote);
 
                 var argsDict = new Dictionary<string, object?>();
                 if (stepEl.TryGetProperty("args", out var argsEl) && argsEl.ValueKind == JsonValueKind.Object)
@@ -109,19 +112,104 @@ public sealed class OpenAICompatibleLlmPlanner : ICognitivePlanner, IDisposable
                         argsDict[p.Name] = JcsDigest.ConvertElement(p.Value);
                 }
 
+                string stepReadiness = grant.Readiness;
                 if (argsDict.TryGetValue("target_id", out var tidObj) && tidObj is string tid && grant.Targets.Count > 0)
                 {
-                    if (!grant.Targets.Exists(t => t.TargetId == tid))
-                        return new PlanDecision(summary, new(), reply, aud);
+                    var cand = grant.Targets.FirstOrDefault(t => t.TargetId == tid);
+                    if (cand is null)
+                        return new PlanDecision(summary, new(), reply, aud, goalStatus, memNote);
+                    stepReadiness = cand.Readiness;
                 }
 
+                if (validSteps.Count == 0 && stepReadiness != "ready")
+                    return new PlanDecision(summary, new(), reply, aud, goalStatus, memNote);
+
                 if (!ValidateObjectSchema(argsDict, cap.ParamsSchema, 0))
-                    return new PlanDecision(summary, new(), reply, aud);
+                    return new PlanDecision(summary, new(), reply, aud, goalStatus, memNote);
 
                 validSteps.Add(new QueueStep(validSteps.Count, mid, act, argsDict));
             }
         }
-        return new PlanDecision(summary, validSteps, reply, aud);
+        return new PlanDecision(summary, validSteps, reply, aud, goalStatus, memNote);
+    }
+
+    public static TargetCandidate? ResolveDeicticTarget(string utterance, IReadOnlyList<TargetCandidate> candidates)
+    {
+        if (candidates.Count == 0) return null;
+        string q = (utterance ?? "").ToLowerInvariant();
+        bool wantsRay = new[] { "pointed", "pointing", "crosshair", "指向", "指着", "准星" }.Any(q.Contains);
+        bool wantsDemo = new[] { "this", "that", "here", "这个", "那个" }.Any(q.Contains);
+        bool wantsAlert = new[] { "alert", "halted", "broken", "报警", "故障", "停机", "缺料" }.Any(q.Contains);
+        var dirs = new (string Canon, string[] Words, string Opp)[]
+        {
+            ("right", new[] { "right", "右侧", "右边", "右方" }, "left"),
+            ("left", new[] { "left", "左侧", "左边", "左方" }, "right"),
+            ("ahead", new[] { "ahead", "front", "前方", "前面" }, "behind"),
+            ("behind", new[] { "behind", "back", "后方", "后面", "身后" }, "ahead")
+        };
+
+        TargetCandidate best = candidates[0];
+        double bestScore = double.NegativeInfinity;
+        foreach (var c in candidates)
+        {
+            double score = 0;
+            string pAnchor = (c.PlayerAnchor ?? "").ToLowerInvariant();
+            if (pAnchor.Contains("pointed", StringComparison.Ordinal))
+                score += wantsRay ? 68 : wantsDemo ? 26 : 8;
+            foreach (var (canon, words, opp) in dirs)
+            {
+                if (words.Any(q.Contains))
+                {
+                    if (pAnchor.Contains(canon, StringComparison.Ordinal)) score += 48;
+                    else if (pAnchor.Contains(opp, StringComparison.Ordinal)) score -= 25;
+                }
+            }
+            if (!string.IsNullOrEmpty(c.AlertTag)) score += wantsAlert ? 65 : 10;
+            if (!string.IsNullOrEmpty(c.Label) && q.Contains(c.Label.ToLowerInvariant(), StringComparison.Ordinal)) score += 30;
+            if (c.Readiness == "ready") score += 5;
+            if (score > bestScore) { bestScore = score; best = c; }
+        }
+        return best;
+    }
+
+    public static List<QueueStep> ResolvePrerequisiteSteps(
+        string methodId,
+        string actor,
+        Dictionary<string, object?>? args,
+        ProjectedContext ctx,
+        IReadOnlyList<CapabilityEntry> capabilities)
+    {
+        var stepArgs = args != null ? new Dictionary<string, object?>(args) : new Dictionary<string, object?>();
+        var active = ctx.ActiveMethods ?? new List<ActiveMethodGrant>();
+        var grant = active.FirstOrDefault(g => g.MethodId == methodId && g.Actor == actor);
+        if (grant is null) return new List<QueueStep> { new(0, methodId, actor, stepArgs) };
+
+        string effReady = grant.Readiness;
+        string? tid = stepArgs.TryGetValue("target_id", out var tObj) ? tObj as string : null;
+        if (!string.IsNullOrEmpty(tid))
+        {
+            var cand = grant.Targets.FirstOrDefault(t => t.TargetId == tid);
+            if (cand != null) effReady = cand.Readiness;
+        }
+        if (effReady == "ready" || string.IsNullOrEmpty(tid))
+            return new List<QueueStep> { new(0, methodId, actor, stepArgs) };
+
+        var capMap = capabilities.ToDictionary(c => c.MethodId, StringComparer.Ordinal);
+        foreach (var nav in active)
+        {
+            if (nav.Actor != actor || nav.MethodId == methodId || nav.Readiness != "ready") continue;
+            string desc = capMap.TryGetValue(nav.MethodId, out var cDef) ? $"{cDef.Name} {cDef.Description}".ToLowerInvariant() : "";
+            bool targetReady = nav.Targets.Any(t => t.TargetId == tid && t.Readiness == "ready");
+            if (targetReady || (nav.Targets.Count == 0 && new[] { "move", "walk", "goto", "navigate", "approach" }.Any(desc.Contains)))
+            {
+                return new List<QueueStep>
+                {
+                    new(0, nav.MethodId, actor, new Dictionary<string, object?> { ["target_id"] = tid }),
+                    new(1, methodId, actor, stepArgs)
+                };
+            }
+        }
+        return new List<QueueStep> { new(0, methodId, actor, stepArgs) };
     }
 
     public static bool ValidateObjectSchema(Dictionary<string, object?> args, Dictionary<string, object?>? schema, int depth = 0)

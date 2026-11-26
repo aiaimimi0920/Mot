@@ -15,6 +15,7 @@ import urllib.parse
 from collections import OrderedDict
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
+from .agent_runtime import GoalExecutionReport
 from .core_sdk import (
     CognitivePlannerPort,
     CoreMetrics,
@@ -71,6 +72,16 @@ class AsyncQueueBuilder:
         allow_initial_staged: bool = False,
     ) -> "AsyncQueueBuilder":
         self._inner.add_step(method_id, actor, args=args, validate=validate, allow_initial_staged=allow_initial_staged)
+        return self
+
+    def add_step_auto(
+        self,
+        method_id: str,
+        actor: str,
+        args: Optional[Dict[str, Any]] = None,
+        validate: bool = True,
+    ) -> "AsyncQueueBuilder":
+        self._inner.add_step_auto(method_id, actor, args=args, validate=validate)
         return self
 
     def build(self, queue_id: Optional[str] = None) -> MethodCallQueue:
@@ -243,6 +254,193 @@ class AsyncCoreSDK:
     ) -> AsyncQueueBuilder:
         return AsyncQueueBuilder(self, context, intent_summary=intent_summary, trigger=trigger, supersedes=supersedes)
 
+    async def execute_goal(
+        self,
+        objective: str,
+        success_when: Optional[Callable[[ProjectedContext, Optional[QueueReceipt]], bool]] = None,
+        max_turns: int = 6,
+        timeout_sec: float = 10.0,
+    ) -> GoalExecutionReport:
+        """Async closed-loop goal orchestrator with step-failure feedback, sustained-step awaiting, and cycle guard."""
+        d = self._sync_delegate
+        goal = d.goal_tracker.start_goal(objective, max_turns=max_turns)
+        deadline = time.monotonic() + timeout_sec
+        last_receipt: Optional[QueueReceipt] = None
+        last_ctx: Optional[ProjectedContext] = None
+        last_planned_rev = -1
+        d._in_execute_goal = True
+
+        async def _pull_fresh_async() -> Optional[ProjectedContext]:
+            p = await self.pull_context_if_due()
+            if p is not None:
+                return p
+            now_ms = int(time.time() * 1000)
+            if d.next_allowed_pull_ms > now_ms and time.monotonic() < deadline:
+                wait_s = min((d.next_allowed_pull_ms - now_ms) / 1000.0 + 0.015, max(0.01, deadline - time.monotonic()))
+                await asyncio.sleep(wait_s)
+                return await self.pull_context_if_due()
+            return None
+
+        try:
+            while time.monotonic() < deadline and not d.closed and not d.actions_paused:
+                pulled = await _pull_fresh_async()
+                ctx = pulled or d.latest_context
+                if ctx is None:
+                    ctx = await self.pull_context()
+                last_ctx = ctx
+
+                if success_when is not None and success_when(ctx, last_receipt):
+                    return GoalExecutionReport(
+                        goal_id=goal.goal_id,
+                        objective=objective,
+                        succeeded=True,
+                        status="completed",
+                        turns_used=goal.turns_used,
+                        submitted_queues=list(goal.submitted_queues),
+                        outcomes=list(goal.recent_outcomes),
+                        final_context=ctx,
+                    )
+
+                if goal.turns_used >= max_turns:
+                    return GoalExecutionReport(
+                        goal_id=goal.goal_id,
+                        objective=objective,
+                        succeeded=False,
+                        status="exhausted",
+                        turns_used=goal.turns_used,
+                        submitted_queues=list(goal.submitted_queues),
+                        outcomes=list(goal.recent_outcomes),
+                        final_context=ctx,
+                        failure_reason=goal.last_failure_reason or "max_turns_exceeded",
+                    )
+
+                if (
+                    (last_receipt is not None and last_receipt.queue_state in ("running", "executing") and ctx.rev == last_planned_rev)
+                    or bool(d.pending_confirm_queues)
+                ):
+                    await asyncio.sleep(0.04)
+                    continue
+
+                last_planned_rev = ctx.rev
+                synth_ctx = ProjectedContext(
+                    slot_id=ctx.slot_id,
+                    epoch=ctx.epoch,
+                    rev=ctx.rev,
+                    capability_table_digest=ctx.capability_table_digest,
+                    state_brief=ctx.state_brief,
+                    active_methods=ctx.active_methods,
+                    player_command=objective,
+                    visual_ref=ctx.visual_ref,
+                    audio_ref=ctx.audio_ref,
+                    allowed_timeline_tags=ctx.allowed_timeline_tags,
+                    extensions_data=ctx.extensions_data,
+                )
+                caps = d.capability_cache.get(synth_ctx.capability_table_digest, [])
+                allowed_tags = set(synth_ctx.allowed_timeline_tags) if synth_ctx.allowed_timeline_tags is not None else None
+                memories = (
+                    d.memory_store.recall_safe(
+                        d.scope.player_id,
+                        SpoilerGuard(
+                            current_epoch=synth_ctx.epoch,
+                            game_origin_id=d.scope.game_instance_id,
+                            allowed_timeline_tags=allowed_tags,
+                            query_hint=objective,
+                        ),
+                    )
+                    if d.scope is not None
+                    else []
+                )
+                decision = await self._invoke_planner(caps, synth_ctx, memories)
+                if decision.reply_text and d.scope is not None and d.scope.allow_chat:
+                    await self.send_chat(decision.reply_text, audience=decision.audience)
+
+                filtered = []
+                for s in decision.planned_steps:
+                    if d.goal_tracker.is_failed_repeat(synth_ctx.state_brief, s.method_id, s.actor, s.args):
+                        break
+                    filtered.append(type(s)(len(filtered), s.method_id, s.actor, s.args))
+
+                if not filtered:
+                    st = "blocked" if decision.goal_status == "blocked" else "no_executable_steps"
+                    return GoalExecutionReport(
+                        goal_id=goal.goal_id,
+                        objective=objective,
+                        succeeded=False,
+                        status=st,
+                        turns_used=goal.turns_used,
+                        submitted_queues=list(goal.submitted_queues),
+                        outcomes=list(goal.recent_outcomes),
+                        final_context=ctx,
+                        failure_reason=goal.last_failure_reason or st,
+                    )
+
+                goal.turns_used += 1
+                q = MethodCallQueue(
+                    queue_id=generate_id("Q"),
+                    epoch=synth_ctx.epoch,
+                    based_on_rev=synth_ctx.rev,
+                    trigger="player_command",
+                    supersedes=(goal.turns_used == 1),
+                    intent_summary=decision.intent_summary or objective,
+                    steps=filtered,
+                )
+                submitted_tuples = [(s.method_id, s.actor, s.args) for s in filtered]
+                last_receipt = await self.submit_queue_with_standard_recovery(q)
+                if last_receipt is not None:
+                    d.goal_tracker.record_receipt(last_receipt, submitted_tuples, synth_ctx)
+                    if last_receipt.latest_context is not None:
+                        last_ctx = last_receipt.latest_context
+
+                fresh_after = await _pull_fresh_async()
+                if fresh_after is not None:
+                    last_ctx = fresh_after
+                elif d.latest_context is not None and d.latest_context.rev > synth_ctx.rev:
+                    last_ctx = d.latest_context
+
+                if success_when is not None and last_ctx is not None and success_when(last_ctx, last_receipt):
+                    return GoalExecutionReport(
+                        goal_id=goal.goal_id,
+                        objective=objective,
+                        succeeded=True,
+                        status="completed",
+                        turns_used=goal.turns_used,
+                        submitted_queues=list(goal.submitted_queues),
+                        outcomes=list(goal.recent_outcomes),
+                        final_context=last_ctx,
+                    )
+                if (
+                    success_when is None
+                    and last_receipt is not None
+                    and last_receipt.queue_state == "completed"
+                    and decision.goal_status == "completed"
+                ):
+                    return GoalExecutionReport(
+                        goal_id=goal.goal_id,
+                        objective=objective,
+                        succeeded=True,
+                        status="completed",
+                        turns_used=goal.turns_used,
+                        submitted_queues=list(goal.submitted_queues),
+                        outcomes=list(goal.recent_outcomes),
+                        final_context=last_ctx,
+                    )
+                await asyncio.sleep(0.03)
+
+            return GoalExecutionReport(
+                goal_id=goal.goal_id,
+                objective=objective,
+                succeeded=False,
+                status="timeout" if time.monotonic() >= deadline else "aborted",
+                turns_used=goal.turns_used,
+                submitted_queues=list(goal.submitted_queues),
+                outcomes=list(goal.recent_outcomes),
+                final_context=last_ctx,
+                failure_reason=goal.last_failure_reason or "goal_timeout",
+            )
+        finally:
+            d._in_execute_goal = False
+            d.goal_tracker.clear_goal()
+
     async def _invoke_planner(
         self,
         caps: List[CapabilityEntry],
@@ -251,10 +449,30 @@ class AsyncCoreSDK:
     ) -> PlanDecision:
         if self._planner is None:
             return PlanDecision()
-        if hasattr(self._planner, "plan"):
-            res = self._planner.plan(caps, ctx, memories)  # type: ignore[union-attr]
-        else:
-            res = self._planner(caps, ctx, memories)  # type: ignore[operator]
+        d = self._sync_delegate
+        if hasattr(self._planner, "plan_async"):
+            return await self._planner.plan_async(  # type: ignore[union-attr]
+                caps,
+                ctx,
+                memories,
+                active_goal=d.goal_tracker.active_goal,
+                recent_outcomes=d.goal_tracker.recent_outcomes,
+            )
+        target_fn = self._planner.plan if hasattr(self._planner, "plan") else self._planner
+        try:
+            sig = inspect.signature(target_fn)  # type: ignore[arg-type]
+            if "active_goal" in sig.parameters or "recent_outcomes" in sig.parameters:
+                res = target_fn(  # type: ignore[operator]
+                    caps,
+                    ctx,
+                    memories,
+                    active_goal=d.goal_tracker.active_goal,
+                    recent_outcomes=d.goal_tracker.recent_outcomes,
+                )
+            else:
+                res = target_fn(caps, ctx, memories)  # type: ignore[operator]
+        except (TypeError, ValueError):
+            res = target_fn(caps, ctx, memories)  # type: ignore[operator]
         if inspect.isawaitable(res):
             return await res
         return res

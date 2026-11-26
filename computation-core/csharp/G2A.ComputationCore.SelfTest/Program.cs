@@ -174,6 +174,16 @@ internal static class Program
                 }
                 if (!caughtSchemaMissing) throw new Exception("Expected C# QueueBuilder recursive JSON Schema pre-flight check");
 
+                var deicticHit = OpenAICompatibleLlmPlanner.ResolveDeicticTarget(
+                    "打开右边的宝箱",
+                    new List<TargetCandidate>
+                    {
+                        new("chest_L", "Left Chest", "ready", PlayerAnchor: "left 3.0m"),
+                        new("chest_R", "Right Chest", "ready", PlayerAnchor: "right 4.0m")
+                    });
+                if (deicticHit?.TargetId != "chest_R")
+                    throw new Exception("Expected ResolveDeicticTarget to match chest_R");
+
                 bool caughtInactive = false;
                 try
                 {

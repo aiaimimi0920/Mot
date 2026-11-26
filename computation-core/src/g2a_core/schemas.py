@@ -283,3 +283,5 @@ class PlanDecision:
     planned_steps: List[QueueStep] = field(default_factory=list)
     reply_text: Optional[str] = None
     audience: str = "player_only"
+    goal_status: str = "completed"  # "completed" | "continue" | "blocked"
+    memory_note: Optional[str] = None

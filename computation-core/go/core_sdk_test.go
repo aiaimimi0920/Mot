@@ -282,4 +282,27 @@ func TestLiveThreeTierGoCoreWebSocketAndExtensions(t *testing.T) {
 	if leaseMs, hbErr := sdk.SendHeartbeat(ctx); hbErr != nil || leaseMs <= 0 {
 		t.Fatalf("SendHeartbeat failed: lease=%d err=%v", leaseMs, hbErr)
 	}
+
+	// Verify bilingual Deictic Target Grounding & Step-0 readiness LLM firewall
+	rightAnchor := "right 4.0m"
+	leftAnchor := "left 3.0m"
+	matched := ResolveDeicticTarget("去检查右侧信标", []TargetCandidate{
+		{TargetID: "b_left", Label: "Left Beacon", Readiness: "ready", PlayerAnchor: &leftAnchor},
+		{TargetID: "b_right", Label: "Right Beacon", Readiness: "ready", PlayerAnchor: &rightAnchor},
+	})
+	if matched == nil || matched.TargetID != "b_right" {
+		t.Fatalf("expected ResolveDeicticTarget to pick b_right, got %+v", matched)
+	}
+	stagedCtx := ProjectedContext{
+		SlotID: "s1", Epoch: 1, Rev: 1, CapabilityTableDigest: "sha256:00",
+		ActiveMethods: []ActiveMethodGrant{{MethodID: "#01", Actor: "companion", Readiness: "staged"}},
+	}
+	sanStaged := SanitizeLLMPlan(
+		map[string]any{"intent_summary": "Premature", "steps": []any{map[string]any{"method_id": "#01", "actor": "companion", "args": map[string]any{}}}},
+		map[string]CapabilityEntry{"#01": {MethodID: "#01", PermittedActors: []string{"companion"}}},
+		stagedCtx,
+	)
+	if len(sanStaged.PlannedSteps) != 0 {
+		t.Fatal("expected SanitizeLLMPlan to reject staged Step-0")
+	}
 }

@@ -343,6 +343,99 @@ public sealed class CoreSdk : IAsyncDisposable
         cts?.Dispose();
     }
 
+    public async Task<GoalExecutionReport> ExecuteGoalAsync(
+        string objective,
+        Func<ProjectedContext, QueueReceipt?, bool>? successWhen = null,
+        int maxTurns = 6,
+        CancellationToken ct = default)
+    {
+        if (maxTurns <= 0) maxTurns = 6;
+        string goalId = "goal-" + Guid.NewGuid().ToString("N")[..10];
+        var failedFps = new HashSet<string>(StringComparer.Ordinal);
+        var submitted = new List<string>();
+        QueueReceipt? lastRec = null;
+        ProjectedContext? lastCtx = null;
+        int turns = 0;
+
+        while (!ct.IsCancellationRequested && !Closed && !ActionsPaused && turns < maxTurns)
+        {
+            var pulled = await PullContextIfDueAsync(ct) ?? await PullContextAsync(ct);
+            lastCtx = pulled;
+            if (successWhen != null && successWhen(pulled, lastRec))
+                return new GoalExecutionReport(goalId, objective, true, "completed", turns, submitted, pulled);
+
+            var synth = pulled with { PlayerCommand = objective };
+            var caps = GetCachedCapabilities(synth.SlotId);
+            var dec = await _planner.PlanAsync(caps, synth, Array.Empty<MemoryRecord>(), ct);
+            if (!string.IsNullOrEmpty(dec.ReplyText))
+                await SendChatAsync(dec.ReplyText, dec.Audience, ct);
+
+            var filtered = new List<QueueStep>();
+            if (dec.PlannedSteps != null)
+            {
+                foreach (var s in dec.PlannedSteps)
+                {
+                    string fp = JcsDigest.ComputeSha256("g2a.agent.loop.v1", new Dictionary<string, object?>
+                    {
+                        ["brief"] = synth.StateBrief,
+                        ["method_id"] = s.MethodId,
+                        ["actor"] = s.Actor,
+                        ["args"] = s.Args
+                    });
+                    if (failedFps.Contains(fp)) break;
+                    filtered.Add(new QueueStep(filtered.Count, s.MethodId, s.Actor, s.Args));
+                }
+            }
+
+            if (filtered.Count == 0)
+            {
+                string st = dec.GoalStatus == "blocked" ? "blocked" : "no_executable_steps";
+                return new GoalExecutionReport(goalId, objective, false, st, turns, submitted, pulled, st);
+            }
+
+            turns++;
+            string qid = "Q-" + Guid.NewGuid().ToString("N")[..12];
+            submitted.Add(qid);
+            lastRec = await SubmitQueueWithRecoveryAsync(new MethodCallQueue(
+                QueueId: qid,
+                Epoch: synth.Epoch,
+                BasedOnRev: synth.Rev,
+                Trigger: "player_command",
+                Supersedes: turns == 1,
+                IntentSummary: string.IsNullOrEmpty(dec.IntentSummary) ? objective : dec.IntentSummary,
+                Steps: filtered), ct);
+
+            if (lastRec != null)
+            {
+                foreach (var sr in lastRec.StepReceipts)
+                {
+                    if (sr.State == "failed" && sr.StepIndex >= 0 && sr.StepIndex < filtered.Count)
+                    {
+                        var st = filtered[sr.StepIndex];
+                        failedFps.Add(JcsDigest.ComputeSha256("g2a.agent.loop.v1", new Dictionary<string, object?>
+                        {
+                            ["brief"] = synth.StateBrief,
+                            ["method_id"] = st.MethodId,
+                            ["actor"] = st.Actor,
+                            ["args"] = st.Args
+                        }));
+                    }
+                }
+            }
+
+            var fresh = await PullContextIfDueAsync(ct);
+            if (fresh != null) lastCtx = fresh;
+            if (successWhen != null && lastCtx != null && successWhen(lastCtx, lastRec))
+                return new GoalExecutionReport(goalId, objective, true, "completed", turns, submitted, lastCtx);
+            if (successWhen == null && lastRec?.QueueState == "completed" && dec.GoalStatus != "continue")
+                return new GoalExecutionReport(goalId, objective, true, "completed", turns, submitted, lastCtx);
+
+            await Task.Delay(25, ct);
+        }
+
+        return new GoalExecutionReport(goalId, objective, false, "exhausted", turns, submitted, lastCtx, "max_turns_exceeded");
+    }
+
     public async ValueTask DisposeAsync()
     {
         await ShutdownAsync(false);
@@ -792,6 +885,18 @@ public sealed class QueueBuilder
             }
         }
         _steps.Add(new QueueStep(idx, methodId, actor, stepArgs));
+        return this;
+    }
+
+    public QueueBuilder AddStepAuto(
+        string methodId,
+        string actor,
+        Dictionary<string, object?>? args = null,
+        bool validate = true)
+    {
+        var chain = OpenAICompatibleLlmPlanner.ResolvePrerequisiteSteps(methodId, actor, args, _ctx, _caps.Values.ToList());
+        foreach (var st in chain)
+            AddStep(st.MethodId, st.Actor, st.Args, validate);
         return this;
     }
 

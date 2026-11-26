@@ -1565,6 +1565,196 @@ class TestOptimizationsAndStress(unittest.TestCase):
                 if hub_proc.stderr:
                     hub_proc.stderr.close()
 
+    def test_ai_agent_goal_engine_self_healing_deictic_and_auto_prerequisites(self) -> None:
+        from g2a_core import (
+            CoreSDK,
+            PlanDecision,
+            QueueStep,
+            SpoilerGuard,
+            TargetCandidate as CoreTarget,
+            resolve_deictic_target,
+        )
+        from g2a_origin import (
+            ActiveMethodGrant as OrigGrant,
+            ImmediateFailed,
+            OriginSDK,
+            TargetCandidate as OrigTarget,
+        )
+
+        # 1. Verify bilingual 360-degree Deictic & Alert Target Grounding
+        cands = [
+            CoreTarget("chest_left", "Wooden Chest", "staged", player_anchor="left 4.0m", actor_anchor="5.0m"),
+            CoreTarget("chest_right", "Gilded Chest", "staged", player_anchor="right 3.5m", actor_anchor="6.0m"),
+            CoreTarget("altar_pointed", "Ancient Altar", "ready", player_anchor="pointed_ray 2.0m", actor_anchor="2.0m"),
+            CoreTarget("furnace_halted", "Smelter", "ready", alert_tag="halted_no_coal", actor_anchor="8.0m"),
+        ]
+        self.assertEqual(resolve_deictic_target("去打开右边的宝箱", cands).target_id, "chest_right")
+        self.assertEqual(resolve_deictic_target("inspect what I am pointing at", cands).target_id, "altar_pointed")
+        self.assertEqual(resolve_deictic_target("修好那个停机报警的设备", cands).target_id, "furnace_halted")
+
+        # 2. Live 3-Tier Multi-Turn Self-Healing AI Agent (`execute_goal`) + Auto-Prerequisite Unrolling + Episodic Spoiler Isolation
+        hub_bin = resolve_hub_binary(ROOT_DIR)
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_path = os.path.join(tmp, "w20_goal_runtime.json")
+            ledger_path = os.path.join(tmp, "w20_goal_ledger.json")
+            hub_proc = subprocess.Popen(
+                [
+                    hub_bin,
+                    "-origin-addr", "127.0.0.1:0",
+                    "-core-addr", "127.0.0.1:0",
+                    "-consent-addr", "127.0.0.1:0",
+                    "-ledger", ledger_path,
+                    "-runtime-file", runtime_path,
+                    "-auto-approve-scope",
+                    "-print-ports-json",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert hub_proc.stdout is not None
+                _ = json.loads(hub_proc.stdout.readline().strip())
+                deadline = time.time() + 3.0
+                while time.time() < deadline and not os.path.exists(runtime_path):
+                    time.sleep(0.02)
+
+                world = {"near_vault": False, "has_key": False, "relic_looted": False}
+
+                def _setup_dungeon(orig: OriginSDK) -> None:
+                    @orig.capability("#01", description="Move companion to target")
+                    def move_to(target_id: str) -> dict:
+                        if target_id == "vault_right":
+                            world["near_vault"] = True
+                        return {"arrived": target_id}
+
+                    @orig.capability("#02", description="Open vault and loot relic")
+                    def open_vault(target_id: str):
+                        if not world["near_vault"]:
+                            return ImmediateFailed("too_far_from_vault")
+                        if not world["has_key"]:
+                            return ImmediateFailed("missing_iron_key")
+                        world["relic_looted"] = True
+                        return {"looted": target_id}
+
+                    @orig.capability("#03", description="Pick up iron key from pedestal")
+                    def take_key(target_id: str) -> dict:
+                        world["has_key"] = True
+                        return {"acquired_key": target_id}
+
+                    orig.bind_state_module(
+                        "crypt",
+                        lambda: dict(world),
+                        lambda: [
+                            OrigGrant(
+                                "#01",
+                                "companion",
+                                "ready",
+                                [OrigTarget("vault_right", "Vault Chest", "ready", player_anchor="right 5.0m")],
+                            ),
+                            OrigGrant(
+                                "#02",
+                                "companion",
+                                "ready" if world["near_vault"] else "staged",
+                                [
+                                    OrigTarget(
+                                        "vault_right",
+                                        "Vault Chest",
+                                        "ready" if world["near_vault"] else "staged",
+                                        prerequisite_hint=None if world["near_vault"] else "requires_proximity",
+                                        player_anchor="right 5.0m",
+                                    )
+                                ],
+                            ),
+                            OrigGrant(
+                                "#03",
+                                "companion",
+                                "ready",
+                                [OrigTarget("pedestal_key", "Key Pedestal", "ready", player_anchor="left 2.0m")],
+                            ),
+                        ],
+                    )
+                    orig.set_allowed_timeline_tags(["branch_alpha"])
+
+                def _self_healing_agent_planner(caps, ctx, memories, active_goal=None, recent_outcomes=None) -> PlanDecision:
+                    outcomes = list(recent_outcomes or [])
+                    saw_missing_key = any(o.failure_reason == "missing_iron_key" for o in outcomes)
+                    crypt_state = ctx.state_brief.get("crypt") or {}
+
+                    # If open_vault failed due to missing_iron_key and we don't have the key yet -> self-heal by fetching key!
+                    if saw_missing_key and not crypt_state.get("has_key"):
+                        return PlanDecision(
+                            intent_summary="Fetch iron key after discovering vault is locked",
+                            planned_steps=[QueueStep(0, "#03", "companion", {"target_id": "pedestal_key"})],
+                            goal_status="continue",
+                            memory_note="Vault chest requires iron key from left pedestal",
+                        )
+
+                    # Resolve "右边" -> vault_right via deictic resolver, and unroll staged -> [#01 move_to, #02 open_vault]!
+                    vault_grant = next(g for g in ctx.active_methods if g.method_id == "#02")
+                    target = resolve_deictic_target(ctx.player_command or "", vault_grant.targets)
+                    assert target is not None
+                    built = core_ref["sdk"].build_queue(ctx).add_step_auto("#02", "companion", {"target_id": target.target_id}).build()
+                    return PlanDecision(
+                        intent_summary="Approach and open right vault chest",
+                        planned_steps=built.steps,
+                        goal_status="completed",
+                    )
+
+                core_ref: dict[str, CoreSDK] = {}
+                with OriginSDK.connect_quick(
+                    slot_id="slot-w20-goal",
+                    runtime_file=runtime_path,
+                    setup_fn=_setup_dungeon,
+                ):
+                    with CoreSDK.connect_quick(
+                        slot_id="slot-w20-goal",
+                        auth_token="core-w20-agent",
+                        planner=_self_healing_agent_planner,
+                        runtime_file=runtime_path,
+                        extensions={"org.g2a.narrative.timeline.v1": {"required": False}},
+                    ) as core_sdk:
+                        core_ref["sdk"] = core_sdk
+                        report = core_sdk.execute_goal(
+                            "打开右边的宝库箱子拿到圣物",
+                            success_when=lambda c, _r: bool((c.state_brief.get("crypt") or {}).get("relic_looted")),
+                            max_turns=5,
+                            timeout_sec=6.0,
+                        )
+                        self.assertTrue(report.succeeded)
+                        self.assertEqual(report.status, "completed")
+                        # Turn 1: move_to succeeds + open_vault fails(missing_iron_key); Turn 2: take_key; Turn 3: open_vault succeeds!
+                        self.assertEqual(report.turns_used, 3)
+                        self.assertTrue(world["relic_looted"])
+
+                        # Verify episodic memory_note was recorded with branch_alpha timeline isolation!
+                        alpha_mems = core_sdk.memory_store.recall_safe(
+                            core_sdk.scope.player_id,
+                            SpoilerGuard(
+                                current_epoch=1,
+                                game_origin_id=core_sdk.scope.game_instance_id,
+                                allowed_timeline_tags={"branch_alpha"},
+                            ),
+                        )
+                        beta_mems = core_sdk.memory_store.recall_safe(
+                            core_sdk.scope.player_id,
+                            SpoilerGuard(
+                                current_epoch=1,
+                                game_origin_id=core_sdk.scope.game_instance_id,
+                                allowed_timeline_tags={"branch_beta"},
+                            ),
+                        )
+                        self.assertEqual(len(alpha_mems), 1)
+                        self.assertIn("iron key", alpha_mems[0].content)
+                        self.assertEqual(beta_mems, [])
+            finally:
+                hub_proc.terminate()
+                hub_proc.wait(timeout=3)
+                if hub_proc.stdout:
+                    hub_proc.stdout.close()
+                if hub_proc.stderr:
+                    hub_proc.stderr.close()
+
 
 if __name__ == "__main__":
     unittest.main()

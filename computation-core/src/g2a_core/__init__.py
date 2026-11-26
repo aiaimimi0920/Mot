@@ -26,6 +26,15 @@ from .memory import (
 )
 from .sqlite_memory import SQLiteCompanionStore
 from .llm_planner import OpenAICompatibleLLMPlanner
+from .agent_runtime import (
+    ActionOutcomeRecord,
+    AgentGoalState,
+    AgentGoalTracker,
+    GoalExecutionReport,
+    rank_deictic_candidates,
+    resolve_deictic_target,
+    resolve_prerequisite_steps,
+)
 from .relay_server import CloudRelayServer
 from .memory_server import MemoryHTTPClient, MemoryHTTPServer
 from .core_sdk import CognitivePlannerPort, CoreMetrics, CoreSDK, FunctionCognitivePlanner, QueueBuilder
@@ -66,4 +75,11 @@ __all__ = [
     "CoreSDK",
     "AsyncQueueBuilder",
     "AsyncCoreSDK",
+    "ActionOutcomeRecord",
+    "AgentGoalState",
+    "AgentGoalTracker",
+    "GoalExecutionReport",
+    "rank_deictic_candidates",
+    "resolve_deictic_target",
+    "resolve_prerequisite_steps",
 ]

@@ -117,7 +117,20 @@ public sealed record PlanDecision(
     string IntentSummary = "",
     List<QueueStep>? PlannedSteps = null,
     string? ReplyText = null,
-    string Audience = "player_only"
+    string Audience = "player_only",
+    string GoalStatus = "completed",
+    string? MemoryNote = null
+);
+
+public sealed record GoalExecutionReport(
+    string GoalId,
+    string Objective,
+    bool Succeeded,
+    string Status,
+    int TurnsUsed,
+    List<string> SubmittedQueues,
+    ProjectedContext? FinalContext = null,
+    string? FailureReason = null
 );
 
 public interface ICognitivePlanner

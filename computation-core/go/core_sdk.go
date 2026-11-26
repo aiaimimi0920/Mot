@@ -362,6 +362,20 @@ func (b *QueueBuilder) AddStep(methodID, actor string, args map[string]any, vali
 	return b, nil
 }
 
+func (b *QueueBuilder) AddStepAuto(methodID, actor string, args map[string]any, validate bool) (*QueueBuilder, error) {
+	caps := make([]CapabilityEntry, 0, len(b.caps))
+	for _, c := range b.caps {
+		caps = append(caps, c)
+	}
+	chain := ResolvePrerequisiteSteps(methodID, actor, args, b.ctx, caps)
+	for _, st := range chain {
+		if _, err := b.AddStep(st.MethodID, st.Actor, st.Args, validate); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (b *QueueBuilder) Submit(ctx context.Context, queueID string) (*QueueReceipt, error) {
 	if len(b.steps) == 0 {
 		return nil, &G2AError{Code: "invalid_arguments", HTTPStatus: 400, Message: "cannot submit empty queue"}
@@ -576,6 +590,122 @@ func (c *CoreSDK) Shutdown(ctx context.Context, notifyHub bool) {
 	if notifyHub && sid != "" {
 		_, _ = c.postEnvelope(ctx, "session.close", map[string]any{"reason": "client_shutdown"}, sid, nil)
 	}
+}
+
+// ExecuteGoal runs a closed-loop multi-turn AI agent cycle with anti-repeat failure fingerprinting and verification.
+func (c *CoreSDK) ExecuteGoal(
+	ctx context.Context,
+	objective string,
+	successWhen func(ProjectedContext, *QueueReceipt) bool,
+	maxTurns int,
+) (*GoalExecutionReport, error) {
+	if maxTurns <= 0 {
+		maxTurns = 6
+	}
+	goalID := "goal-" + randomHex(5)
+	failedFPs := make(map[string]struct{})
+	var submitted []string
+	var lastRec *QueueReceipt
+	var lastCtx *ProjectedContext
+	turns := 0
+
+	for ctx.Err() == nil && turns < maxTurns {
+		pulled, err := c.PullContextIfDue(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if pulled == nil {
+			pulled, err = c.PullContext(ctx)
+			if err != nil {
+				return nil, err
+			}
+		}
+		lastCtx = pulled
+		if successWhen != nil && successWhen(*pulled, lastRec) {
+			return &GoalExecutionReport{
+				GoalID: goalID, Objective: objective, Succeeded: true, Status: "completed",
+				TurnsUsed: turns, SubmittedQueues: submitted, FinalContext: pulled,
+			}, nil
+		}
+
+		synth := *pulled
+		objCopy := objective
+		synth.PlayerCommand = &objCopy
+		caps := c.GetCachedCapabilities(synth.SlotID)
+		dec, err := c.Planner.Plan(caps, synth, nil)
+		if err != nil {
+			return nil, err
+		}
+		if dec.ReplyText != "" {
+			_ = c.SendChat(ctx, dec.Audience, dec.ReplyText)
+		}
+
+		filtered := make([]QueueStep, 0, len(dec.PlannedSteps))
+		for _, s := range dec.PlannedSteps {
+			fp, _ := DigestSHA256("g2a.agent.loop.v1", map[string]any{
+				"brief": synth.StateBrief, "method_id": s.MethodID, "actor": s.Actor, "args": s.Args,
+			})
+			if _, seen := failedFPs[fp]; seen {
+				break
+			}
+			filtered = append(filtered, QueueStep{StepIndex: len(filtered), MethodID: s.MethodID, Actor: s.Actor, Args: s.Args})
+		}
+		if len(filtered) == 0 {
+			st := "no_executable_steps"
+			if dec.GoalStatus == "blocked" {
+				st = "blocked"
+			}
+			return &GoalExecutionReport{
+				GoalID: goalID, Objective: objective, Succeeded: false, Status: st,
+				TurnsUsed: turns, SubmittedQueues: submitted, FinalContext: pulled, FailureReason: st,
+			}, nil
+		}
+
+		turns++
+		qid := "Q-" + randomHex(6)
+		submitted = append(submitted, qid)
+		rec, err := c.SubmitQueueWithRecovery(ctx, MethodCallQueue{
+			QueueID: qid, Epoch: synth.Epoch, BasedOnRev: synth.Rev,
+			Trigger: "player_command", Supersedes: turns == 1, IntentSummary: dec.IntentSummary, Steps: filtered,
+		})
+		if err != nil {
+			return nil, err
+		}
+		lastRec = rec
+		if rec != nil {
+			for _, sr := range rec.StepReceipts {
+				if sr.State == "failed" && sr.StepIndex >= 0 && sr.StepIndex < len(filtered) {
+					st := filtered[sr.StepIndex]
+					fp, _ := DigestSHA256("g2a.agent.loop.v1", map[string]any{
+						"brief": synth.StateBrief, "method_id": st.MethodID, "actor": st.Actor, "args": st.Args,
+					})
+					failedFPs[fp] = struct{}{}
+				}
+			}
+		}
+
+		if fresh, _ := c.PullContextIfDue(ctx); fresh != nil {
+			lastCtx = fresh
+		}
+		if successWhen != nil && lastCtx != nil && successWhen(*lastCtx, lastRec) {
+			return &GoalExecutionReport{
+				GoalID: goalID, Objective: objective, Succeeded: true, Status: "completed",
+				TurnsUsed: turns, SubmittedQueues: submitted, FinalContext: lastCtx,
+			}, nil
+		}
+		if successWhen == nil && lastRec != nil && lastRec.QueueState == "completed" && dec.GoalStatus != "continue" {
+			return &GoalExecutionReport{
+				GoalID: goalID, Objective: objective, Succeeded: true, Status: "completed",
+				TurnsUsed: turns, SubmittedQueues: submitted, FinalContext: lastCtx,
+			}, nil
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	return &GoalExecutionReport{
+		GoalID: goalID, Objective: objective, Succeeded: false, Status: "exhausted",
+		TurnsUsed: turns, SubmittedQueues: submitted, FinalContext: lastCtx, FailureReason: "max_turns_exceeded",
+	}, nil
 }
 
 func (c *CoreSDK) onContextReceived(ctx context.Context, pc ProjectedContext, depth int) (*QueueReceipt, error) {
