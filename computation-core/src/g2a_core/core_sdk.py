@@ -29,6 +29,7 @@ from .schemas import (
     PlanDecision,
     ProjectedContext,
     QueueReceipt,
+    QueueStep,
 )
 from .ssrf import validate_outbound_url_against_ssrf
 
@@ -72,6 +73,105 @@ class CognitivePlannerPort(Protocol):
         recalled_memories: List[MemoryRecord],
     ) -> PlanDecision:
         ...
+
+
+class FunctionCognitivePlanner:
+    """Ergonomic adapter wrapping a plain callable `(caps, ctx, memories) -> PlanDecision` into CognitivePlannerPort."""
+
+    def __init__(
+        self,
+        fn: Callable[[List[CapabilityEntry], ProjectedContext, List[MemoryRecord]], PlanDecision],
+    ) -> None:
+        self._fn = fn
+
+    def plan(
+        self,
+        capabilities: List[CapabilityEntry],
+        context: ProjectedContext,
+        recalled_memories: List[MemoryRecord],
+    ) -> PlanDecision:
+        return self._fn(capabilities, context, recalled_memories)
+
+
+class QueueBuilder:
+    """
+    Fluent step builder with zero-latency client-side pre-flight validation against:
+      1. FrozenScope permitted_methods;
+      2. ProjectedContext active_methods (readiness + target_id candidate membership);
+      3. Cached CapabilityEntry JSON Schema.
+    """
+
+    def __init__(
+        self,
+        sdk: "CoreSDK",
+        context: ProjectedContext,
+        intent_summary: str = "Execute planned companion queue",
+        trigger: Optional[str] = None,
+        supersedes: Optional[bool] = None,
+    ) -> None:
+        self._sdk = sdk
+        self._ctx = context
+        self._intent_summary = intent_summary
+        is_cmd = context.player_command is not None
+        self._trigger = trigger or ("player_command" if is_cmd else "proactive")
+        self._supersedes = is_cmd if supersedes is None else supersedes
+        self._steps: List[QueueStep] = []
+        self._grant_map = {(g.method_id, g.actor): g for g in context.active_methods}
+        caps = sdk.capability_cache.get(context.capability_table_digest, [])
+        self._cap_map = {c.method_id: c for c in caps}
+
+    def add_step(
+        self,
+        method_id: str,
+        actor: str,
+        args: Optional[Dict[str, Any]] = None,
+        validate: bool = True,
+        allow_initial_staged: bool = False,
+    ) -> "QueueBuilder":
+        step_args = dict(args or {})
+        idx = len(self._steps)
+        if validate:
+            if self._sdk.scope is not None:
+                allowed_actors = self._sdk.scope.permitted_methods.get(method_id)
+                if allowed_actors is not None and actor not in allowed_actors:
+                    raise G2AError("permission_denied", 403, f"Scope forbids ({method_id}, {actor})")
+            grant = self._grant_map.get((method_id, actor))
+            if grant is None:
+                raise G2AError("invalid_arguments", 400, f"Method ({method_id}, {actor}) not active in current context")
+            if idx == 0 and not allow_initial_staged and grant.readiness != "ready":
+                raise G2AError("stale_context", 409, f"Initial step ({method_id}, {actor}) is staged, not ready")
+            if "target_id" in step_args and grant.targets:
+                tid = step_args["target_id"]
+                cand = next((t for t in grant.targets if t.target_id == tid), None)
+                if cand is None:
+                    raise G2AError("not_found", 404, f"Target {tid!r} not in active candidates for {method_id}")
+                if idx == 0 and not allow_initial_staged and cand.readiness != "ready":
+                    raise G2AError("stale_context", 409, f"Initial target {tid!r} is staged ({cand.prerequisite_hint})")
+            cap = self._cap_map.get(method_id)
+            if cap is not None and cap.params_schema:
+                from .llm_planner import OpenAICompatibleLLMPlanner
+
+                if not OpenAICompatibleLLMPlanner._validate_object_schema(step_args, cap.params_schema, 0):
+                    raise G2AError("invalid_arguments", 400, f"Arguments for {method_id} failed local JSON Schema check")
+
+        self._steps.append(QueueStep(step_index=idx, method_id=method_id, actor=actor, args=step_args))
+        return self
+
+    def build(self, queue_id: Optional[str] = None) -> MethodCallQueue:
+        if not self._steps:
+            raise G2AError("invalid_arguments", 400, "Cannot build an empty MethodCallQueue")
+        return MethodCallQueue(
+            queue_id=queue_id or generate_id("Q"),
+            epoch=self._ctx.epoch,
+            based_on_rev=self._ctx.rev,
+            trigger=self._trigger,
+            supersedes=self._supersedes,
+            intent_summary=self._intent_summary,
+            steps=list(self._steps),
+        )
+
+    def submit(self, queue_id: Optional[str] = None) -> Optional[QueueReceipt]:
+        return self._sdk.submit_queue_with_standard_recovery(self.build(queue_id=queue_id))
 
 
 class CoreSDK:
@@ -205,6 +305,64 @@ class CoreSDK:
         self.allow_loopback = True
         manifest = discover_local_hub_manifest(runtime_file=runtime_file)
         return self.connect(str(manifest["core_url"]), auth_token, slot_id, **kwargs)
+
+    @classmethod
+    def connect_quick(
+        cls,
+        slot_id: str,
+        auth_token: str,
+        planner: Union[CognitivePlannerPort, Callable[..., PlanDecision], None] = None,
+        hub_endpoint: str = "auto",
+        fallback_url: Optional[str] = None,
+        runtime_file: Optional[str] = None,
+        stream_mode: str = "websocket",
+        allow_loopback: bool = True,
+        memory_store: Optional[InMemoryCompanionStore] = None,
+        **connect_kwargs: Any,
+    ) -> "CoreSDK":
+        """One-step context-managed CoreSDK bootstrap with local Hub auto-discovery and callable planner support."""
+        if planner is None:
+            resolved_planner: CognitivePlannerPort = FunctionCognitivePlanner(lambda c, x, m: PlanDecision())
+        elif hasattr(planner, "plan"):
+            resolved_planner = planner  # type: ignore[assignment]
+        else:
+            resolved_planner = FunctionCognitivePlanner(planner)  # type: ignore[arg-type]
+
+        sdk = cls(
+            planner=resolved_planner,
+            memory_store=memory_store,
+            allow_loopback=allow_loopback,
+            stream_mode=stream_mode,
+        )
+        resolved_ep = hub_endpoint
+        if hub_endpoint == "auto":
+            try:
+                manifest = discover_local_hub_manifest(runtime_file=runtime_file)
+                resolved_ep = str(manifest["core_url"])
+            except Exception:
+                if not fallback_url:
+                    raise
+                resolved_ep = fallback_url
+        sdk.connect(resolved_ep, auth_token, slot_id, **connect_kwargs)
+        return sdk
+
+    def build_queue(
+        self,
+        context: Optional[ProjectedContext] = None,
+        intent_summary: str = "Execute planned companion queue",
+        trigger: Optional[str] = None,
+        supersedes: Optional[bool] = None,
+    ) -> QueueBuilder:
+        ctx = context or self.latest_context
+        if ctx is None:
+            ctx = self.pull_context()
+        return QueueBuilder(self, ctx, intent_summary=intent_summary, trigger=trigger, supersedes=supersedes)
+
+    def __enter__(self) -> "CoreSDK":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.shutdown_session_cleanly(notify_hub=True)
 
     def shutdown_session_cleanly(self, notify_hub: bool = False) -> None:
         if self.closed:

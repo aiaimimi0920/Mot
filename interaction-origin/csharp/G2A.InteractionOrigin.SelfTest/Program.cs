@@ -336,6 +336,18 @@ internal static class Program
         }
         if (!caughtOverMax) throw new Exception("Expected recursive JSON Schema maximum bound rejection");
 
+        // Verify CompleteStepsBatch coalesces multiple sustained settlements into 1 origin.sync delta frame
+        sdk.HandleOriginExecute(new OriginExecuteRequest("slot-csharp", 1, "invoke", "exec-batch-1", "#01", "companion", new()));
+        sdk.HandleOriginExecute(new OriginExecuteRequest("slot-csharp", 1, "invoke", "exec-batch-2", "#01", "companion", new()));
+        int beforeBatch = tx.Posts.Count;
+        int batchSettled = sdk.CompleteStepsBatch(new (string, bool, Dictionary<string, object?>?, string?)[]
+        {
+            ("exec-batch-1", true, new Dictionary<string, object?> { ["arrived"] = "A" }, null),
+            ("exec-batch-2", false, null, "blocked_path")
+        });
+        if (batchSettled != 2 || tx.Posts.Count - beforeBatch != 1)
+            throw new Exception("Expected CompleteStepsBatch to coalesce 2 settlements into 1 origin.sync frame");
+
         Console.WriteLine($"C# G2A.InteractionOrigin SelfTest PASSED | JCS={d1}");
         return 0;
     }

@@ -573,17 +573,33 @@ public:
     }
 
     void complete_step(const std::string& execution_id, bool succeeded, JsonObject summary = {}, std::string reason = "") {
+        complete_steps_batch({{execution_id, succeeded, std::move(summary), std::move(reason)}});
+    }
+
+    struct StepSettlement {
+        std::string execution_id;
+        bool succeeded = true;
+        JsonObject summary;
+        std::string reason;
+    };
+
+    size_t complete_steps_batch(const std::vector<StepSettlement>& settlements) {
         std::lock_guard<std::recursive_mutex> lk(mu_);
-        if (in_flight_.erase(execution_id) == 0) return;
-        OriginExecuteReply rep{
-            execution_id,
-            succeeded ? "succeeded" : "failed",
-            succeeded ? std::optional<JsonObject>(std::move(summary)) : std::nullopt,
-            succeeded ? std::nullopt : std::optional<std::string>(std::move(reason)),
-        };
-        store_ledger_reply(rep);
-        pending_settled_.push_back(std::move(rep));
-        flush_dirty_sync(false);
+        size_t count = 0;
+        for (const auto& s : settlements) {
+            if (in_flight_.erase(s.execution_id) == 0) continue;
+            OriginExecuteReply rep{
+                s.execution_id,
+                s.succeeded ? "succeeded" : "failed",
+                s.succeeded ? std::optional<JsonObject>(s.summary) : std::nullopt,
+                s.succeeded ? std::nullopt : std::optional<std::string>(s.reason),
+            };
+            store_ledger_reply(rep);
+            pending_settled_.push_back(std::move(rep));
+            ++count;
+        }
+        if (count > 0) flush_dirty_sync(false);
+        return count;
     }
 
     OriginExecuteReply cancel_in_flight_step(const std::string& execution_id) {

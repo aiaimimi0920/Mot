@@ -256,6 +256,44 @@ export class OriginSDK {
     this.syncEnabled = true;
   }
 
+  static async connectQuick(config) {
+    let resolvedUrl = config.hubOriginUrl ?? "auto";
+    if (resolvedUrl === "auto") {
+      try {
+        resolvedUrl = await discoverLocalHubOriginUrl();
+      } catch {
+        resolvedUrl = config.fallbackUrl ?? "http://127.0.0.1:19210";
+      }
+    }
+    const sdk = new OriginSDK(
+      config.slotId,
+      resolvedUrl,
+      config.roleKind ?? "companion",
+      config.billingMode ?? "player_metered",
+      config.onChatDelivered,
+      config.originToken ?? "",
+      config.roomId ?? "",
+      config.factionId ?? ""
+    );
+    const defaultActors = config.actors ?? (sdk.roleKind === "independent_npc" ? [] : ["companion", "player"]);
+    for (const act of defaultActors) sdk.bindActorSubject(act, {});
+    if (config.setup) await config.setup(sdk);
+    await sdk.publishCapabilitiesAndStartOutboundStream(config.publishOptions ?? {});
+    return sdk;
+  }
+
+  async close(notifyOffline = true) {
+    for (const execId of [...this.inFlight.keys()]) await this.cancelInFlightStep(execId);
+    if (notifyOffline) {
+      try { await this.reportPresenceChanged(false, 0); } catch {}
+    }
+    this.stopOutboundExecuteStream();
+  }
+
+  async [Symbol.asyncDispose]() {
+    await this.close(true);
+  }
+
   registerCapability(def, handler) {
     const actors = this.roleKind === "independent_npc" ? def.permitted_actors.filter((a) => a !== "player") : [...def.permitted_actors];
     this.capabilities.set(def.method_id, {
@@ -484,11 +522,25 @@ export class OriginSDK {
   }
 
   async completeStep(executionId, succeeded, summary, reason) {
-    if (!this.inFlight.delete(executionId)) return;
-    const rep = { execution_id: executionId, state: succeeded ? "succeeded" : "failed", effect_summary: summary, failure_reason: reason };
-    this.storeLedgerReply(rep);
-    this.pendingSettled.push(rep);
-    await this.flushDirtySync(false);
+    await this.completeStepsBatch([{ executionId, succeeded, summary, reason }]);
+  }
+
+  async completeStepsBatch(settlements) {
+    let count = 0;
+    for (const s of settlements) {
+      if (!this.inFlight.delete(s.executionId)) continue;
+      const rep = {
+        execution_id: s.executionId,
+        state: s.succeeded ? "succeeded" : "failed",
+        effect_summary: s.summary,
+        failure_reason: s.reason,
+      };
+      this.storeLedgerReply(rep);
+      this.pendingSettled.push(rep);
+      count++;
+    }
+    if (count > 0) await this.flushDirtySync(false);
+    return count;
   }
 
   async cancelInFlightStep(executionId) {

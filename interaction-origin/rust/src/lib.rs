@@ -824,25 +824,37 @@ impl OriginSdk {
     }
 
     pub fn complete_step(&self, execution_id: &str, succeeded: bool, summary: Option<JsonObject>, reason: Option<String>) {
-        let should_sync = {
+        let _ = self.complete_steps_batch(&[(execution_id.to_owned(), succeeded, summary, reason)]);
+    }
+
+    /// Atomically settles multiple sustained steps in one lock scope and emits at most one `origin.sync` delta frame.
+    pub fn complete_steps_batch(
+        &self,
+        settlements: &[(String, bool, Option<JsonObject>, Option<String>)],
+    ) -> usize {
+        let count = {
             let mut st = self.state.lock().unwrap();
-            if st.in_flight.remove(execution_id).is_none() {
-                false
-            } else {
+            let mut n = 0usize;
+            for (execution_id, succeeded, summary, reason) in settlements {
+                if st.in_flight.remove(execution_id).is_none() {
+                    continue;
+                }
                 let rep = OriginExecuteReply {
-                    execution_id: execution_id.to_owned(),
-                    state: if succeeded { "succeeded".to_owned() } else { "failed".to_owned() },
-                    effect_summary: if succeeded { summary } else { None },
-                    failure_reason: if succeeded { None } else { reason },
+                    execution_id: execution_id.clone(),
+                    state: if *succeeded { "succeeded".to_owned() } else { "failed".to_owned() },
+                    effect_summary: if *succeeded { summary.clone() } else { None },
+                    failure_reason: if *succeeded { None } else { reason.clone() },
                 };
                 store_ledger_reply(&mut st, rep.clone());
                 st.pending_settled.push(rep);
-                true
+                n += 1;
             }
+            n
         };
-        if should_sync {
+        if count > 0 {
             self.flush_dirty_sync(false);
         }
+        count
     }
 
     pub fn cancel_in_flight_step(&self, execution_id: &str) -> OriginExecuteReply {
@@ -1329,5 +1341,32 @@ mod tests {
         let c_rep = sdk.cancel_in_flight_step("ex-ka-1");
         assert_eq!(c_rep.state, "cancelled");
         assert!(cancelled.load(Ordering::SeqCst));
+
+        // Verify complete_steps_batch coalesces multiple sustained settlements into a single origin.sync delta frame
+        let mut ok_args = JsonObject::new();
+        ok_args.insert("qty".to_owned(), JsonValue::from(5i64));
+        for eid in ["ex-rs-b1", "ex-rs-b2"] {
+            let r = sdk.handle_origin_execute(&OriginExecuteRequest {
+                slot_id: "slot-rust-test".to_owned(),
+                epoch: 1,
+                kind: "invoke".to_owned(),
+                execution_id: eid.to_owned(),
+                method_id: Some("#01".to_owned()),
+                actor: Some("companion".to_owned()),
+                args: ok_args.clone(),
+            });
+            assert_eq!(r.state, "executing");
+        }
+        let posts_before = posts.lock().unwrap().len();
+        let batch_n = sdk.complete_steps_batch(&[
+            ("ex-rs-b1".to_owned(), true, None, None),
+            ("ex-rs-b2".to_owned(), false, None, Some("cart_full".to_owned())),
+        ]);
+        assert_eq!(batch_n, 2);
+        let locked_posts = posts.lock().unwrap();
+        assert_eq!(locked_posts.len() - posts_before, 1);
+        let last_sync_wire = jcs::canonicalize_utf8(&locked_posts.last().unwrap().1).unwrap();
+        assert!(last_sync_wire.contains("\"ex-rs-b1\""));
+        assert!(last_sync_wire.contains("\"ex-rs-b2\""));
     }
 }

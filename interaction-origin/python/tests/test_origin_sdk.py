@@ -297,6 +297,77 @@ class TestInteractionOriginPythonSDK(unittest.TestCase):
         self.assertEqual(npc_tx.posts[-1][1]["kind"], "host_handoff")
         self.assertEqual(npc_tx.posts[-1][1]["new_player_id"], "player-2")
 
+    def test_capability_decorator_schema_inference_token_lifecycle_and_batch_settlement(self):
+        from typing import Literal, Optional
+        from g2a_origin import G2AOriginError, infer_params_schema_from_callable
+
+        tx = RecordingTransport()
+        sdk = OriginSDK(slot_id="slot-ergonomics", hub_transport=tx)
+        sdk.bind_actor_subject("companion", {"name": "Lyra"})
+
+        @sdk.capability("#01", description="Brew tactical potion")
+        def brew_potion(
+            recipe: Literal["heal", "stamina"],
+            potency: int,
+            urgent: bool = False,
+            note: Optional[str] = None,
+        ) -> dict:
+            return {"brewed": recipe, "potency": potency, "urgent": urgent, "note": note}
+
+        inferred = infer_params_schema_from_callable(brew_potion)
+        self.assertEqual(inferred["required"], ["recipe", "potency"])
+        self.assertFalse(inferred["additionalProperties"])
+        self.assertEqual(inferred["properties"]["recipe"], {"enum": ["heal", "stamina"], "type": "string"})
+        self.assertEqual(inferred["properties"]["potency"], {"type": "integer"})
+
+        tokens_seen = {}
+
+        @sdk.capability("#02", sustained=True, description="Channel ward")
+        def channel_ward(sector: str, token) -> StartedExecuting:
+            tokens_seen[sector] = token
+            return StartedExecuting(cancel_fn=lambda: None)
+
+        sdk.publish_capabilities_and_baseline()
+        self.assertEqual(len(tx.posts), 2)
+
+        # Valid typed invocation auto-wraps plain dict into ImmediateSucceeded
+        ok = sdk.handle_origin_execute(
+            OriginExecuteRequest("slot-ergonomics", 1, "invoke", "ex-brew-1", "#01", "companion", {"recipe": "heal", "potency": 3})
+        )
+        self.assertEqual(ok.state, "succeeded")
+        self.assertEqual(ok.effect_summary, {"brewed": "heal", "potency": 3, "urgent": False, "note": None})
+
+        # Invalid Literal enum value rejected by inferred JSON Schema
+        with self.assertRaises(G2AOriginError):
+            sdk.handle_origin_execute(
+                OriginExecuteRequest("slot-ergonomics", 1, "invoke", "ex-brew-bad", "#01", "companion", {"recipe": "poison", "potency": 1})
+            )
+
+        # Start 4 sustained steps: cancel 1 (verifying StepExecutionToken.is_cancelled + on_cancel), batch-settle 3 in ONE sync frame!
+        cancel_cb_fired = {"north": False}
+        for sec in ("north", "east", "south", "west"):
+            rep = sdk.handle_origin_execute(
+                OriginExecuteRequest("slot-ergonomics", 1, "invoke", f"ex-{sec}", "#02", "companion", {"sector": sec})
+            )
+            self.assertEqual(rep.state, "executing")
+        tokens_seen["north"].on_cancel(lambda: cancel_cb_fired.__setitem__("north", True))
+        sdk.cancel_in_flight_step("ex-north")
+        self.assertTrue(tokens_seen["north"].is_cancelled)
+        self.assertTrue(cancel_cb_fired["north"])
+
+        posts_before_batch = len(tx.posts)
+        settled_n = sdk.complete_steps_batch(
+            [
+                ("ex-east", True, {"ward": "east"}, None),
+                ("ex-south", True, {"ward": "south"}, None),
+                ("ex-west", False, None, "mana_depleted"),
+            ]
+        )
+        self.assertEqual(settled_n, 3)
+        self.assertEqual(len(tx.posts) - posts_before_batch, 1)  # Single coalesced origin.sync delta frame!
+        batch_sync = tx.posts[-1][1]
+        self.assertEqual(len(batch_sync["settled_executions"]), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

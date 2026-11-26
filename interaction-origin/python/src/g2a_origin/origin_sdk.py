@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import http.client
+import inspect
 import json
 import math
 import os
@@ -15,7 +16,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Protocol, Sequence, Tuple, Union, get_args, get_origin, get_type_hints
 
 from .jcs import StrictJSONError, jcs_sha256, parse_strict_json
 
@@ -106,6 +107,34 @@ class ActiveMethodGrant:
 @dataclass
 class StepExecutionToken:
     execution_id: str
+    _sdk: Optional["OriginSDK"] = field(default=None, repr=False, compare=False)
+    _cancelled: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
+    _cancel_callbacks: List[Callable[[], None]] = field(default_factory=list, repr=False, compare=False)
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def on_cancel(self, callback: Callable[[], None]) -> None:
+        if self._cancelled.is_set():
+            callback()
+        else:
+            self._cancel_callbacks.append(callback)
+
+    def _trigger_cancel(self) -> None:
+        if not self._cancelled.is_set():
+            self._cancelled.set()
+            for cb in list(self._cancel_callbacks):
+                cb()
+
+    def complete(
+        self,
+        succeeded: bool = True,
+        summary: Optional[Dict[str, Any]] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        if self._sdk is not None:
+            self._sdk.complete_step(self.execution_id, succeeded, summary=summary, reason=reason)
 
 
 @dataclass
@@ -525,6 +554,98 @@ def _validate_args_schema(
                 _validate_field_schema(qual, v, prop_spec, depth + 1)
 
 
+def _py_type_to_json_schema(tp: Any) -> Tuple[Dict[str, Any], bool]:
+    origin = get_origin(tp)
+    if origin is Union:
+        non_none = [a for a in get_args(tp) if a is not type(None)]
+        is_opt = len(non_none) < len(get_args(tp))
+        if len(non_none) == 1:
+            sub_schema, _ = _py_type_to_json_schema(non_none[0])
+            return sub_schema, is_opt
+    if origin is Literal:
+        vals = list(get_args(tp))
+        base_t = "string" if all(isinstance(v, str) for v in vals) else "integer" if all(type(v) is int for v in vals) else None
+        spec: Dict[str, Any] = {"enum": vals}
+        if base_t:
+            spec["type"] = base_t
+        return spec, False
+    if origin in (list, List, Sequence):
+        item_args = get_args(tp)
+        item_schema, _ = _py_type_to_json_schema(item_args[0]) if item_args else ({}, False)
+        return ({"type": "array", "items": item_schema} if item_schema else {"type": "array"}), False
+    if origin in (dict, Dict) or tp is dict:
+        return {"type": "object"}, False
+    if tp is str:
+        return {"type": "string"}, False
+    if tp is bool:
+        return {"type": "boolean"}, False
+    if tp is int:
+        return {"type": "integer"}, False
+    if tp is float:
+        return {"type": "number"}, False
+    return {}, False
+
+
+def infer_params_schema_from_callable(
+    fn: Callable[..., Any],
+    skip_params: Sequence[str] = ("self", "actor", "subject", "token"),
+) -> Dict[str, Any]:
+    """Automatically derives a strict JSON Schema from Python function type annotations and defaults."""
+    sig = inspect.signature(fn)
+    local_ns: Dict[str, Any] = {
+        "Any": Any,
+        "Dict": Dict,
+        "List": List,
+        "Literal": Literal,
+        "Optional": Optional,
+        "Sequence": Sequence,
+        "Tuple": Tuple,
+        "Union": Union,
+    }
+    frame = inspect.currentframe()
+    try:
+        caller = frame.f_back if frame is not None else None
+        while caller is not None:
+            if caller.f_code.co_filename != __file__:
+                local_ns.update(caller.f_locals)
+                break
+            caller = caller.f_back
+    finally:
+        del frame
+    try:
+        hints = get_type_hints(fn, localns=local_ns)
+    except Exception:
+        hints = {}
+    skip = set(skip_params)
+    props: Dict[str, Any] = {}
+    required: List[str] = []
+    allow_extra = False
+
+    for name, param in sig.parameters.items():
+        if name in skip:
+            continue
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            allow_extra = True
+            continue
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            continue
+        ann = hints.get(name, param.annotation)
+        if ann is inspect.Parameter.empty:
+            prop_spec, is_opt = {}, False
+        else:
+            prop_spec, is_opt = _py_type_to_json_schema(ann)
+        props[name] = prop_spec
+        if param.default is inspect.Parameter.empty and not is_opt:
+            required.append(name)
+
+    return {
+        "type": "object",
+        "required": required,
+        "additionalProperties": allow_extra,
+        "properties": props,
+    }
+
+
 # --- OriginSDK (§2.2 - §2.4) ---
 
 
@@ -579,6 +700,7 @@ class OriginSDK:
         self.actors: Dict[str, Any] = {}
         self.signal_modules: Dict[str, _SignalModule] = {}
         self.in_flight_steps: Dict[str, Callable[[], None]] = {}
+        self._in_flight_tokens: Dict[str, StepExecutionToken] = {}
         self.execution_ledger: OrderedDict[str, OriginExecuteReply] = OrderedDict()
         self.pending_settled_executions: List[OriginExecuteReply] = []
 
@@ -609,6 +731,62 @@ class OriginSDK:
         origin_url = discover_local_hub_origin_url(runtime_file=runtime_file)
         tx = LoopbackHTTPTransportClient(origin_url, shared_token=shared_token)
         return cls(slot_id=slot_id, hub_transport=tx, shared_token=shared_token, **kwargs)
+
+    @classmethod
+    def connect_quick(
+        cls,
+        slot_id: str,
+        hub_origin_url: str = "auto",
+        fallback_url: str = "http://127.0.0.1:19210",
+        execute_mode: str = "loopback",  # "loopback" | "pull"
+        actors: Sequence[str] = ("companion", "player"),
+        runtime_file: Optional[str] = None,
+        shared_token: str = "",
+        setup_fn: Optional[Callable[["OriginSDK"], None]] = None,
+        publish: bool = True,
+        **kwargs: Any,
+    ) -> "OriginSDK":
+        """One-step zero-boilerplate OriginSDK bootstrap with automatic discovery fallback and listener startup."""
+        resolved_url = hub_origin_url
+        if hub_origin_url == "auto":
+            try:
+                resolved_url = discover_local_hub_origin_url(runtime_file=runtime_file)
+            except Exception:
+                resolved_url = fallback_url
+        tx = LoopbackHTTPTransportClient(resolved_url, shared_token=shared_token)
+        sdk = cls(slot_id=slot_id, hub_transport=tx, shared_token=shared_token, **kwargs)
+        for act in actors:
+            if sdk.slot_role_kind == "independent_npc" and act == "player":
+                continue
+            sdk.bind_actor_subject(act, {})
+        if execute_mode == "pull":
+            sdk.start_outbound_execute_stream(resolved_url)
+        else:
+            sdk.start_loopback_execute_listener()
+        if setup_fn is not None:
+            setup_fn(sdk)
+        if publish:
+            sdk.publish_capabilities_and_baseline()
+        return sdk
+
+    def close(self, notify_offline: bool = True) -> None:
+        self._cancel_all_in_flight("sdk_closed")
+        if notify_offline:
+            try:
+                self.report_player_presence(False, 0)
+            except Exception:
+                pass
+        self.stop_loopback_execute_listener()
+        self.stop_outbound_execute_stream()
+        close_fn = getattr(self.hub_transport, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+    def __enter__(self) -> "OriginSDK":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close(notify_offline=True)
 
     def start_loopback_execute_listener(self, host: str = "127.0.0.1", port: int = 0) -> str:
         sdk_ref = self
@@ -691,20 +869,23 @@ class OriginSDK:
         return self.origin_execute_url
 
     def stop_loopback_execute_listener(self) -> None:
-        self._outbound_stop.set()
+        self.stop_outbound_execute_stream()
         if self._http_server is not None:
             self._http_server.shutdown()
             self._http_server.server_close()
             self._http_server = None
+        close_fn = getattr(self.hub_transport, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+    def stop_outbound_execute_stream(self) -> None:
+        self._outbound_stop.set()
         if self._outbound_reply_conn is not None:
             try:
                 self._outbound_reply_conn.close()
             except Exception:
                 pass
             self._outbound_reply_conn = None
-        close_fn = getattr(self.hub_transport, "close", None)
-        if callable(close_fn):
-            close_fn()
 
     def __del__(self) -> None:
         try:
@@ -854,6 +1035,89 @@ class OriginSDK:
             spatial_target_verb=spatial_target_verb,
             navigation_verb=navigation_verb,
         )
+
+    def capability(
+        self,
+        method_id: str,
+        name: Optional[str] = None,
+        description: str = "",
+        permitted_actors: Sequence[str] = ("companion",),
+        sustained: bool = False,
+        risk_flags: Sequence[str] = (),
+        default_policy: str = "allow",
+        params_schema: Optional[Dict[str, Any]] = None,
+        readiness_check: Optional[Callable[[str, Any], Optional[str]]] = None,
+        spatial_target_verb: bool = False,
+        navigation_verb: bool = False,
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """
+        Zero-boilerplate decorator registering a game capability and automatically inferring its JSON Schema
+        from Python type hints. Decorated functions may accept `(actor, subject, args, token)` OR typed keyword
+        arguments directly, and may return an `EffectInvocationResult` or a plain `dict` / `None`.
+        """
+        def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            sig = inspect.signature(fn)
+            param_names = list(sig.parameters.keys())
+            is_raw_four_arg = param_names == ["actor", "subject", "args", "token"]
+            schema = (
+                dict(params_schema)
+                if params_schema is not None
+                else ({"type": "object"} if is_raw_four_arg else infer_params_schema_from_callable(fn))
+            )
+            cap_def = CapabilityEntry(
+                method_id=method_id,
+                name=name or fn.__name__,
+                description=description or (inspect.getdoc(fn) or fn.__name__),
+                permitted_actors=list(permitted_actors),
+                params_schema=schema,
+                sustained=sustained,
+                risk_flags=list(risk_flags),
+                default_policy=default_policy,
+            )
+
+            def _wrapped_handler(
+                actor: str,
+                subject: Any,
+                step_args: Dict[str, Any],
+                token: StepExecutionToken,
+            ) -> EffectInvocationResult:
+                if is_raw_four_arg:
+                    res = fn(actor, subject, step_args, token)
+                else:
+                    call_kwargs: Dict[str, Any] = {}
+                    accepts_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+                    for pname in param_names:
+                        if pname == "actor":
+                            call_kwargs["actor"] = actor
+                        elif pname == "subject":
+                            call_kwargs["subject"] = subject
+                        elif pname == "token":
+                            call_kwargs["token"] = token
+                        elif pname in step_args:
+                            call_kwargs[pname] = step_args[pname]
+                    if accepts_varkw:
+                        for k, v in step_args.items():
+                            call_kwargs.setdefault(k, v)
+                    res = fn(**call_kwargs)
+
+                if isinstance(res, (ImmediateSucceeded, ImmediateFailed, StartedExecuting)):
+                    return res
+                if res is None:
+                    return ImmediateSucceeded({})
+                if isinstance(res, dict):
+                    return ImmediateSucceeded(res)
+                return ImmediateSucceeded({"value": res})
+
+            self.register_capability(
+                cap_def,
+                effect_handler=_wrapped_handler,
+                readiness_check=readiness_check,
+                spatial_target_verb=spatial_target_verb,
+                navigation_verb=navigation_verb,
+            )
+            return fn
+
+        return _decorator
 
     def publish_capabilities_and_baseline(
         self,
@@ -1183,7 +1447,7 @@ class OriginSDK:
             _validate_args_schema(req.args, reg.definition.params_schema)
 
             subject_instance = self.actors[req.actor]
-            token = StepExecutionToken(req.execution_id)
+            token = StepExecutionToken(req.execution_id, _sdk=self)
             outcome = reg.effect_handler(req.actor, subject_instance, req.args, token)
 
             if isinstance(outcome, ImmediateSucceeded):
@@ -1198,6 +1462,7 @@ class OriginSDK:
                 return rep
             if isinstance(outcome, StartedExecuting):
                 self.in_flight_steps[req.execution_id] = outcome.cancel_fn
+                self._in_flight_tokens[req.execution_id] = token
                 rep = OriginExecuteReply(req.execution_id, "executing")
                 self._store_ledger_reply(rep)
                 return rep
@@ -1225,28 +1490,41 @@ class OriginSDK:
         summary: Optional[Dict[str, Any]] = None,
         reason: Optional[str] = None,
     ) -> None:
-        settled_flag = {"queued": False}
+        self.complete_steps_batch([(execution_id, succeeded, summary, reason)])
 
-        def _finish() -> None:
-            if execution_id not in self.in_flight_steps:
-                return
-            self.in_flight_steps.pop(execution_id, None)
-            state = "succeeded" if succeeded else "failed"
-            rep = OriginExecuteReply(execution_id, state, effect_summary=summary, failure_reason=reason)
-            self._store_ledger_reply(rep)
-            self.pending_settled_executions.append(rep)
-            settled_flag["queued"] = True
+    def complete_steps_batch(
+        self,
+        settlements: Sequence[Tuple[str, bool, Optional[Dict[str, Any]], Optional[str]]],
+    ) -> int:
+        """Atomically settles multiple sustained steps on the game thread and coalesces them into a single origin.sync frame."""
+        settled_count = {"n": 0}
 
-        self.engine_dispatcher.run_on_game_thread(_finish)
-        if settled_flag["queued"]:
+        def _finish_batch() -> None:
+            for execution_id, succeeded, summary, reason in settlements:
+                if execution_id not in self.in_flight_steps:
+                    continue
+                self.in_flight_steps.pop(execution_id, None)
+                self._in_flight_tokens.pop(execution_id, None)
+                state = "succeeded" if succeeded else "failed"
+                rep = OriginExecuteReply(execution_id, state, effect_summary=summary, failure_reason=reason)
+                self._store_ledger_reply(rep)
+                self.pending_settled_executions.append(rep)
+                settled_count["n"] += 1
+
+        self.engine_dispatcher.run_on_game_thread(_finish_batch)
+        if settled_count["n"] > 0:
             self.flush_dirty_sync(significant_event=False)
+        return settled_count["n"]
 
     def cancel_in_flight_step(self, execution_id: str) -> OriginExecuteReply:
         cancelled_flag = {"queued": False}
 
         def _cancel() -> OriginExecuteReply:
+            tok = self._in_flight_tokens.pop(execution_id, None)
             cancel_fn = self.in_flight_steps.pop(execution_id, None)
             if cancel_fn is not None:
+                if tok is not None:
+                    tok._trigger_cancel()
                 cancel_fn()
                 rep = OriginExecuteReply(execution_id, "cancelled", failure_reason="cancelled_by_hub")
                 self._store_ledger_reply(rep)
@@ -1263,10 +1541,14 @@ class OriginSDK:
     def _cancel_all_in_flight(self, reason: str) -> None:
         def _clear() -> None:
             for exec_id, cancel_fn in list(self.in_flight_steps.items()):
+                tok = self._in_flight_tokens.pop(exec_id, None)
+                if tok is not None:
+                    tok._trigger_cancel()
                 cancel_fn()
                 rep = OriginExecuteReply(exec_id, "cancelled", failure_reason=reason)
                 self._store_ledger_reply(rep)
                 self.pending_settled_executions.append(rep)
             self.in_flight_steps.clear()
+            self._in_flight_tokens.clear()
 
         self.engine_dispatcher.run_on_game_thread(_clear)

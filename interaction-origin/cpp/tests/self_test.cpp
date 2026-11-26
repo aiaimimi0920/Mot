@@ -269,6 +269,26 @@ int main() {
     assert(m_ok.body.find("\"succeeded\"") != std::string::npos);
     http::detail::close_socket(cli);
 
+    // 10. Verify atomic multi-step batch settlement (complete_steps_batch coalesces into 1 origin.sync delta frame)
+    ext_sdk.register_capability(
+        {"#10", "patrol_sector", "Sustained patrol", {"companion"}, JsonObject{{"type", "object"}}, true, {}, "allow"},
+        [](const std::string&, const JsonObject&, const std::string&) {
+            return EffectOutcome::StartedExecuting([]() {});
+        });
+    assert(ext_sdk.handle_origin_execute({"slot-ext-cpp", 1, "invoke", "ex-b1", "#10", "companion", {}}).state == "executing");
+    assert(ext_sdk.handle_origin_execute({"slot-ext-cpp", 1, "invoke", "ex-b2", "#10", "companion", {}}).state == "executing");
+    assert(ext_sdk.handle_origin_execute({"slot-ext-cpp", 1, "invoke", "ex-b3", "#10", "companion", {}}).state == "executing");
+    size_t before_batch = ext_posts.size();
+    size_t settled_cnt = ext_sdk.complete_steps_batch({
+        {"ex-b1", true, JsonObject{{"sector", "A"}}, ""},
+        {"ex-b2", true, JsonObject{{"sector", "B"}}, ""},
+        {"ex-b3", false, {}, "blocked"},
+    });
+    assert(settled_cnt == 3);
+    assert(ext_posts.size() - before_batch == 1);
+    const auto& batch_frame = std::get<JsonObject>(ext_posts.back().second.data);
+    assert(std::get<JsonArray>(batch_frame.at("settled_executions").data).size() == 3);
+
     std::cout << "C++17 G2A OriginSdk SelfTest PASSED | JCS=" << digest << "\n";
     return 0;
 }

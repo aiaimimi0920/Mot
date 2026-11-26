@@ -483,3 +483,90 @@ public sealed class OutboundExecuteStreamClient : IDisposable
         _cts.Dispose();
     }
 }
+
+/// <summary>
+/// One-step disposable host session automating Hub discovery, listener/pull-stream startup, baseline publish, and offline cleanup.
+/// </summary>
+public sealed class OriginHostSession : IDisposable
+{
+    public OriginSdk Sdk { get; }
+    public string ExecuteUrl { get; }
+
+    private readonly HttpHubTransportClient _transport;
+    private readonly LoopbackExecuteListener? _listener;
+    private readonly OutboundExecuteStreamClient? _pullStream;
+    private bool _disposed;
+
+    private OriginHostSession(
+        OriginSdk sdk,
+        HttpHubTransportClient transport,
+        LoopbackExecuteListener? listener,
+        OutboundExecuteStreamClient? pullStream,
+        string executeUrl)
+    {
+        Sdk = sdk;
+        _transport = transport;
+        _listener = listener;
+        _pullStream = pullStream;
+        ExecuteUrl = executeUrl;
+    }
+
+    public static OriginHostSession StartQuick(
+        string slotId,
+        Action<OriginSdk>? setup = null,
+        string hubOriginUrl = "auto",
+        string fallbackUrl = "http://127.0.0.1:19210",
+        bool useOutboundPull = false,
+        string sharedToken = "",
+        string roleKind = "companion",
+        string billingMode = "player_metered")
+    {
+        string resolvedUrl = hubOriginUrl;
+        HttpHubTransportClient tx;
+        if (hubOriginUrl == "auto")
+        {
+            try
+            {
+                tx = HttpHubTransportClient.FromLocalHubDiscovery(sharedToken: sharedToken);
+                using var doc = JsonDocument.Parse(File.ReadAllText(HttpHubTransportClient.GetDefaultRuntimeFilePath(), Encoding.UTF8));
+                resolvedUrl = doc.RootElement.GetProperty("origin_url").GetString() ?? fallbackUrl;
+            }
+            catch
+            {
+                resolvedUrl = fallbackUrl;
+                tx = new HttpHubTransportClient(fallbackUrl, sharedToken);
+            }
+        }
+        else
+        {
+            tx = new HttpHubTransportClient(hubOriginUrl, sharedToken);
+        }
+
+        var sdk = new OriginSdk(slotId, tx, roleKind: roleKind, billingMode: billingMode);
+        sdk.BindActorSubject("companion", new object());
+        if (roleKind != "independent_npc")
+            sdk.BindActorSubject("player", new object());
+        setup?.Invoke(sdk);
+
+        if (useOutboundPull)
+        {
+            var pull = new OutboundExecuteStreamClient(sdk, resolvedUrl, slotId, sharedToken);
+            sdk.PublishCapabilitiesAndBaseline(OutboundExecuteStreamClient.PullExecuteUrl);
+            return new OriginHostSession(sdk, tx, null, pull, OutboundExecuteStreamClient.PullExecuteUrl);
+        }
+
+        var ln = new LoopbackExecuteListener(sdk, 0, sharedToken);
+        sdk.PublishCapabilitiesAndBaseline(ln.ExecuteUrl);
+        return new OriginHostSession(sdk, tx, ln, null, ln.ExecuteUrl);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        try { Sdk.ReportPlayerPresence(false, 0); } catch { }
+        _listener?.Dispose();
+        _pullStream?.Dispose();
+        _transport.Dispose();
+    }
+}

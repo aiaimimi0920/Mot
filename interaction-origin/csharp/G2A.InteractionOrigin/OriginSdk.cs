@@ -306,15 +306,27 @@ public sealed class OriginSdk
 
     public void CompleteStep(string executionId, bool succeeded, Dictionary<string, object?>? summary = null, string? reason = null)
     {
-        bool queued = _dispatcher.RunOnGameThread(() =>
+        CompleteStepsBatch(new[] { (executionId, succeeded, summary, reason) });
+    }
+
+    public int CompleteStepsBatch(
+        IEnumerable<(string ExecutionId, bool Succeeded, Dictionary<string, object?>? Summary, string? Reason)> settlements)
+    {
+        int count = _dispatcher.RunOnGameThread(() =>
         {
-            if (!_inFlightSteps.Remove(executionId)) return false;
-            var rep = new OriginExecuteReply(executionId, succeeded ? "succeeded" : "failed", summary, reason);
-            StoreLedgerReply(rep);
-            _pendingSettled.Add(rep);
-            return true;
+            int n = 0;
+            foreach (var (executionId, succeeded, summary, reason) in settlements)
+            {
+                if (!_inFlightSteps.Remove(executionId)) continue;
+                var rep = new OriginExecuteReply(executionId, succeeded ? "succeeded" : "failed", summary, reason);
+                StoreLedgerReply(rep);
+                _pendingSettled.Add(rep);
+                n++;
+            }
+            return n;
         });
-        if (queued) FlushDirtySync(false);
+        if (count > 0) FlushDirtySync(false);
+        return count;
     }
 
     public OriginExecuteReply CancelInFlightStep(string executionId)

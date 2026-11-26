@@ -590,6 +590,93 @@ export class OpenAICompatibleLLMPlanner {
   }
 }
 
+export async function discoverLocalHubCoreUrl(explicitPath?: string): Promise<string> {
+  const fsMod = await import("node:fs/promises");
+  const pathMod = await import("node:path");
+  const osMod = await import("node:os");
+  let p = explicitPath || process.env.G2A_HUB_RUNTIME_FILE || "";
+  if (!p) {
+    if (process.platform === "win32" && process.env.LOCALAPPDATA) {
+      p = pathMod.join(process.env.LOCALAPPDATA, "G2A", "hub.runtime.json");
+    } else {
+      p = pathMod.join(osMod.homedir(), ".g2a", "hub.runtime.json");
+    }
+  }
+  const doc = parseStrictJson<Record<string, any>>(await fsMod.readFile(p, "utf8"));
+  if (typeof doc.core_url !== "string" || !doc.core_url) {
+    throw new G2ACoreError("unavailable", 503, "Missing core_url in Hub runtime manifest");
+  }
+  return doc.core_url.replace(/\/$/, "");
+}
+
+export class QueueBuilder {
+  private steps: QueueStep[] = [];
+  private grantMap: Map<string, ProjectedContext["active_methods"][number]>;
+  private capMap: Map<string, CapabilityEntry>;
+  private trigger: "player_command" | "proactive";
+  private supersedes: boolean;
+
+  constructor(
+    private readonly sdk: CoreSDK,
+    private readonly base: string,
+    private readonly authToken: string,
+    private readonly ctx: ProjectedContext,
+    private readonly intentSummary = "Execute planned companion queue",
+    capabilities: CapabilityEntry[] = [],
+    private readonly permittedMethods?: Record<string, string[]>
+  ) {
+    const isCmd = ctx.player_command !== undefined && ctx.player_command !== null && ctx.player_command !== "";
+    this.trigger = isCmd ? "player_command" : "proactive";
+    this.supersedes = isCmd;
+    this.grantMap = new Map((ctx.active_methods ?? []).map((g) => [`${g.method_id}|${g.actor}`, g]));
+    this.capMap = new Map(capabilities.map((c) => [c.method_id, c]));
+  }
+
+  addStep(methodId: string, actor: string, args: Record<string, unknown> = {}, validate = true): this {
+    const idx = this.steps.length;
+    if (validate) {
+      if (this.permittedMethods && this.permittedMethods[methodId] && !this.permittedMethods[methodId].includes(actor)) {
+        throw new G2ACoreError("permission_denied", 403, `Scope forbids (${methodId}, ${actor})`);
+      }
+      const grant = this.grantMap.get(`${methodId}|${actor}`);
+      if (!grant) throw new G2ACoreError("invalid_arguments", 400, `Method (${methodId}, ${actor}) not active`);
+      if (idx === 0 && grant.readiness !== "ready") {
+        throw new G2ACoreError("stale_context", 409, `Initial step (${methodId}, ${actor}) is staged`);
+      }
+      if (typeof args.target_id === "string" && grant.targets.length > 0) {
+        const cand = grant.targets.find((t) => t.target_id === args.target_id);
+        if (!cand) throw new G2ACoreError("not_found", 404, `Target '${args.target_id}' not in active candidates`);
+        if (idx === 0 && cand.readiness !== "ready") {
+          throw new G2ACoreError("stale_context", 409, `Initial target '${args.target_id}' is staged`);
+        }
+      }
+      const cap = this.capMap.get(methodId);
+      if (cap?.params_schema && !validateSchemaObject(args, cap.params_schema)) {
+        throw new G2ACoreError("invalid_arguments", 400, `Arguments for ${methodId} failed local JSON Schema check`);
+      }
+    }
+    this.steps.push({ step_index: idx, method_id: methodId, actor, args: { ...args } });
+    return this;
+  }
+
+  build(queueId?: string): MethodCallQueue {
+    if (this.steps.length === 0) throw new G2ACoreError("invalid_arguments", 400, "Cannot build empty MethodCallQueue");
+    return {
+      queue_id: queueId ?? `Q-${crypto.randomUUID().slice(0, 12)}`,
+      epoch: this.ctx.epoch,
+      based_on_rev: this.ctx.rev,
+      trigger: this.trigger,
+      supersedes: this.supersedes,
+      intent_summary: this.intentSummary,
+      steps: [...this.steps],
+    };
+  }
+
+  async submit(queueId?: string): Promise<unknown> {
+    return this.sdk.submitQueueWithRecovery(this.base, this.authToken, this.build(queueId));
+  }
+}
+
 export class CoreSDK {
   private capabilityCache = new Map<string, CapabilityEntry[]>();
   private slotDigests = new Map<string, string>();
@@ -606,6 +693,9 @@ export class CoreSDK {
   private hbTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private playerId = "player-local";
+  private connectedBase = "";
+  private connectedToken = "";
+  private permittedMethods?: Record<string, string[]>;
 
   public sessionId: string | null = null;
   public actionsPaused = false;
@@ -617,6 +707,62 @@ export class CoreSDK {
     private readonly streamMode: "websocket" | "sse" = "websocket",
     private readonly memoryStore?: InMemoryCompanionStore
   ) {}
+
+  static async connectQuick(options: {
+    slotId: string;
+    authToken: string;
+    planner?: CognitivePlanner;
+    hubEndpoint?: string;
+    fallbackUrl?: string;
+    streamMode?: "websocket" | "sse";
+    allowLoopback?: boolean;
+    memoryStore?: InMemoryCompanionStore;
+    extensions?: Record<string, { required?: boolean }>;
+  }): Promise<CoreSDK> {
+    let ep = options.hubEndpoint ?? "auto";
+    if (ep === "auto") {
+      try {
+        ep = await discoverLocalHubCoreUrl();
+      } catch (err) {
+        if (!options.fallbackUrl) throw err;
+        ep = options.fallbackUrl;
+      }
+    }
+    const sdk = new CoreSDK(
+      options.planner ?? (() => ({ intent_summary: "" })),
+      options.allowLoopback ?? true,
+      options.streamMode ?? "websocket",
+      options.memoryStore
+    );
+    await sdk.connect(ep, options.authToken, options.slotId, { extensions: options.extensions });
+    return sdk;
+  }
+
+  createQueueBuilder(ctx: ProjectedContext, intentSummary?: string): QueueBuilder;
+  createQueueBuilder(base: string, authToken: string, ctx: ProjectedContext, intentSummary?: string): QueueBuilder;
+  createQueueBuilder(
+    baseOrCtx: string | ProjectedContext,
+    authTokenOrSummary?: string,
+    maybeCtx?: ProjectedContext,
+    maybeSummary = "Execute planned companion queue"
+  ): QueueBuilder {
+    if (typeof baseOrCtx === "object" && baseOrCtx !== null) {
+      const summary = typeof authTokenOrSummary === "string" ? authTokenOrSummary : "Execute planned companion queue";
+      const caps = this.capabilityCache.get(baseOrCtx.capability_table_digest) ?? [];
+      return new QueueBuilder(this, this.connectedBase, this.connectedToken, baseOrCtx, summary, caps, this.permittedMethods);
+    }
+    const ctx = maybeCtx!;
+    const caps = this.capabilityCache.get(ctx.capability_table_digest) ?? [];
+    return new QueueBuilder(this, baseOrCtx.replace(/\/$/, ""), authTokenOrSummary ?? "", ctx, maybeSummary, caps, this.permittedMethods);
+  }
+
+  async [Symbol.asyncDispose](): Promise<void> {
+    if (this.connectedBase && this.connectedToken) {
+      await this.closeSession(this.connectedBase, this.connectedToken);
+    } else {
+      this.shutdown();
+    }
+  }
 
   async connect(
     hubEndpoint: string,
@@ -659,6 +805,9 @@ export class CoreSDK {
     }
     this.slotDigests.set(slotId, capDigest);
     this.sessionId = String(res.session_id);
+    this.connectedBase = base;
+    this.connectedToken = authToken;
+    this.permittedMethods = (res.frozen_scope as any)?.permitted_methods;
     this.playerId = String((res.frozen_scope as any)?.player_id ?? options?.playerId ?? "player-local");
     this.closed = false;
 

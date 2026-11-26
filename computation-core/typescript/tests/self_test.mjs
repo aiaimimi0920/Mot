@@ -163,6 +163,14 @@ if (fs.existsSync(hubPath)) {
     const pulled = await coreSdk.pullContextIfDue(coreUrl, "ts-core-agent");
     assert.deepEqual(pulled.extensions_data, { "org.g2a.sim.batch_blueprint.v1": { layout: "hex_6" } });
 
+    // Verify QueueBuilder zero-latency pre-flight guard + valid queue build
+    assert.throws(() => coreSdk.createQueueBuilder(pulled).addStep("#99", "companion", {}));
+    const builtQ = coreSdk
+      .createQueueBuilder(pulled, "Pre-flight verified chest open")
+      .addStep("#02", "companion", { target_id: "chest_R" })
+      .build("Q-ts-preflight");
+    assert.equal(builtQ.steps.length, 1);
+
     await origSdk.reportPlayerCommand("open right chest");
     const deadline = Date.now() + 3000;
     while (Date.now() < deadline && (!chestOpened || chatDelivered.length === 0)) {

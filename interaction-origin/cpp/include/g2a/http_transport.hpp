@@ -474,4 +474,57 @@ private:
     std::thread accept_thread_;
 };
 
+// One-step RAII C++17 Origin Host managing Hub discovery, Keep-Alive transport, loopback listener, & offline teardown.
+class ScopedOriginHost {
+public:
+    ScopedOriginHost(
+        std::string slot_id,
+        const std::function<void(OriginSdk&)>& setup_fn,
+        const std::string& hub_origin_url = "auto",
+        const std::string& fallback_url = "http://127.0.0.1:19210",
+        const std::string& shared_token = "",
+        std::string role_kind = "companion",
+        std::string billing_mode = "player_metered") {
+        std::string resolved = hub_origin_url;
+        if (hub_origin_url == "auto") {
+            try {
+                resolved = OriginSdk::discover_local_hub_origin_url();
+            } catch (...) {
+                resolved = fallback_url;
+            }
+        }
+        transport_ = std::make_unique<HttpHubTransportClient>(resolved, shared_token);
+        sdk_ = std::make_unique<OriginSdk>(
+            std::move(slot_id),
+            [this](const std::string& op, const JsonValue& p) { transport_->post_to_hub(op, p); },
+            std::move(role_kind),
+            std::move(billing_mode));
+        sdk_->bind_actor_subject("companion");
+        if (sdk_ && role_kind != "independent_npc") sdk_->bind_actor_subject("player");
+        listener_ = std::make_unique<LoopbackExecuteListener>(*sdk_, 0, shared_token);
+        if (setup_fn) setup_fn(*sdk_);
+        sdk_->publish_capabilities_and_baseline(listener_->execute_url());
+    }
+
+    ~ScopedOriginHost() {
+        if (sdk_) {
+            try { sdk_->report_player_presence(false, 0); } catch (...) {}
+        }
+        listener_.reset();
+        sdk_.reset();
+        transport_.reset();
+    }
+
+    ScopedOriginHost(const ScopedOriginHost&) = delete;
+    ScopedOriginHost& operator=(const ScopedOriginHost&) = delete;
+
+    OriginSdk& sdk() { return *sdk_; }
+    const std::string& execute_url() const { return listener_->execute_url(); }
+
+private:
+    std::unique_ptr<HttpHubTransportClient> transport_;
+    std::unique_ptr<OriginSdk> sdk_;
+    std::unique_ptr<LoopbackExecuteListener> listener_;
+};
+
 } // namespace g2a::http

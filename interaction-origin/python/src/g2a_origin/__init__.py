@@ -21,12 +21,14 @@ from .origin_sdk import (
     StartedExecuting,
     StepExecutionToken,
     TargetCandidate,
+    infer_params_schema_from_callable,
 )
 
 __all__ = [
     "canonicalize_utf8",
     "jcs_sha256",
     "parse_strict_json",
+    "infer_params_schema_from_callable",
     "ActiveMethodGrant",
     "CapabilityEntry",
     "EffectInvocationResult",

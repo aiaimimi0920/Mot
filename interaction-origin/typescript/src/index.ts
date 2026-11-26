@@ -203,6 +203,21 @@ export interface SlotPublishOptions {
   allowlist_criteria_url?: string;
 }
 
+export interface QuickOriginConfig {
+  slotId: string;
+  hubOriginUrl?: string; // "auto" or explicit http://...
+  fallbackUrl?: string;
+  roleKind?: "companion" | "independent_npc";
+  billingMode?: "player_metered" | "developer_sponsored";
+  originToken?: string;
+  roomId?: string;
+  factionId?: string;
+  actors?: string[];
+  onChatDelivered?: (audience: string, text: string) => void;
+  setup?: (sdk: OriginSDK) => void | Promise<void>;
+  publishOptions?: SlotPublishOptions;
+}
+
 /**
  * Tier 1 Interaction Origin SDK for Browser / HTML5 / Three.js / Tauri / Node 20+ games (G2A V0.0.1).
  * Uses zero-inbound-port streaming ("pull://origin.execute") over EventSource or universal fetch ReadableStream.
@@ -234,6 +249,48 @@ export class OriginSDK {
     public readonly roomId: string = "",
     public readonly factionId: string = ""
   ) {}
+
+  static async connectQuick(config: QuickOriginConfig): Promise<OriginSDK> {
+    let resolvedUrl = config.hubOriginUrl ?? "auto";
+    if (resolvedUrl === "auto") {
+      try {
+        resolvedUrl = await discoverLocalHubOriginUrl();
+      } catch {
+        resolvedUrl = config.fallbackUrl ?? "http://127.0.0.1:19210";
+      }
+    }
+    const sdk = new OriginSDK(
+      config.slotId,
+      resolvedUrl,
+      config.roleKind ?? "companion",
+      config.billingMode ?? "player_metered",
+      config.onChatDelivered,
+      config.originToken ?? "",
+      config.roomId ?? "",
+      config.factionId ?? ""
+    );
+    const defaultActors = config.actors ?? (sdk.roleKind === "independent_npc" ? [] : ["companion", "player"]);
+    for (const act of defaultActors) sdk.bindActorSubject(act, {});
+    if (config.setup) await config.setup(sdk);
+    await sdk.publishCapabilitiesAndStartOutboundStream(config.publishOptions);
+    return sdk;
+  }
+
+  async close(notifyOffline = true): Promise<void> {
+    for (const execId of [...this.inFlight.keys()]) {
+      await this.cancelInFlightStep(execId);
+    }
+    if (notifyOffline) {
+      try {
+        await this.reportPresenceChanged(false, 0);
+      } catch {}
+    }
+    this.stopOutboundExecuteStream();
+  }
+
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this.close(true);
+  }
 
   registerCapability(def: CapabilityEntry, handler: DomainEffectHandler): void {
     const actors =
@@ -487,16 +544,32 @@ export class OriginSDK {
   }
 
   async completeStep(executionId: string, succeeded: boolean, summary?: Record<string, unknown>, reason?: string): Promise<void> {
-    if (!this.inFlight.delete(executionId)) return;
-    const rep: OriginExecuteReply = {
-      execution_id: executionId,
-      state: succeeded ? "succeeded" : "failed",
-      effect_summary: summary,
-      failure_reason: reason,
-    };
-    this.storeLedgerReply(rep);
-    this.pendingSettled.push(rep);
-    await this.flushDirtySync(false);
+    await this.completeStepsBatch([{ executionId, succeeded, summary, reason }]);
+  }
+
+  async completeStepsBatch(
+    settlements: Array<{
+      executionId: string;
+      succeeded: boolean;
+      summary?: Record<string, unknown>;
+      reason?: string;
+    }>
+  ): Promise<number> {
+    let count = 0;
+    for (const s of settlements) {
+      if (!this.inFlight.delete(s.executionId)) continue;
+      const rep: OriginExecuteReply = {
+        execution_id: s.executionId,
+        state: s.succeeded ? "succeeded" : "failed",
+        effect_summary: s.summary,
+        failure_reason: s.reason,
+      };
+      this.storeLedgerReply(rep);
+      this.pendingSettled.push(rep);
+      count++;
+    }
+    if (count > 0) await this.flushDirtySync(false);
+    return count;
   }
 
   async cancelInFlightStep(executionId: string): Promise<OriginExecuteReply> {

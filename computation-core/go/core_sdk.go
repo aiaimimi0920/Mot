@@ -196,6 +196,147 @@ func (c *CoreSDK) Connect(
 	return &authRes.FrozenScope, nil
 }
 
+// ConnectQuick performs one-step Hub auto-discovery (with optional fallbackURL) and opens a ready CoreSDK session.
+func ConnectQuick(
+	ctx context.Context,
+	slotID string,
+	authToken string,
+	planner CognitivePlanner,
+	hubEndpoint string,
+	fallbackURL string,
+	opts ConnectOptions,
+) (*CoreSDK, error) {
+	resolved := hubEndpoint
+	if hubEndpoint == "" || hubEndpoint == "auto" {
+		u, err := DiscoverLocalHubCoreURL("")
+		if err != nil {
+			if fallbackURL == "" {
+				return nil, err
+			}
+			resolved = fallbackURL
+		} else {
+			resolved = u
+		}
+	}
+	sdk := NewCoreSDK(planner, true)
+	if _, err := sdk.Connect(ctx, resolved, authToken, slotID, opts); err != nil {
+		return nil, err
+	}
+	return sdk, nil
+}
+
+type QueueBuilder struct {
+	sdk           *CoreSDK
+	ctx           ProjectedContext
+	intentSummary string
+	trigger       string
+	supersedes    bool
+	steps         []QueueStep
+	grants        map[string]ActiveMethodGrant
+	caps          map[string]CapabilityEntry
+}
+
+func (c *CoreSDK) NewQueueBuilder(pc ProjectedContext, intentSummary string) *QueueBuilder {
+	isCmd := pc.PlayerCommand != nil && *pc.PlayerCommand != ""
+	trig := "proactive"
+	if isCmd {
+		trig = "player_command"
+	}
+	grants := make(map[string]ActiveMethodGrant, len(pc.ActiveMethods))
+	for _, g := range pc.ActiveMethods {
+		grants[g.MethodID+"|"+g.Actor] = g
+	}
+	c.mu.Lock()
+	rawCaps := c.capabilityCache[pc.CapabilityTableDigest]
+	c.mu.Unlock()
+	capMap := make(map[string]CapabilityEntry, len(rawCaps))
+	for _, capDef := range rawCaps {
+		capMap[capDef.MethodID] = capDef
+	}
+	return &QueueBuilder{
+		sdk:           c,
+		ctx:           pc,
+		intentSummary: intentSummary,
+		trigger:       trig,
+		supersedes:    isCmd,
+		grants:        grants,
+		caps:          capMap,
+	}
+}
+
+func (b *QueueBuilder) AddStep(methodID, actor string, args map[string]any, validate bool) (*QueueBuilder, error) {
+	if args == nil {
+		args = map[string]any{}
+	}
+	idx := len(b.steps)
+	if validate {
+		b.sdk.mu.Lock()
+		scope := b.sdk.frozenScope
+		b.sdk.mu.Unlock()
+		if scope != nil && scope.PermittedMethods != nil {
+			if allowed, exists := scope.PermittedMethods[methodID]; exists {
+				okActor := false
+				for _, a := range allowed {
+					if a == actor {
+						okActor = true
+						break
+					}
+				}
+				if !okActor {
+					return nil, &G2AError{Code: "permission_denied", HTTPStatus: 403, Message: fmt.Sprintf("scope forbids (%s, %s)", methodID, actor)}
+				}
+			}
+		}
+		grant, ok := b.grants[methodID+"|"+actor]
+		if !ok {
+			return nil, &G2AError{Code: "invalid_arguments", HTTPStatus: 400, Message: fmt.Sprintf("method (%s, %s) not active", methodID, actor)}
+		}
+		if idx == 0 && grant.Readiness != "ready" {
+			return nil, &G2AError{Code: "stale_context", HTTPStatus: 409, Message: "initial step is staged"}
+		}
+		if tid, hasTID := args["target_id"].(string); hasTID && len(grant.Targets) > 0 {
+			found := false
+			for _, t := range grant.Targets {
+				if t.TargetID == tid {
+					found = true
+					if idx == 0 && t.Readiness != "ready" {
+						return nil, &G2AError{Code: "stale_context", HTTPStatus: 409, Message: "initial target is staged"}
+					}
+					break
+				}
+			}
+			if !found {
+				return nil, &G2AError{Code: "not_found", HTTPStatus: 404, Message: "target_id not in active candidates"}
+			}
+		}
+		if capDef, hasCap := b.caps[methodID]; hasCap && len(capDef.ParamsSchema) > 0 {
+			if !validateSchemaObject(args, capDef.ParamsSchema, 0) {
+				return nil, &G2AError{Code: "invalid_arguments", HTTPStatus: 400, Message: "step args failed local JSON Schema check"}
+			}
+		}
+	}
+	b.steps = append(b.steps, QueueStep{StepIndex: idx, MethodID: methodID, Actor: actor, Args: args})
+	return b, nil
+}
+
+func (b *QueueBuilder) Submit(ctx context.Context, queueID string) (*QueueReceipt, error) {
+	if len(b.steps) == 0 {
+		return nil, &G2AError{Code: "invalid_arguments", HTTPStatus: 400, Message: "cannot submit empty queue"}
+	}
+	if queueID == "" {
+		queueID = "Q-" + randomHex(6)
+	}
+	return b.sdk.SubmitQueueWithRecovery(ctx, MethodCallQueue{
+		QueueID:       queueID,
+		Epoch:         b.ctx.Epoch,
+		BasedOnRev:    b.ctx.Rev,
+		Trigger:       b.trigger,
+		Supersedes:    b.supersedes,
+		IntentSummary: b.intentSummary,
+		Steps:         b.steps,
+	})
+}
+
 func (c *CoreSDK) PullContext(ctx context.Context) (*ProjectedContext, error) {
 	sid := c.SessionID()
 	raw, err := c.postEnvelope(ctx, "context.pull", map[string]any{}, sid, nil)

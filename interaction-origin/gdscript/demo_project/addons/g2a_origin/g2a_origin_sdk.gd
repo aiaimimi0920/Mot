@@ -47,6 +47,20 @@ var _outbound_queue: Array[Dictionary] = []
 func _ready() -> void:
 	_ensure_http_worker()
 
+func _exit_tree() -> void:
+	if sync_enabled:
+		report_player_presence(false, 0)
+
+## One-step Godot 4 host bootstrap: discovers local Hub manifest (falling back to hub_origin_url),
+## binds default companion/player subjects if unset, and publishes capabilities + initial baseline.
+func start_quick_host(origin_execute_url: String = "pull://origin.execute") -> void:
+	auto_discover_local_hub()
+	if not _actors.has("companion"):
+		bind_actor_subject("companion", self)
+	if slot_role_kind != "independent_npc" and not _actors.has("player"):
+		bind_actor_subject("player", self)
+	publish_capabilities_and_baseline(origin_execute_url)
+
 func _ensure_http_worker() -> void:
 	if _http_worker != null or not is_inside_tree():
 		return
@@ -351,20 +365,38 @@ func handle_origin_execute(req: Dictionary) -> Dictionary:
 	return rep
 
 func complete_step(execution_id: String, succeeded: bool, effect_summary: Dictionary = {}, failure_reason: String = "") -> void:
-	if not _in_flight_steps.has(execution_id):
-		return
-	_in_flight_steps.erase(execution_id)
-	var rep: Dictionary = {
+	complete_steps_batch([{
 		"execution_id": execution_id,
-		"state": "succeeded" if succeeded else "failed",
-	}
-	if not effect_summary.is_empty():
-		rep["effect_summary"] = effect_summary
-	if failure_reason != "":
-		rep["failure_reason"] = failure_reason
-	_store_ledger_reply(rep)
-	_pending_settled.append(rep)
-	flush_dirty_sync(false)
+		"succeeded": succeeded,
+		"effect_summary": effect_summary,
+		"failure_reason": failure_reason,
+	}])
+
+## Atomically settles multiple sustained steps and coalesces them into a single `origin.sync` delta frame.
+func complete_steps_batch(items: Array) -> int:
+	var settled_count := 0
+	for item in items:
+		var eid := str(item.get("execution_id", ""))
+		if not _in_flight_steps.has(eid):
+			continue
+		_in_flight_steps.erase(eid)
+		var ok := bool(item.get("succeeded", true))
+		var rep: Dictionary = {
+			"execution_id": eid,
+			"state": "succeeded" if ok else "failed",
+		}
+		var sum: Dictionary = item.get("effect_summary", {})
+		var reason := str(item.get("failure_reason", ""))
+		if not sum.is_empty():
+			rep["effect_summary"] = sum
+		if reason != "":
+			rep["failure_reason"] = reason
+		_store_ledger_reply(rep)
+		_pending_settled.append(rep)
+		settled_count += 1
+	if settled_count > 0:
+		flush_dirty_sync(false)
+	return settled_count
 
 func cancel_in_flight_step(execution_id: String) -> Dictionary:
 	if _in_flight_steps.has(execution_id):

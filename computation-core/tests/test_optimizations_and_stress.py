@@ -1293,6 +1293,134 @@ class TestOptimizationsAndStress(unittest.TestCase):
         finally:
             relay.stop()
 
+    def test_quick_connect_context_managers_decorator_and_queue_builder_preflight(self) -> None:
+        from typing import Literal
+        from g2a_origin import ActiveMethodGrant as OrigGrant, OriginSDK, TargetCandidate as OrigTarget
+
+        hub_bin = resolve_hub_binary(ROOT_DIR)
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_path = os.path.join(tmp, "w18_runtime.json")
+            ledger_path = os.path.join(tmp, "w18_ledger.json")
+            hub_proc = subprocess.Popen(
+                [
+                    hub_bin,
+                    "-origin-addr", "127.0.0.1:0",
+                    "-core-addr", "127.0.0.1:0",
+                    "-consent-addr", "127.0.0.1:0",
+                    "-ledger", ledger_path,
+                    "-runtime-file", runtime_path,
+                    "-auto-approve-scope",
+                    "-print-ports-json",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert hub_proc.stdout is not None
+                _ = json.loads(hub_proc.stdout.readline().strip())
+                deadline = time.time() + 3.0
+                while time.time() < deadline and not os.path.exists(runtime_path):
+                    time.sleep(0.02)
+                self.assertTrue(os.path.exists(runtime_path))
+
+                state = {"near_chest": False, "opened_mode": ""}
+
+                def _setup_origin(orig: OriginSDK) -> None:
+                    @orig.capability("#01", description="Approach target")
+                    def move_to(target_id: str) -> dict:
+                        state["near_chest"] = target_id == "chest_iron"
+                        return {"arrived": target_id}
+
+                    @orig.capability("#02", description="Unlock chest")
+                    def unlock_chest(target_id: str, mode: Literal["careful", "fast"] = "careful") -> dict:
+                        state["opened_mode"] = f"{target_id}:{mode}"
+                        return {"unlocked": target_id, "mode": mode}
+
+                    orig.bind_state_module(
+                        "dungeon",
+                        lambda: {"near_chest": state["near_chest"], "opened_mode": state["opened_mode"]},
+                        lambda: [
+                            OrigGrant(
+                                "#01",
+                                "companion",
+                                "ready",
+                                [OrigTarget("chest_iron", "Iron Chest", "ready")],
+                            ),
+                            OrigGrant(
+                                "#02",
+                                "companion",
+                                "ready" if state["near_chest"] else "staged",
+                                [
+                                    OrigTarget(
+                                        "chest_iron",
+                                        "Iron Chest",
+                                        "ready" if state["near_chest"] else "staged",
+                                        prerequisite_hint=None if state["near_chest"] else "Move closer first",
+                                    )
+                                ],
+                            ),
+                        ],
+                    )
+
+                with OriginSDK.connect_quick(
+                    slot_id="slot-w18-quick",
+                    runtime_file=runtime_path,
+                    setup_fn=_setup_origin,
+                ) as orig_sdk:
+                    with CoreSDK.connect_quick(
+                        slot_id="slot-w18-quick",
+                        auth_token="core-w18-quick",
+                        runtime_file=runtime_path,
+                    ) as core_sdk:
+                        pulled = core_sdk.pull_context()
+
+                        # 1. QueueBuilder rejects disallowed actor in FrozenScope
+                        with self.assertRaises(G2AError) as e_perm:
+                            core_sdk.build_queue(pulled).add_step("#01", "player", {"target_id": "chest_iron"})
+                        self.assertEqual(e_perm.exception.code, "permission_denied")
+
+                        # 2. QueueBuilder rejects staged step at step_index == 0
+                        with self.assertRaises(G2AError) as e_staged:
+                            core_sdk.build_queue(pulled).add_step("#02", "companion", {"target_id": "chest_iron"})
+                        self.assertEqual(e_staged.exception.code, "stale_context")
+
+                        # 3. QueueBuilder rejects unknown target_id candidate
+                        with self.assertRaises(G2AError) as e_nf:
+                            core_sdk.build_queue(pulled).add_step("#01", "companion", {"target_id": "chest_phantom"})
+                        self.assertEqual(e_nf.exception.code, "not_found")
+
+                        # 4. QueueBuilder rejects invalid Literal enum arg against @orig.capability inferred schema!
+                        with self.assertRaises(G2AError) as e_schema:
+                            (
+                                core_sdk.build_queue(pulled)
+                                .add_step("#01", "companion", {"target_id": "chest_iron"})
+                                .add_step("#02", "companion", {"target_id": "chest_iron", "mode": "dynamite"})
+                            )
+                        self.assertEqual(e_schema.exception.code, "invalid_arguments")
+
+                        # 5. Valid 2-step chain (#01 ready -> #02 staged) passes pre-flight and settles end-to-end!
+                        rec = (
+                            core_sdk.build_queue(pulled, intent_summary="Approach and carefully unlock iron chest")
+                            .add_step("#01", "companion", {"target_id": "chest_iron"})
+                            .add_step("#02", "companion", {"target_id": "chest_iron", "mode": "fast"})
+                            .submit(queue_id="Q-w18-chain")
+                        )
+                        self.assertIsNotNone(rec)
+                        assert rec is not None
+                        self.assertEqual(rec.queue_state, "completed")
+                        self.assertEqual(state["opened_mode"], "chest_iron:fast")
+
+                    self.assertTrue(core_sdk.closed)
+                self.assertFalse(orig_sdk.sync_enabled)
+            finally:
+                hub_proc.terminate()
+                hub_proc.wait(timeout=3)
+                if hub_proc.stdout:
+                    hub_proc.stdout.close()
+                if hub_proc.stderr:
+                    hub_proc.stderr.close()
+
 
 if __name__ == "__main__":
     unittest.main()

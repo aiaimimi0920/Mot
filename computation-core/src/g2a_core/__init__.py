@@ -28,7 +28,7 @@ from .sqlite_memory import SQLiteCompanionStore
 from .llm_planner import OpenAICompatibleLLMPlanner
 from .relay_server import CloudRelayServer
 from .memory_server import MemoryHTTPServer
-from .core_sdk import CognitivePlannerPort, CoreSDK
+from .core_sdk import CognitivePlannerPort, CoreSDK, FunctionCognitivePlanner, QueueBuilder
 
 __all__ = [
     "G2A_WIRE_VERSION",
@@ -57,5 +57,7 @@ __all__ = [
     "MemoryService",
     "OpenAICompatibleLLMPlanner",
     "CognitivePlannerPort",
+    "FunctionCognitivePlanner",
+    "QueueBuilder",
     "CoreSDK",
 ]

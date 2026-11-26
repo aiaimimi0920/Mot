@@ -42,6 +42,7 @@ public sealed class CoreSdk : IAsyncDisposable
     private TaskCompletionSource<bool> _streamReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public string? SessionId { get; private set; }
+    public FrozenScope? CurrentScope { get { lock (_gate) return _frozenScope; } }
     public bool ActionsPaused { get; private set; }
     public bool Closed { get; private set; }
 
@@ -127,6 +128,34 @@ public sealed class CoreSdk : IAsyncDisposable
 
         return scope;
     }
+
+    public static async Task<CoreSdk> ConnectQuickAsync(
+        string slotId,
+        string authToken,
+        ICognitivePlanner? planner = null,
+        string hubEndpoint = "auto",
+        string? fallbackUrl = null,
+        string streamMode = "websocket",
+        bool allowLoopback = true,
+        InMemoryCompanionStore? memoryStore = null,
+        Dictionary<string, object?>? extensions = null,
+        CancellationToken ct = default)
+    {
+        string resolved = hubEndpoint;
+        if (hubEndpoint == "auto")
+        {
+            try { resolved = HubDiscovery.DiscoverLocalHubCoreUrl(); }
+            catch when (!string.IsNullOrEmpty(fallbackUrl)) { resolved = fallbackUrl!; }
+        }
+        var sdk = new CoreSdk(planner, memoryStore, allowLoopback, streamMode);
+        await sdk.ConnectAsync(resolved, authToken, slotId, extensions: extensions, ct: ct);
+        return sdk;
+    }
+
+    public QueueBuilder CreateQueueBuilder(
+        ProjectedContext context,
+        string intentSummary = "Execute planned companion queue",
+        string? trigger = null) => new(this, context, intentSummary, trigger);
 
     public async Task<ProjectedContext> PullContextAsync(CancellationToken ct = default)
     {
@@ -619,4 +648,87 @@ public sealed class CoreSdk : IAsyncDisposable
             ExtensionsData: ext
         );
     }
+
+    internal IReadOnlyList<CapabilityEntry> GetCachedCapabilities(string digest)
+    {
+        lock (_gate)
+            return _capabilityCache.TryGetValue(digest, out var c) ? c : Array.Empty<CapabilityEntry>();
+    }
+}
+
+/// <summary>
+/// Fluent queue builder performing zero-latency client-side pre-flight checks against FrozenScope, ActiveMethods, and ParamsSchema.
+/// </summary>
+public sealed class QueueBuilder
+{
+    private readonly CoreSdk _sdk;
+    private readonly ProjectedContext _ctx;
+    private readonly string _intentSummary;
+    private readonly string _trigger;
+    private readonly bool _supersedes;
+    private readonly List<QueueStep> _steps = new();
+    private readonly Dictionary<string, ActiveMethodGrant> _grants;
+
+    internal QueueBuilder(CoreSdk sdk, ProjectedContext ctx, string intentSummary, string? trigger)
+    {
+        _sdk = sdk;
+        _ctx = ctx;
+        _intentSummary = intentSummary;
+        bool isCmd = !string.IsNullOrEmpty(ctx.PlayerCommand);
+        _trigger = trigger ?? (isCmd ? "player_command" : "proactive");
+        _supersedes = isCmd;
+        _grants = (ctx.ActiveMethods ?? new List<ActiveMethodGrant>())
+            .ToDictionary(g => $"{g.MethodId}|{g.Actor}", StringComparer.Ordinal);
+    }
+
+    public QueueBuilder AddStep(
+        string methodId,
+        string actor,
+        Dictionary<string, object?>? args = null,
+        bool validate = true,
+        bool allowInitialStaged = false)
+    {
+        var stepArgs = args != null ? new Dictionary<string, object?>(args) : new Dictionary<string, object?>();
+        int idx = _steps.Count;
+        if (validate)
+        {
+            var scope = _sdk.CurrentScope;
+            if (scope?.PermittedMethods != null &&
+                scope.PermittedMethods.TryGetValue(methodId, out var allowedActors) &&
+                !allowedActors.Contains(actor))
+            {
+                throw new G2ACoreException("permission_denied", 403, $"Scope forbids ({methodId}, {actor})");
+            }
+            if (!_grants.TryGetValue($"{methodId}|{actor}", out var grant))
+                throw new G2ACoreException("invalid_arguments", 400, $"Method ({methodId}, {actor}) not active in context");
+            if (idx == 0 && !allowInitialStaged && grant.Readiness != "ready")
+                throw new G2ACoreException("stale_context", 409, $"Initial step ({methodId}, {actor}) is staged");
+            if (stepArgs.TryGetValue("target_id", out var tidObj) && tidObj is string tid && grant.Targets.Count > 0)
+            {
+                var cand = grant.Targets.FirstOrDefault(t => t.TargetId == tid)
+                    ?? throw new G2ACoreException("not_found", 404, $"Target '{tid}' not in active candidates");
+                if (idx == 0 && !allowInitialStaged && cand.Readiness != "ready")
+                    throw new G2ACoreException("stale_context", 409, $"Initial target '{tid}' is staged");
+            }
+        }
+        _steps.Add(new QueueStep(idx, methodId, actor, stepArgs));
+        return this;
+    }
+
+    public MethodCallQueue Build(string? queueId = null)
+    {
+        if (_steps.Count == 0)
+            throw new G2ACoreException("invalid_arguments", 400, "Cannot build an empty MethodCallQueue");
+        return new MethodCallQueue(
+            QueueId: queueId ?? ("Q-" + Guid.NewGuid().ToString("N")[..12]),
+            Epoch: _ctx.Epoch,
+            BasedOnRev: _ctx.Rev,
+            Trigger: _trigger,
+            Supersedes: _supersedes,
+            IntentSummary: _intentSummary,
+            Steps: _steps.ToList());
+    }
+
+    public Task<QueueReceipt?> SubmitAsync(string? queueId = null, CancellationToken ct = default) =>
+        _sdk.SubmitQueueWithRecoveryAsync(Build(queueId), ct);
 }

@@ -264,4 +264,16 @@ func TestLiveThreeTierGoCoreWebSocketAndExtensions(t *testing.T) {
 	if _, leaked := pulled.ExtensionsData["org.g2a.unnegotiated.v1"]; leaked {
 		t.Fatal("unnegotiated extension data leaked!")
 	}
+
+	// Verify QueueBuilder pre-flight checks against active_methods and valid queue construction
+	if _, err := sdk.NewQueueBuilder(*pulled, "Invalid step").AddStep("#99", "companion", nil, true); err == nil {
+		t.Fatal("expected QueueBuilder to reject inactive method #99")
+	}
+	qb, err := sdk.NewQueueBuilder(*pulled, "Ping beacon").AddStep("#01", "companion", map[string]any{}, true)
+	if err != nil {
+		t.Fatalf("QueueBuilder.AddStep failed: %v", err)
+	}
+	if len(qb.steps) != 1 || qb.steps[0].MethodID != "#01" {
+		t.Fatalf("unexpected built steps: %+v", qb.steps)
+	}
 }

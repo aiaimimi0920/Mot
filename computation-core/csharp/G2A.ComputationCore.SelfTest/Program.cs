@@ -141,32 +141,37 @@ internal static class Program
                 origSdk.AttachExtensionData("org.g2a.sim.batch_blueprint.v1", new Dictionary<string, object?> { ["tier"] = "epic" });
                 origSdk.PublishCapabilitiesAndBaseline(listener.ExecuteUrl);
 
-                await using var coreSdk = new CoreSdk(allowLoopback: true, streamMode: "websocket");
-                var scope = await coreSdk.ConnectAsync(
-                    coreUrl,
-                    "cs-core-agent",
-                    "slot-cs-full-e2e",
+                await using var coreSdk = await CoreSdk.ConnectQuickAsync(
+                    slotId: "slot-cs-full-e2e",
+                    authToken: "cs-core-agent",
+                    hubEndpoint: coreUrl,
+                    streamMode: "websocket",
+                    allowLoopback: true,
                     extensions: new Dictionary<string, object?>
                     {
                         ["org.g2a.sim.batch_blueprint.v1"] = new Dictionary<string, object?> { ["required"] = false }
                     });
-                if (scope.SlotId != "slot-cs-full-e2e") throw new Exception("Unexpected FrozenScope slot_id");
+                if (coreSdk.CurrentScope?.SlotId != "slot-cs-full-e2e") throw new Exception("Unexpected FrozenScope slot_id");
 
                 var pulled = await coreSdk.PullContextIfDueAsync();
                 if (pulled is null || pulled.ExtensionsData?["org.g2a.sim.batch_blueprint.v1"]["tier"]?.ToString() != "epic")
                     throw new Exception("Expected negotiated extensions_data in C# CoreSdk");
 
-                var receipt = await coreSdk.SubmitQueueWithRecoveryAsync(new MethodCallQueue(
-                    QueueId: "Q-cs-e2e-1",
-                    Epoch: pulled.Epoch,
-                    BasedOnRev: pulled.Rev,
-                    Trigger: "player_command",
-                    Supersedes: true,
-                    IntentSummary: "Open gold chest",
-                    Steps: new List<QueueStep>
-                    {
-                        new(0, "#02", "companion", new Dictionary<string, object?> { ["target_id"] = "chest_gold" })
-                    }));
+                bool caughtInactive = false;
+                try
+                {
+                    coreSdk.CreateQueueBuilder(pulled).AddStep("#99", "companion");
+                }
+                catch (G2ACoreException gex) when (gex.Code == "invalid_arguments")
+                {
+                    caughtInactive = true;
+                }
+                if (!caughtInactive) throw new Exception("Expected QueueBuilder pre-flight rejection for inactive method");
+
+                var receipt = await coreSdk
+                    .CreateQueueBuilder(pulled, "Open gold chest")
+                    .AddStep("#02", "companion", new Dictionary<string, object?> { ["target_id"] = "chest_gold" })
+                    .SubmitAsync("Q-cs-e2e-1");
                 if (receipt?.QueueState != "completed" || !chestOpened)
                     throw new Exception("Expected completed queue and opened chest in C# 3-tier E2E");
 

@@ -600,3 +600,119 @@ fn post_keepalive_reply(
         }
     }
 }
+
+pub struct RunningOriginHost {
+    sdk: Arc<OriginSdk>,
+    _listener: Option<LoopbackExecuteListener>,
+    _stream: Option<OutboundExecuteStreamClient>,
+}
+
+impl RunningOriginHost {
+    pub fn sdk(&self) -> &Arc<OriginSdk> {
+        &self.sdk
+    }
+}
+
+impl Drop for RunningOriginHost {
+    fn drop(&mut self) {
+        self.sdk.report_player_presence(false, 0);
+    }
+}
+
+pub struct OriginHostBuilder {
+    slot_id: String,
+    role_kind: String,
+    billing_mode: String,
+    room_id: String,
+    faction_id: String,
+    hub_origin_url: String,
+    fallback_url: String,
+    shared_token: String,
+    use_outbound_pull: bool,
+}
+
+impl OriginHostBuilder {
+    pub fn new(slot_id: impl Into<String>) -> Self {
+        Self {
+            slot_id: slot_id.into(),
+            role_kind: "companion".to_owned(),
+            billing_mode: "player_metered".to_owned(),
+            room_id: String::new(),
+            faction_id: String::new(),
+            hub_origin_url: "auto".to_owned(),
+            fallback_url: "http://127.0.0.1:19210".to_owned(),
+            shared_token: String::new(),
+            use_outbound_pull: false,
+        }
+    }
+
+    pub fn with_hub_url(mut self, url: impl Into<String>) -> Self {
+        self.hub_origin_url = url.into();
+        self
+    }
+
+    pub fn with_fallback_url(mut self, url: impl Into<String>) -> Self {
+        self.fallback_url = url.into();
+        self
+    }
+
+    pub fn with_outbound_pull(mut self, enabled: bool) -> Self {
+        self.use_outbound_pull = enabled;
+        self
+    }
+
+    pub fn start(
+        self,
+        setup_fn: impl FnOnce(&Arc<OriginSdk>),
+    ) -> Result<RunningOriginHost, String> {
+        let resolved = if self.hub_origin_url == "auto" {
+            discover_local_hub_origin_url(None).unwrap_or_else(|_| self.fallback_url.clone())
+        } else {
+            self.hub_origin_url.clone()
+        };
+        let tx = Arc::new(HttpHubTransportClient::new(&resolved, &self.shared_token)?);
+        let tx_c = Arc::clone(&tx);
+        let is_npc = self.role_kind == "independent_npc";
+        let slot_copy = self.slot_id.clone();
+        let sdk = Arc::new(OriginSdk::new(
+            self.slot_id,
+            self.role_kind,
+            self.billing_mode,
+            self.room_id,
+            self.faction_id,
+            Box::new(move |op, payload| {
+                let _ = tx_c.post_to_hub(op, payload);
+            }),
+        ));
+        sdk.bind_actor_subject("companion");
+        if !is_npc {
+            sdk.bind_actor_subject("player");
+        }
+        setup_fn(&sdk);
+
+        if self.use_outbound_pull {
+            let stream = OutboundExecuteStreamClient::start(Arc::clone(&sdk), &resolved, &slot_copy, &self.shared_token)?;
+            sdk.publish_capabilities_and_baseline(crate::SlotPublishOptions {
+                origin_execute_url: PULL_EXECUTE_SENTINEL.to_owned(),
+                ..Default::default()
+            });
+            Ok(RunningOriginHost {
+                sdk,
+                _listener: None,
+                _stream: Some(stream),
+            })
+        } else {
+            let listener = LoopbackExecuteListener::start(Arc::clone(&sdk), 0, &self.shared_token)?;
+            let exec_url = listener.execute_url().to_owned();
+            sdk.publish_capabilities_and_baseline(crate::SlotPublishOptions {
+                origin_execute_url: exec_url,
+                ..Default::default()
+            });
+            Ok(RunningOriginHost {
+                sdk,
+                _listener: Some(listener),
+                _stream: None,
+            })
+        }
+    }
+}
