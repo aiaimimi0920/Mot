@@ -157,6 +157,30 @@ public sealed class CoreSdk : IAsyncDisposable
         string intentSummary = "Execute planned companion queue",
         string? trigger = null) => new(this, context, intentSummary, trigger);
 
+    public IReadOnlyList<CapabilityEntry> GetCachedCapabilities(string? slotId = null)
+    {
+        lock (_gate)
+        {
+            string targetSlot = slotId ?? _frozenScope?.SlotId ?? "";
+            string digest = _slotDigests.TryGetValue(targetSlot, out var d) ? d : (_frozenScope?.CapabilityTableDigest ?? "");
+            return _capabilityCache.TryGetValue(digest, out var c) ? c.ToList() : Array.Empty<CapabilityEntry>();
+        }
+    }
+
+    public async Task<long> SendHeartbeatAsync(CancellationToken ct = default)
+    {
+        var el = await PostEnvelopeAsync("session.heartbeat", new Dictionary<string, object?>(), SessionId, null, ct);
+        return el.TryGetProperty("lease_deadline_ms", out var ld) && ld.TryGetInt64(out long ms) ? ms : 0L;
+    }
+
+    public async Task<bool> ResumeSessionAsync(CancellationToken ct = default)
+    {
+        var el = await PostEnvelopeAsync("session.resume", new Dictionary<string, object?>(), SessionId, null, ct);
+        bool paused = el.TryGetProperty("actions_paused", out var ap) && ap.ValueKind == JsonValueKind.True;
+        lock (_gate) { ActionsPaused = paused; }
+        return paused;
+    }
+
     public async Task<ProjectedContext> PullContextAsync(CancellationToken ct = default)
     {
         try
@@ -445,6 +469,7 @@ public sealed class CoreSdk : IAsyncDisposable
     private async Task WebSocketStreamLoopAsync(CancellationToken ct)
     {
         bool isReconnect = false;
+        int attempt = 0;
         var buf = new byte[64 * 1024];
         while (!ct.IsCancellationRequested && !Closed)
         {
@@ -452,7 +477,16 @@ public sealed class CoreSdk : IAsyncDisposable
             lock (_gate) { baseEp = _hubEndpoint; tok = _authToken; sid = SessionId ?? ""; lastId = _lastEventId; }
             if (isReconnect)
             {
-                try { await PostEnvelopeAsync("session.resume", new Dictionary<string, object?>(), sid, null, ct); } catch { }
+                try
+                {
+                    await ResumeSessionAsync(ct);
+                }
+                catch (G2ACoreException gex) when (gex.Code is "revoked" or "permission_denied")
+                {
+                    await ShutdownAsync(false);
+                    return;
+                }
+                catch { }
             }
             using var ws = new ClientWebSocket();
             ws.Options.SetRequestHeader("Authorization", $"Bearer {tok}");
@@ -464,6 +498,7 @@ public sealed class CoreSdk : IAsyncDisposable
             try
             {
                 await ws.ConnectAsync(new Uri(wsUrl), ct);
+                attempt = 0;
                 _streamReady.TrySetResult(true);
                 using var ms = new MemoryStream();
                 while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
@@ -486,20 +521,31 @@ public sealed class CoreSdk : IAsyncDisposable
             }
         Reconnect:
             isReconnect = true;
-            try { await Task.Delay(150, ct); } catch { return; }
+            int backoffMs = Math.Min(150 * (1 << Math.Min(attempt++, 5)), 4000);
+            try { await Task.Delay(backoffMs, ct); } catch { return; }
         }
     }
 
     private async Task SseStreamLoopAsync(CancellationToken ct)
     {
         bool isReconnect = false;
+        int attempt = 0;
         while (!ct.IsCancellationRequested && !Closed)
         {
             string baseEp, tok, sid, lastId;
             lock (_gate) { baseEp = _hubEndpoint; tok = _authToken; sid = SessionId ?? ""; lastId = _lastEventId; }
             if (isReconnect)
             {
-                try { await PostEnvelopeAsync("session.resume", new Dictionary<string, object?>(), sid, null, ct); } catch { }
+                try
+                {
+                    await ResumeSessionAsync(ct);
+                }
+                catch (G2ACoreException gex) when (gex.Code is "revoked" or "permission_denied")
+                {
+                    await ShutdownAsync(false);
+                    return;
+                }
+                catch { }
             }
             string url = $"{baseEp}/g2a/v1/core/events?session_id={Uri.EscapeDataString(sid)}" + (isReconnect ? "&replay=1" : "");
             try
@@ -510,6 +556,7 @@ public sealed class CoreSdk : IAsyncDisposable
                 if (!string.IsNullOrEmpty(lastId)) req.Headers.TryAddWithoutValidation("Last-Event-ID", lastId);
                 using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
                 resp.EnsureSuccessStatusCode();
+                attempt = 0;
                 _streamReady.TrySetResult(true);
                 await using var stream = await resp.Content.ReadAsStreamAsync(ct);
                 using var reader = new StreamReader(stream, Encoding.UTF8);
@@ -538,7 +585,8 @@ public sealed class CoreSdk : IAsyncDisposable
                 if (ct.IsCancellationRequested || Closed) return;
             }
             isReconnect = true;
-            try { await Task.Delay(150, ct); } catch { return; }
+            int backoffMs = Math.Min(150 * (1 << Math.Min(attempt++, 5)), 4000);
+            try { await Task.Delay(backoffMs, ct); } catch { return; }
         }
     }
 
@@ -573,26 +621,38 @@ public sealed class CoreSdk : IAsyncDisposable
         if (!string.IsNullOrEmpty(tok))
             req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", tok);
 
-        using var resp = await _http.SendAsync(req, ct);
-        byte[] raw = await resp.Content.ReadAsByteArrayAsync(ct);
-        using var doc = JcsDigest.ParseStrictDocument(raw);
-        var root = doc.RootElement;
-        string acceptance = root.GetProperty("acceptance").GetString() ?? "not_accepted";
-        if (acceptance == "accepted")
-            return root.GetProperty("result").Clone();
+        HttpResponseMessage resp;
+        byte[] raw;
+        try
+        {
+            resp = await _http.SendAsync(req, ct);
+            raw = await resp.Content.ReadAsByteArrayAsync(ct);
+        }
+        catch (TaskCanceledException tex) when (!ct.IsCancellationRequested)
+        {
+            throw new G2ACoreException("outcome_unknown", 504, $"Request timed out: {tex.Message}");
+        }
+        using (resp)
+        {
+            using var doc = JcsDigest.ParseStrictDocument(raw);
+            var root = doc.RootElement;
+            string acceptance = root.GetProperty("acceptance").GetString() ?? "not_accepted";
+            if (acceptance == "accepted")
+                return root.GetProperty("result").Clone();
 
-        var errEl = root.GetProperty("error");
-        string code = errEl.GetProperty("code").GetString() ?? "invalid_request";
-        int httpStatus = errEl.TryGetProperty("http_status", out var hs) ? hs.GetInt32() : (int)resp.StatusCode;
-        string msg = errEl.TryGetProperty("message", out var m) ? m.GetString() ?? "" : "";
-        long? retryAfter = errEl.TryGetProperty("retry_after_ms", out var ra) && ra.ValueKind == JsonValueKind.Number ? ra.GetInt64() : null;
-        if (!retryAfter.HasValue && resp.Headers.RetryAfter?.Delta is TimeSpan delta)
-            retryAfter = (long)delta.TotalMilliseconds;
-        long? cooldown = errEl.TryGetProperty("cooldown_ms", out var cd) && cd.ValueKind == JsonValueKind.Number ? cd.GetInt64() : null;
-        ProjectedContext? fresh = errEl.TryGetProperty("fresh_context", out var fc) && fc.ValueKind == JsonValueKind.Object
-            ? ParseProjectedContext(fc)
-            : null;
-        throw new G2ACoreException(code, httpStatus, msg, retryAfter, cooldown, fresh);
+            var errEl = root.GetProperty("error");
+            string code = errEl.GetProperty("code").GetString() ?? "invalid_request";
+            int httpStatus = errEl.TryGetProperty("http_status", out var hs) ? hs.GetInt32() : (int)resp.StatusCode;
+            string msg = errEl.TryGetProperty("message", out var m) ? m.GetString() ?? "" : "";
+            long? retryAfter = errEl.TryGetProperty("retry_after_ms", out var ra) && ra.ValueKind == JsonValueKind.Number ? ra.GetInt64() : null;
+            if (!retryAfter.HasValue && resp.Headers.RetryAfter?.Delta is TimeSpan delta)
+                retryAfter = (long)delta.TotalMilliseconds;
+            long? cooldown = errEl.TryGetProperty("cooldown_ms", out var cd) && cd.ValueKind == JsonValueKind.Number ? cd.GetInt64() : null;
+            ProjectedContext? fresh = errEl.TryGetProperty("fresh_context", out var fc) && fc.ValueKind == JsonValueKind.Object
+                ? ParseProjectedContext(fc)
+                : null;
+            throw new G2ACoreException(code, httpStatus, msg, retryAfter, cooldown, fresh);
+        }
     }
 
     private static List<CapabilityEntry> ParseCapabilityTable(JsonElement arr)
@@ -637,6 +697,15 @@ public sealed class CoreSdk : IAsyncDisposable
                     ext[p.Name] = sub;
             }
         }
+        var visual = el.TryGetProperty("visual_ref", out var vr) && vr.ValueKind == JsonValueKind.Object
+            ? JcsDigest.ConvertElement(vr) as Dictionary<string, object?>
+            : null;
+        var audio = el.TryGetProperty("audio_ref", out var ar) && ar.ValueKind == JsonValueKind.Object
+            ? JcsDigest.ConvertElement(ar) as Dictionary<string, object?>
+            : null;
+        var timelineTags = el.TryGetProperty("allowed_timeline_tags", out var tt) && tt.ValueKind == JsonValueKind.Array
+            ? tt.EnumerateArray().Select(x => x.GetString() ?? "").ToList()
+            : null;
         return new ProjectedContext(
             SlotId: el.GetProperty("slot_id").GetString() ?? "",
             Epoch: el.GetProperty("epoch").GetInt64(),
@@ -645,11 +714,14 @@ public sealed class CoreSdk : IAsyncDisposable
             PlayerCommand: el.TryGetProperty("player_command", out var pc) && pc.ValueKind == JsonValueKind.String ? pc.GetString() : null,
             StateBrief: brief,
             ActiveMethods: active,
+            VisualRef: visual,
+            AudioRef: audio,
+            AllowedTimelineTags: timelineTags,
             ExtensionsData: ext
         );
     }
 
-    internal IReadOnlyList<CapabilityEntry> GetCachedCapabilities(string digest)
+    internal IReadOnlyList<CapabilityEntry> GetCachedCapabilitiesByDigest(string digest)
     {
         lock (_gate)
             return _capabilityCache.TryGetValue(digest, out var c) ? c : Array.Empty<CapabilityEntry>();
@@ -668,6 +740,7 @@ public sealed class QueueBuilder
     private readonly bool _supersedes;
     private readonly List<QueueStep> _steps = new();
     private readonly Dictionary<string, ActiveMethodGrant> _grants;
+    private readonly Dictionary<string, CapabilityEntry> _caps;
 
     internal QueueBuilder(CoreSdk sdk, ProjectedContext ctx, string intentSummary, string? trigger)
     {
@@ -679,6 +752,8 @@ public sealed class QueueBuilder
         _supersedes = isCmd;
         _grants = (ctx.ActiveMethods ?? new List<ActiveMethodGrant>())
             .ToDictionary(g => $"{g.MethodId}|{g.Actor}", StringComparer.Ordinal);
+        _caps = sdk.GetCachedCapabilitiesByDigest(ctx.CapabilityTableDigest)
+            .ToDictionary(c => c.MethodId, StringComparer.Ordinal);
     }
 
     public QueueBuilder AddStep(
@@ -709,6 +784,11 @@ public sealed class QueueBuilder
                     ?? throw new G2ACoreException("not_found", 404, $"Target '{tid}' not in active candidates");
                 if (idx == 0 && !allowInitialStaged && cand.Readiness != "ready")
                     throw new G2ACoreException("stale_context", 409, $"Initial target '{tid}' is staged");
+            }
+            if (_caps.TryGetValue(methodId, out var cap) && cap.ParamsSchema is { Count: > 0 })
+            {
+                if (!OpenAICompatibleLlmPlanner.ValidateObjectSchema(stepArgs, cap.ParamsSchema, 0))
+                    throw new G2ACoreException("invalid_arguments", 400, $"Arguments for {methodId} failed local JSON Schema check");
             }
         }
         _steps.Add(new QueueStep(idx, methodId, actor, stepArgs));

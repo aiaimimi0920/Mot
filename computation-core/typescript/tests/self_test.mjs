@@ -138,6 +138,7 @@ if (fs.existsSync(hubPath)) {
       () => [{ method_id: "#02", actor: "companion", readiness: "ready", targets: [{ target_id: "chest_R", label: "Right Chest", readiness: "ready" }] }]
     );
     origSdk.attachExtensionData("org.g2a.sim.batch_blueprint.v1", { layout: "hex_6" });
+    origSdk.setAllowedTimelineTags(["save_branch_ts"]);
     await origSdk.publishCapabilitiesAndStartOutboundStream({ shared_cooldown_ms: 400 });
 
     const coreSdk = new CoreSDK(
@@ -157,11 +158,18 @@ if (fs.existsSync(hubPath)) {
     );
 
     await coreSdk.connect(coreUrl, "ts-core-agent", "slot-ts-live", {
-      extensions: { "org.g2a.sim.batch_blueprint.v1": { required: false } },
+      extensions: {
+        "org.g2a.sim.batch_blueprint.v1": { required: false },
+        "org.g2a.narrative.timeline.v1": { required: false },
+      },
     });
 
-    const pulled = await coreSdk.pullContextIfDue(coreUrl, "ts-core-agent");
+    const pulled = await coreSdk.pullContextIfDue();
     assert.deepEqual(pulled.extensions_data, { "org.g2a.sim.batch_blueprint.v1": { layout: "hex_6" } });
+    assert.deepEqual(pulled.allowed_timeline_tags, ["save_branch_ts"]);
+    assert.equal(coreSdk.getCachedCapabilities().length, 1);
+    const hbRes = await coreSdk.sendHeartbeat();
+    assert.equal(hbRes.lease_deadline_ms > 0, true);
 
     // Verify QueueBuilder zero-latency pre-flight guard + valid queue build
     assert.throws(() => coreSdk.createQueueBuilder(pulled).addStep("#99", "companion", {}));

@@ -289,6 +289,18 @@ int main() {
     const auto& batch_frame = std::get<JsonObject>(ext_posts.back().second.data);
     assert(std::get<JsonArray>(batch_frame.at("settled_executions").data).size() == 3);
 
+    // 11. Verify multimodal refs, anti-spoiler allowed_timeline_tags delta sync, & OriginMetrics
+    ext_sdk.attach_visual_frame(JsonObject{{"frame_id", "vf-cpp-1"}});
+    ext_sdk.attach_audio_segment(JsonObject{{"segment_id", "af-cpp-1"}});
+    ext_sdk.set_allowed_timeline_tags({"chapter_1", "route_a"}, true);
+    const auto& mm_frame = std::get<JsonObject>(ext_posts.back().second.data);
+    assert(mm_frame.find("visual_ref") != mm_frame.end());
+    assert(mm_frame.find("audio_ref") != mm_frame.end());
+    assert(std::get<JsonArray>(mm_frame.at("allowed_timeline_tags").data).size() == 2);
+    assert(!ext_sdk.flush_dirty_sync(false));
+    auto m_snap = ext_sdk.metrics();
+    assert(m_snap.frames_synced >= 3 && m_snap.zero_change_skips >= 1 && m_snap.steps_settled_batch == 3);
+
     std::cout << "C++17 G2A OriginSdk SelfTest PASSED | JCS=" << digest << "\n";
     return 0;
 }

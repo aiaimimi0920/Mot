@@ -37,11 +37,16 @@ public sealed class OriginSdk
 
     private Dictionary<(string MethodId, string Actor), string> _lastSentMethodJson = new();
     private readonly Dictionary<string, Dictionary<string, object?>> _extensionsData = new();
+    private Dictionary<string, object?>? _visualRef;
+    private Dictionary<string, object?>? _audioRef;
+    private List<string>? _allowedTimelineTags;
     private string _lastSentBriefDigest = "";
     private bool _syncEnabled = true;
 
     public long CurrentEpoch { get; private set; } = 1;
     public long CurrentRev { get; private set; } = 0;
+    public long FramesSynced { get; private set; }
+    public long ZeroChangeSkips { get; private set; }
 
     public OriginSdk(
         string slotId,
@@ -98,6 +103,36 @@ public sealed class OriginSdk
         if (flush) FlushDirtySync(false);
     }
 
+    public void AttachVisualFrame(Dictionary<string, object?> visualRef, bool flush = false)
+    {
+        _dispatcher.RunOnGameThread(() =>
+        {
+            _visualRef = new Dictionary<string, object?>(visualRef);
+            return true;
+        });
+        if (flush) FlushDirtySync(false);
+    }
+
+    public void AttachAudioSegment(Dictionary<string, object?> audioRef, bool flush = false)
+    {
+        _dispatcher.RunOnGameThread(() =>
+        {
+            _audioRef = new Dictionary<string, object?>(audioRef);
+            return true;
+        });
+        if (flush) FlushDirtySync(false);
+    }
+
+    public void SetAllowedTimelineTags(IEnumerable<string> tags, bool flush = false)
+    {
+        _dispatcher.RunOnGameThread(() =>
+        {
+            _allowedTimelineTags = tags.ToList();
+            return true;
+        });
+        if (flush) FlushDirtySync(true);
+    }
+
     public void PublishCapabilitiesAndBaseline(
         string originExecuteUrl = "",
         bool disabled = false,
@@ -135,7 +170,7 @@ public sealed class OriginSdk
     {
         if (!_syncEnabled && _pendingSettled.Count == 0) return false;
 
-        var (brief, grants, settled, extSnapshot) = _dispatcher.RunOnGameThread(() =>
+        var (brief, grants, settled, extSnapshot, visSnapshot, audSnapshot, tagsSnapshot) = _dispatcher.RunOnGameThread(() =>
         {
             var (b, g) = CollectCurrentView();
             var s = _pendingSettled.ToList();
@@ -143,11 +178,21 @@ public sealed class OriginSdk
             var ext = _extensionsData.ToDictionary(
                 kv => kv.Key,
                 kv => new Dictionary<string, object?>(kv.Value));
-            return (b, g, s, ext);
+            var vis = _visualRef != null ? new Dictionary<string, object?>(_visualRef) : null;
+            var aud = _audioRef != null ? new Dictionary<string, object?>(_audioRef) : null;
+            var tags = _allowedTimelineTags?.ToList();
+            return (b, g, s, ext, vis, aud, tags);
         });
 
-        object digestTarget = extSnapshot.Count > 0
-            ? new Dictionary<string, object?> { ["brief"] = brief, ["ext"] = extSnapshot }
+        object digestTarget = (extSnapshot.Count > 0 || visSnapshot != null || audSnapshot != null || tagsSnapshot != null)
+            ? new Dictionary<string, object?>
+            {
+                ["brief"] = brief,
+                ["ext"] = extSnapshot.Count > 0 ? extSnapshot : null,
+                ["visual"] = visSnapshot,
+                ["audio"] = audSnapshot,
+                ["timelines"] = tagsSnapshot
+            }
             : brief;
         string briefDigest = JcsDigest.ComputeSha256("g2a.brief.v1", digestTarget);
         var currentSerialized = grants.ToDictionary(kv => kv.Key, kv => JsonSerializer.Serialize(kv.Value));
@@ -167,10 +212,14 @@ public sealed class OriginSdk
         }
 
         if (briefDigest == _lastSentBriefDigest && upserted.Count == 0 && removed.Count == 0 && settled.Count == 0)
+        {
+            ZeroChangeSkips++;
             return false;
+        }
 
         long prevRev = CurrentRev;
         CurrentRev++;
+        FramesSynced++;
         _lastSentBriefDigest = briefDigest;
         _lastSentMethodJson = currentSerialized;
 
@@ -187,6 +236,9 @@ public sealed class OriginSdk
             ["removed_methods"] = removed,
             ["settled_executions"] = settled
         };
+        if (visSnapshot != null) frame["visual_ref"] = visSnapshot;
+        if (audSnapshot != null) frame["audio_ref"] = audSnapshot;
+        if (tagsSnapshot != null) frame["allowed_timeline_tags"] = tagsSnapshot;
         if (extSnapshot.Count > 0) frame["extensions_data"] = extSnapshot;
         _transport.PostToHub("origin.sync", frame);
         return true;
@@ -194,7 +246,7 @@ public sealed class OriginSdk
 
     public void FlushFullSync()
     {
-        var (brief, grants, settled, extSnapshot) = _dispatcher.RunOnGameThread(() =>
+        var (brief, grants, settled, extSnapshot, visSnapshot, audSnapshot, tagsSnapshot) = _dispatcher.RunOnGameThread(() =>
         {
             var (b, g) = CollectCurrentView();
             var s = _pendingSettled.ToList();
@@ -202,12 +254,23 @@ public sealed class OriginSdk
             var ext = _extensionsData.ToDictionary(
                 kv => kv.Key,
                 kv => new Dictionary<string, object?>(kv.Value));
-            return (b, g, s, ext);
+            var vis = _visualRef != null ? new Dictionary<string, object?>(_visualRef) : null;
+            var aud = _audioRef != null ? new Dictionary<string, object?>(_audioRef) : null;
+            var tags = _allowedTimelineTags?.ToList();
+            return (b, g, s, ext, vis, aud, tags);
         });
 
         CurrentRev++;
-        object digestTarget = extSnapshot.Count > 0
-            ? new Dictionary<string, object?> { ["brief"] = brief, ["ext"] = extSnapshot }
+        FramesSynced++;
+        object digestTarget = (extSnapshot.Count > 0 || visSnapshot != null || audSnapshot != null || tagsSnapshot != null)
+            ? new Dictionary<string, object?>
+            {
+                ["brief"] = brief,
+                ["ext"] = extSnapshot.Count > 0 ? extSnapshot : null,
+                ["visual"] = visSnapshot,
+                ["audio"] = audSnapshot,
+                ["timelines"] = tagsSnapshot
+            }
             : brief;
         _lastSentBriefDigest = JcsDigest.ComputeSha256("g2a.brief.v1", digestTarget);
         _lastSentMethodJson = grants.ToDictionary(kv => kv.Key, kv => JsonSerializer.Serialize(kv.Value));
@@ -224,6 +287,9 @@ public sealed class OriginSdk
             ["removed_methods"] = new List<MethodActorKey>(),
             ["settled_executions"] = settled
         };
+        if (visSnapshot != null) frame["visual_ref"] = visSnapshot;
+        if (audSnapshot != null) frame["audio_ref"] = audSnapshot;
+        if (tagsSnapshot != null) frame["allowed_timeline_tags"] = tagsSnapshot;
         if (extSnapshot.Count > 0) frame["extensions_data"] = extSnapshot;
         _transport.PostToHub("origin.sync", frame);
     }

@@ -1421,6 +1421,150 @@ class TestOptimizationsAndStress(unittest.TestCase):
                 if hub_proc.stderr:
                     hub_proc.stderr.close()
 
+    def test_asyncio_sdk_end_to_end_memory_http_client_and_core_primitives(self) -> None:
+        import asyncio
+        from g2a_core import AsyncCoreSDK, MemoryHTTPClient, PlanDecision, QueueStep
+        from g2a_origin import ActiveMethodGrant as OrigGrant, AsyncOriginSDK, TargetCandidate as OrigTarget
+
+        # 1. Cross-vendor portable memory transfer via MemoryHTTPClient over persistent HTTP/1.1 Keep-Alive
+        with tempfile.TemporaryDirectory() as tmp:
+            s_src = SQLiteCompanionStore(os.path.join(tmp, "src.db"))
+            s_dst = SQLiteCompanionStore(os.path.join(tmp, "dst.db"))
+            srv_src = MemoryHTTPServer(s_src, platform_ceiling="cross_game_companion", player_tokens={"tok-p1": "p1"})
+            srv_dst = MemoryHTTPServer(s_dst, platform_ceiling="same_game_companion", player_tokens={"tok-p1": "p1"})
+            url_src = srv_src.start()
+            url_dst = srv_dst.start()
+            try:
+                with (
+                    MemoryHTTPClient(url_src, "tok-p1", allow_loopback=True) as cli_src,
+                    MemoryHTTPClient(url_dst, "tok-p1", allow_loopback=True) as cli_dst,
+                ):
+                    created = cli_src.create_record(
+                        "Prefers stealth bow",
+                        memory_id="mem-stealth",
+                        max_disclosure_scope="cross_game_companion",
+                    )
+                    self.assertEqual(created.memory_id, "mem-stealth")
+                    self.assertTrue(cli_src.patch_record("mem-stealth", content="Prefers silent longbow", pinned_by_player=True))
+                    receipt = cli_src.transfer_to(cli_dst)
+                    self.assertEqual(receipt.record_statuses["mem-stealth"], "transformed")
+
+                    dst_recs = cli_dst.list_records()
+                    self.assertEqual(len(dst_recs), 1)
+                    self.assertEqual(dst_recs[0].content, "Prefers silent longbow")
+                    self.assertEqual(dst_recs[0].max_disclosure_scope, "same_game_companion")
+                    self.assertTrue(cli_dst.delete_record("mem-stealth"))
+                    self.assertEqual(cli_dst.list_records(), [])
+            finally:
+                srv_src.stop()
+                srv_dst.stop()
+                s_src.close()
+                s_dst.close()
+
+        # 2. Live 3-Tier asyncio E2E: AsyncOriginSDK (`async def` capability) <-> Go Hub <-> AsyncCoreSDK (`async def` planner)
+        hub_bin = resolve_hub_binary(ROOT_DIR)
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_path = os.path.join(tmp, "w19_async_runtime.json")
+            ledger_path = os.path.join(tmp, "w19_async_ledger.json")
+            hub_proc = subprocess.Popen(
+                [
+                    hub_bin,
+                    "-origin-addr", "127.0.0.1:0",
+                    "-core-addr", "127.0.0.1:0",
+                    "-consent-addr", "127.0.0.1:0",
+                    "-ledger", ledger_path,
+                    "-runtime-file", runtime_path,
+                    "-auto-approve-scope",
+                    "-print-ports-json",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert hub_proc.stdout is not None
+                _ = json.loads(hub_proc.stdout.readline().strip())
+                deadline = time.time() + 3.0
+                while time.time() < deadline and not os.path.exists(runtime_path):
+                    time.sleep(0.02)
+
+                async def _run_async_e2e() -> None:
+                    scanned_holder = {"target": "", "chat": ""}
+
+                    def _setup_async_origin(orig: AsyncOriginSDK) -> None:
+                        @orig.capability("#01", description="Async scan relic")
+                        async def scan_relic(target_id: str, power: int = 10) -> dict:
+                            await asyncio.sleep(0.01)
+                            scanned_holder["target"] = f"{target_id}:{power}"
+                            return {"scanned": target_id, "power": power}
+
+                        orig.bind_state_module(
+                            "altar",
+                            lambda: {"scanned": scanned_holder["target"]},
+                            lambda: [
+                                OrigGrant(
+                                    "#01",
+                                    "companion",
+                                    "ready",
+                                    [OrigTarget("relic_sun", "Sun Relic", "ready")],
+                                )
+                            ],
+                        )
+                        orig.attach_visual_frame({"frame_id": "vf-1", "mime": "image/jpeg"})
+                        orig.set_allowed_timeline_tags(["branch_sun"])
+
+                    async def _async_planner(caps, ctx, memories) -> PlanDecision:
+                        await asyncio.sleep(0.005)
+                        if ctx.player_command and not scanned_holder["target"]:
+                            return PlanDecision(
+                                intent_summary="Scan sun relic asynchronously",
+                                planned_steps=[QueueStep(0, "#01", "companion", {"target_id": "relic_sun", "power": 25})],
+                                reply_text="Scanning the Sun Relic!",
+                            )
+                        return PlanDecision()
+
+                    async with await AsyncOriginSDK.connect_quick(
+                        slot_id="slot-w19-async",
+                        runtime_file=runtime_path,
+                        setup_fn=_setup_async_origin,
+                        chat_ui_handler=lambda aud, txt, ai: scanned_holder.__setitem__("chat", f"{aud}:{txt}"),
+                    ) as async_orig:
+                        self.assertFalse(await async_orig.flush_dirty_sync())
+                        self.assertGreaterEqual(async_orig.metrics.zero_change_skips, 1)
+
+                        async with await AsyncCoreSDK.connect_quick(
+                            slot_id="slot-w19-async",
+                            auth_token="core-w19-async",
+                            planner=_async_planner,
+                            runtime_file=runtime_path,
+                            extensions={"org.g2a.narrative.timeline.v1": {"required": False}},
+                        ) as async_core:
+                            caps = async_core.get_cached_capabilities()
+                            self.assertEqual(len(caps), 1)
+                            hb = await async_core.send_heartbeat()
+                            self.assertGreater(hb.get("lease_deadline_ms", 0), 0)
+
+                            pulled = await async_core.pull_context()
+                            self.assertEqual(pulled.allowed_timeline_tags, ["branch_sun"])
+
+                            await async_orig.report_player_command("scan the sun relic")
+                            wait_until = time.time() + 3.0
+                            while time.time() < wait_until and (not scanned_holder["target"] or not scanned_holder["chat"]):
+                                await asyncio.sleep(0.02)
+
+                            self.assertEqual(scanned_holder["target"], "relic_sun:25")
+                            self.assertEqual(scanned_holder["chat"], "player_only:Scanning the Sun Relic!")
+                            self.assertGreaterEqual(async_core.metrics.queues_submitted, 1)
+
+                asyncio.run(_run_async_e2e())
+            finally:
+                hub_proc.terminate()
+                hub_proc.wait(timeout=3)
+                if hub_proc.stdout:
+                    hub_proc.stdout.close()
+                if hub_proc.stderr:
+                    hub_proc.stderr.close()
+
 
 if __name__ == "__main__":
     unittest.main()

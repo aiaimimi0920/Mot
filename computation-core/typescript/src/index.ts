@@ -695,6 +695,7 @@ export class CoreSDK {
   private playerId = "player-local";
   private connectedBase = "";
   private connectedToken = "";
+  private connectedSlotId = "";
   private permittedMethods?: Record<string, string[]>;
 
   public sessionId: string | null = null;
@@ -705,7 +706,8 @@ export class CoreSDK {
     private readonly planner: CognitivePlanner,
     private readonly allowLoopback = false,
     private readonly streamMode: "websocket" | "sse" = "websocket",
-    private readonly memoryStore?: InMemoryCompanionStore
+    private readonly memoryStore?: InMemoryCompanionStore,
+    private readonly requestTimeoutMs = 10000
   ) {}
 
   static async connectQuick(options: {
@@ -807,6 +809,7 @@ export class CoreSDK {
     this.sessionId = String(res.session_id);
     this.connectedBase = base;
     this.connectedToken = authToken;
+    this.connectedSlotId = slotId;
     this.permittedMethods = (res.frozen_scope as any)?.permitted_methods;
     this.playerId = String((res.frozen_scope as any)?.player_id ?? options?.playerId ?? "player-local");
     this.closed = false;
@@ -833,10 +836,53 @@ export class CoreSDK {
     return (res.frozen_scope ?? {}) as Record<string, unknown>;
   }
 
-  async closeSession(base: string, authToken: string): Promise<void> {
+  getCachedCapabilities(slotId?: string): CapabilityEntry[] {
+    const target = slotId ?? this.connectedSlotId;
+    const digest = this.slotDigests.get(target) ?? "";
+    return [...(this.capabilityCache.get(digest) ?? [])];
+  }
+
+  async sendHeartbeat(base = this.connectedBase, authToken = this.connectedToken): Promise<Record<string, unknown>> {
+    return this.postEnvelope(base.replace(/\/$/, ""), authToken, "session.heartbeat", {}, this.sessionId ?? undefined);
+  }
+
+  async resumeSession(base = this.connectedBase, authToken = this.connectedToken): Promise<Record<string, unknown>> {
+    const res = await this.postEnvelope(base.replace(/\/$/, ""), authToken, "session.resume", {}, this.sessionId ?? undefined);
+    this.actionsPaused = Boolean(res.actions_paused);
+    return res;
+  }
+
+  async sendChat(text: string, audience?: string): Promise<Record<string, unknown>>;
+  async sendChat(base: string, authToken: string, text: string, audience?: string): Promise<Record<string, unknown>>;
+  async sendChat(
+    textOrBase: string,
+    audienceOrToken = "player_only",
+    maybeText?: string,
+    maybeAudience = "player_only"
+  ): Promise<Record<string, unknown>> {
+    const isShort = maybeText === undefined;
+    const base = isShort ? this.connectedBase : textOrBase;
+    const tok = isShort ? this.connectedToken : audienceOrToken;
+    const text = isShort ? textOrBase : maybeText;
+    const audience = isShort ? audienceOrToken : maybeAudience;
+    return this.postEnvelope(
+      base.replace(/\/$/, ""),
+      tok,
+      "chat.send",
+      {
+        message_id: `msg-${crypto.randomUUID().slice(0, 12)}`,
+        audience,
+        text,
+        provenance: "ai_companion",
+      },
+      this.sessionId ?? undefined
+    );
+  }
+
+  async closeSession(base = this.connectedBase, authToken = this.connectedToken): Promise<void> {
     const sid = this.sessionId;
     this.shutdown();
-    if (sid) {
+    if (sid && base) {
       try {
         await this.postEnvelope(base.replace(/\/$/, ""), authToken, "session.close", { reason: "client_shutdown" }, sid);
       } catch {}
@@ -857,12 +903,12 @@ export class CoreSDK {
     this.sseAbort = null;
   }
 
-  async pullContext(base: string, authToken: string): Promise<ProjectedContext> {
+  async pullContext(base = this.connectedBase, authToken = this.connectedToken): Promise<ProjectedContext> {
     const res = await this.postEnvelope(base.replace(/\/$/, ""), authToken, "context.pull", {}, this.sessionId ?? undefined);
     return res as unknown as ProjectedContext;
   }
 
-  async pullContextIfDue(base: string, authToken: string): Promise<ProjectedContext | null> {
+  async pullContextIfDue(base = this.connectedBase, authToken = this.connectedToken): Promise<ProjectedContext | null> {
     if (this.closed || !this.sessionId) return null;
     if (Date.now() < this.nextAllowedPullMs) return null;
     try {
@@ -878,12 +924,24 @@ export class CoreSDK {
     }
   }
 
-  async queryQueue(base: string, authToken: string, queueId: string): Promise<Record<string, unknown>> {
-    return this.postEnvelope(base.replace(/\/$/, ""), authToken, "queue.query", { queue_id: queueId }, this.sessionId ?? undefined);
+  async queryQueue(queueId: string): Promise<Record<string, unknown>>;
+  async queryQueue(base: string, authToken: string, queueId: string): Promise<Record<string, unknown>>;
+  async queryQueue(baseOrQueueId: string, authToken?: string, queueId?: string): Promise<Record<string, unknown>> {
+    const isShort = queueId === undefined && authToken === undefined;
+    const base = isShort ? this.connectedBase : baseOrQueueId;
+    const tok = isShort ? this.connectedToken : (authToken ?? "");
+    const qid = isShort ? baseOrQueueId : (queueId ?? "");
+    return this.postEnvelope(base.replace(/\/$/, ""), tok, "queue.query", { queue_id: qid }, this.sessionId ?? undefined);
   }
 
-  async cancelQueue(base: string, authToken: string, queueId: string): Promise<Record<string, unknown>> {
-    return this.postEnvelope(base.replace(/\/$/, ""), authToken, "queue.cancel", { queue_id: queueId }, this.sessionId ?? undefined);
+  async cancelQueue(queueId: string): Promise<Record<string, unknown>>;
+  async cancelQueue(base: string, authToken: string, queueId: string): Promise<Record<string, unknown>>;
+  async cancelQueue(baseOrQueueId: string, authToken?: string, queueId?: string): Promise<Record<string, unknown>> {
+    const isShort = queueId === undefined && authToken === undefined;
+    const base = isShort ? this.connectedBase : baseOrQueueId;
+    const tok = isShort ? this.connectedToken : (authToken ?? "");
+    const qid = isShort ? baseOrQueueId : (queueId ?? "");
+    return this.postEnvelope(base.replace(/\/$/, ""), tok, "queue.cancel", { queue_id: qid }, this.sessionId ?? undefined);
   }
 
   async onContextReceived(base: string, authToken: string, ctx: ProjectedContext, depth = 0): Promise<unknown> {
@@ -1259,23 +1317,34 @@ export class CoreSDK {
     sessionId?: string,
     extensions?: Record<string, unknown>
   ): Promise<Record<string, unknown>> {
-    const resp = await fetch(`${base}/g2a/v1/core`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${authToken}`,
-      },
-      body: JSON.stringify({
-        g2a_version: G2A_WIRE_VERSION,
-        request_id: `req-${crypto.randomUUID().slice(0, 12)}`,
-        session_id: sessionId,
-        timestamp_ms: Date.now(),
-        operation,
-        payload,
-        extensions: extensions ?? {},
-      }),
-    });
-    const raw = await resp.text();
+    let resp: Response;
+    let raw: string;
+    try {
+      const signal = typeof (AbortSignal as any)?.timeout === "function" ? (AbortSignal as any).timeout(this.requestTimeoutMs) : undefined;
+      resp = await fetch(`${base}/g2a/v1/core`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${authToken}`,
+        },
+        signal,
+        body: JSON.stringify({
+          g2a_version: G2A_WIRE_VERSION,
+          request_id: `req-${crypto.randomUUID().slice(0, 12)}`,
+          session_id: sessionId,
+          timestamp_ms: Date.now(),
+          operation,
+          payload,
+          extensions: extensions ?? {},
+        }),
+      });
+      raw = await resp.text();
+    } catch (err: any) {
+      if (err?.name === "TimeoutError" || err?.name === "AbortError") {
+        throw new G2ACoreError("outcome_unknown", 504, `Request timed out: ${err?.message ?? err}`);
+      }
+      throw err;
+    }
     const env = parseStrictJson<Record<string, any>>(raw);
     if (env.acceptance === "accepted") return (env.result ?? {}) as Record<string, unknown>;
     const e = env.error ?? { code: "invalid_request", http_status: resp.status, message: "Rejected" };

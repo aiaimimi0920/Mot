@@ -250,6 +250,12 @@ export class OriginSDK {
     public readonly factionId: string = ""
   ) {}
 
+  private visualRef: Record<string, unknown> | null = null;
+  private audioRef: Record<string, unknown> | null = null;
+  private allowedTimelineTags: string[] | null = null;
+  public framesSynced = 0;
+  public zeroChangeSkips = 0;
+
   static async connectQuick(config: QuickOriginConfig): Promise<OriginSDK> {
     let resolvedUrl = config.hubOriginUrl ?? "auto";
     if (resolvedUrl === "auto") {
@@ -323,6 +329,18 @@ export class OriginSDK {
 
   attachExtensionData(extName: string, data: Record<string, unknown>): void {
     this.extensionsData[extName] = { ...data };
+  }
+
+  attachVisualFrame(visualRef: Record<string, unknown>): void {
+    this.visualRef = { ...visualRef };
+  }
+
+  attachAudioSegment(audioRef: Record<string, unknown>): void {
+    this.audioRef = { ...audioRef };
+  }
+
+  setAllowedTimelineTags(tags: string[]): void {
+    this.allowedTimelineTags = [...tags];
   }
 
   async publishCapabilitiesAndStartOutboundStream(options?: SlotPublishOptions): Promise<void> {
@@ -432,7 +450,13 @@ export class OriginSDK {
     if (!this.syncEnabled && this.pendingSettled.length === 0) return false;
     const { brief, grants } = this.collectView();
     const hasExt = Object.keys(this.extensionsData).length > 0;
-    const briefDigest = await jcsSha256("g2a.brief.v1", hasExt ? { brief, ext: this.extensionsData } : brief);
+    const hasExtra = hasExt || this.visualRef !== null || this.audioRef !== null || this.allowedTimelineTags !== null;
+    const briefDigest = await jcsSha256(
+      "g2a.brief.v1",
+      hasExtra
+        ? { brief, ext: hasExt ? this.extensionsData : null, visual: this.visualRef, audio: this.audioRef, timelines: this.allowedTimelineTags }
+        : brief
+    );
 
     const upserted: ActiveMethodGrant[] = [];
     const removed: Array<{ method_id: string; actor: string }> = [];
@@ -452,10 +476,12 @@ export class OriginSDK {
 
     const settledBatch = this.pendingSettled.splice(0, this.pendingSettled.length);
     if (briefDigest === this.lastBriefDigest && upserted.length === 0 && removed.length === 0 && settledBatch.length === 0) {
+      this.zeroChangeSkips++;
       return false;
     }
 
     const prevRev = this.currentRev++;
+    this.framesSynced++;
     this.lastBriefDigest = briefDigest;
     this.lastSentMethods = curCanon;
     await this.postToHub("origin.sync", {
@@ -469,6 +495,9 @@ export class OriginSDK {
       upserted_methods: upserted,
       removed_methods: removed,
       settled_executions: settledBatch,
+      ...(this.visualRef ? { visual_ref: { ...this.visualRef } } : {}),
+      ...(this.audioRef ? { audio_ref: { ...this.audioRef } } : {}),
+      ...(this.allowedTimelineTags ? { allowed_timeline_tags: [...this.allowedTimelineTags] } : {}),
       ...(hasExt ? { extensions_data: { ...this.extensionsData } } : {}),
     });
     return true;
@@ -477,8 +506,15 @@ export class OriginSDK {
   async flushFullSync(): Promise<void> {
     const { brief, grants } = this.collectView();
     const hasExt = Object.keys(this.extensionsData).length > 0;
+    const hasExtra = hasExt || this.visualRef !== null || this.audioRef !== null || this.allowedTimelineTags !== null;
     this.currentRev++;
-    this.lastBriefDigest = await jcsSha256("g2a.brief.v1", hasExt ? { brief, ext: this.extensionsData } : brief);
+    this.framesSynced++;
+    this.lastBriefDigest = await jcsSha256(
+      "g2a.brief.v1",
+      hasExtra
+        ? { brief, ext: hasExt ? this.extensionsData : null, visual: this.visualRef, audio: this.audioRef, timelines: this.allowedTimelineTags }
+        : brief
+    );
     this.lastSentMethods.clear();
     for (const [k, g] of grants.entries()) this.lastSentMethods.set(k, canonicalizeJcs(g));
     const settledBatch = this.pendingSettled.splice(0, this.pendingSettled.length);
@@ -492,6 +528,9 @@ export class OriginSDK {
       upserted_methods: [...grants.values()],
       removed_methods: [],
       settled_executions: settledBatch,
+      ...(this.visualRef ? { visual_ref: { ...this.visualRef } } : {}),
+      ...(this.audioRef ? { audio_ref: { ...this.audioRef } } : {}),
+      ...(this.allowedTimelineTags ? { allowed_timeline_tags: [...this.allowedTimelineTags] } : {}),
       ...(hasExt ? { extensions_data: { ...this.extensionsData } } : {}),
     });
   }

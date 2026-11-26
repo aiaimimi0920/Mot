@@ -139,6 +139,7 @@ internal static class Program
                         new("#02", "companion", "ready", new List<Orig.TargetCandidate> { new("chest_gold", "Gold Chest", "ready") })
                     });
                 origSdk.AttachExtensionData("org.g2a.sim.batch_blueprint.v1", new Dictionary<string, object?> { ["tier"] = "epic" });
+                origSdk.SetAllowedTimelineTags(new[] { "timeline_gold" });
                 origSdk.PublishCapabilitiesAndBaseline(listener.ExecuteUrl);
 
                 await using var coreSdk = await CoreSdk.ConnectQuickAsync(
@@ -149,13 +150,29 @@ internal static class Program
                     allowLoopback: true,
                     extensions: new Dictionary<string, object?>
                     {
-                        ["org.g2a.sim.batch_blueprint.v1"] = new Dictionary<string, object?> { ["required"] = false }
+                        ["org.g2a.sim.batch_blueprint.v1"] = new Dictionary<string, object?> { ["required"] = false },
+                        ["org.g2a.narrative.timeline.v1"] = new Dictionary<string, object?> { ["required"] = false }
                     });
                 if (coreSdk.CurrentScope?.SlotId != "slot-cs-full-e2e") throw new Exception("Unexpected FrozenScope slot_id");
 
                 var pulled = await coreSdk.PullContextIfDueAsync();
                 if (pulled is null || pulled.ExtensionsData?["org.g2a.sim.batch_blueprint.v1"]["tier"]?.ToString() != "epic")
                     throw new Exception("Expected negotiated extensions_data in C# CoreSdk");
+                if (pulled.AllowedTimelineTags is not { Count: 1 } || pulled.AllowedTimelineTags[0] != "timeline_gold")
+                    throw new Exception("Expected AllowedTimelineTags propagation in C# CoreSdk");
+                if (coreSdk.GetCachedCapabilities().Count != 1 || await coreSdk.SendHeartbeatAsync() <= 0)
+                    throw new Exception("Expected cached capabilities and valid heartbeat lease in C# CoreSdk");
+
+                bool caughtSchemaMissing = false;
+                try
+                {
+                    coreSdk.CreateQueueBuilder(pulled).AddStep("#02", "companion", new Dictionary<string, object?>());
+                }
+                catch (G2ACoreException gex) when (gex.Code == "invalid_arguments")
+                {
+                    caughtSchemaMissing = true;
+                }
+                if (!caughtSchemaMissing) throw new Exception("Expected C# QueueBuilder recursive JSON Schema pre-flight check");
 
                 bool caughtInactive = false;
                 try

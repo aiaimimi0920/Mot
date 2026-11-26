@@ -276,4 +276,10 @@ func TestLiveThreeTierGoCoreWebSocketAndExtensions(t *testing.T) {
 	if len(qb.steps) != 1 || qb.steps[0].MethodID != "#01" {
 		t.Fatalf("unexpected built steps: %+v", qb.steps)
 	}
+	if gotCaps := sdk.GetCachedCapabilities(""); len(gotCaps) != 1 {
+		t.Fatalf("expected 1 cached capability, got %d", len(gotCaps))
+	}
+	if leaseMs, hbErr := sdk.SendHeartbeat(ctx); hbErr != nil || leaseMs <= 0 {
+		t.Fatalf("SendHeartbeat failed: lease=%d err=%v", leaseMs, hbErr)
+	}
 }

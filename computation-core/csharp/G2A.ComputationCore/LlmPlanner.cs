@@ -124,7 +124,7 @@ public sealed class OpenAICompatibleLlmPlanner : ICognitivePlanner, IDisposable
         return new PlanDecision(summary, validSteps, reply, aud);
     }
 
-    private static bool ValidateObjectSchema(Dictionary<string, object?> args, Dictionary<string, object?>? schema, int depth)
+    public static bool ValidateObjectSchema(Dictionary<string, object?> args, Dictionary<string, object?>? schema, int depth = 0)
     {
         if (depth > 16) return false;
         if (schema is null || schema.Count == 0) return true;

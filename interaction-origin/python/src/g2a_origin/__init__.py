@@ -14,6 +14,7 @@ from .origin_sdk import (
     LoopbackHTTPTransportClient,
     OriginExecuteReply,
     OriginExecuteRequest,
+    OriginMetrics,
     OriginSDK,
     PlayerFocusInfo,
     Pose3D,
@@ -23,6 +24,7 @@ from .origin_sdk import (
     TargetCandidate,
     infer_params_schema_from_callable,
 )
+from .async_sdk import AsyncOriginSDK
 
 __all__ = [
     "canonicalize_utf8",
@@ -30,6 +32,7 @@ __all__ = [
     "parse_strict_json",
     "infer_params_schema_from_callable",
     "ActiveMethodGrant",
+    "AsyncOriginSDK",
     "CapabilityEntry",
     "EffectInvocationResult",
     "EngineDispatcherPort",
@@ -41,6 +44,7 @@ __all__ = [
     "LoopbackHTTPTransportClient",
     "OriginExecuteReply",
     "OriginExecuteRequest",
+    "OriginMetrics",
     "OriginSDK",
     "PlayerFocusInfo",
     "Pose3D",

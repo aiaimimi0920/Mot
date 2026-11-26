@@ -348,6 +348,12 @@ internal static class Program
         if (batchSettled != 2 || tx.Posts.Count - beforeBatch != 1)
             throw new Exception("Expected CompleteStepsBatch to coalesce 2 settlements into 1 origin.sync frame");
 
+        sdk.AttachVisualFrame(new Dictionary<string, object?> { ["frame_id"] = "vf-cs-1" });
+        sdk.SetAllowedTimelineTags(new[] { "branch_cs" }, flush: true);
+        if (sdk.FlushDirtySync()) throw new Exception("Expected zero packet after unchanged timeline sync");
+        if (sdk.FramesSynced < 3 || sdk.ZeroChangeSkips < 2)
+            throw new Exception("Expected FramesSynced and ZeroChangeSkips telemetry");
+
         Console.WriteLine($"C# G2A.InteractionOrigin SelfTest PASSED | JCS={d1}");
         return 0;
     }

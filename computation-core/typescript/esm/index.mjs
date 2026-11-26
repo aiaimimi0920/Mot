@@ -480,11 +480,12 @@ export class QueueBuilder {
 }
 
 export class CoreSDK {
-  constructor(planner, allowLoopback = false, streamMode = "websocket", memoryStore = undefined) {
+  constructor(planner, allowLoopback = false, streamMode = "websocket", memoryStore = undefined, requestTimeoutMs = 10000) {
     this.planner = planner;
     this.allowLoopback = allowLoopback;
     this.streamMode = streamMode;
     this.memoryStore = memoryStore;
+    this.requestTimeoutMs = requestTimeoutMs;
 
     this.capabilityCache = new Map();
     this.slotDigests = new Map();
@@ -495,6 +496,7 @@ export class CoreSDK {
     this.seenEvents = new Set();
     this.lastEventId = "";
     this.nextAllowedPullMs = 0;
+    this.reconnectAttempts = 0;
     this.ws = null;
     this.nodeWsSocket = null;
     this.sseAbort = null;
@@ -503,6 +505,7 @@ export class CoreSDK {
     this.playerId = "player-local";
     this.connectedBase = "";
     this.connectedToken = "";
+    this.connectedSlotId = "";
     this.permittedMethods = undefined;
     this.sessionId = null;
     this.actionsPaused = false;
@@ -576,6 +579,7 @@ export class CoreSDK {
     this.sessionId = String(res.session_id);
     this.connectedBase = base;
     this.connectedToken = authToken;
+    this.connectedSlotId = slotId;
     this.permittedMethods = res.frozen_scope?.permitted_methods;
     this.playerId = String(res.frozen_scope?.player_id ?? options.playerId ?? "player-local");
     this.closed = false;
@@ -597,10 +601,40 @@ export class CoreSDK {
     return res.frozen_scope ?? {};
   }
 
-  async closeSession(base, authToken) {
+  getCachedCapabilities(slotId) {
+    const target = slotId ?? this.connectedSlotId;
+    const digest = this.slotDigests.get(target) ?? "";
+    return [...(this.capabilityCache.get(digest) ?? [])];
+  }
+
+  async sendHeartbeat(base = this.connectedBase, authToken = this.connectedToken) {
+    return this.postEnvelope(base.replace(/\/$/, ""), authToken, "session.heartbeat", {}, this.sessionId ?? undefined);
+  }
+
+  async resumeSession(base = this.connectedBase, authToken = this.connectedToken) {
+    const res = await this.postEnvelope(base.replace(/\/$/, ""), authToken, "session.resume", {}, this.sessionId ?? undefined);
+    this.actionsPaused = Boolean(res.actions_paused);
+    return res;
+  }
+
+  async sendChat(textOrBase, audienceOrToken = "player_only", maybeText = undefined, maybeAudience = "player_only") {
+    const isShort = maybeText === undefined;
+    const base = isShort ? this.connectedBase : textOrBase;
+    const tok = isShort ? this.connectedToken : audienceOrToken;
+    const text = isShort ? textOrBase : maybeText;
+    const audience = isShort ? audienceOrToken : maybeAudience;
+    return this.postEnvelope(base.replace(/\/$/, ""), tok, "chat.send", {
+      message_id: `msg-${crypto.randomUUID().slice(0, 12)}`,
+      audience,
+      text,
+      provenance: "ai_companion",
+    }, this.sessionId ?? undefined);
+  }
+
+  async closeSession(base = this.connectedBase, authToken = this.connectedToken) {
     const sid = this.sessionId;
     this.shutdown();
-    if (sid) {
+    if (sid && base) {
       try { await this.postEnvelope(base.replace(/\/$/, ""), authToken, "session.close", { reason: "client_shutdown" }, sid); } catch {}
     }
   }
@@ -617,11 +651,11 @@ export class CoreSDK {
     this.sseAbort = null;
   }
 
-  async pullContext(base, authToken) {
+  async pullContext(base = this.connectedBase, authToken = this.connectedToken) {
     return this.postEnvelope(base.replace(/\/$/, ""), authToken, "context.pull", {}, this.sessionId ?? undefined);
   }
 
-  async pullContextIfDue(base, authToken) {
+  async pullContextIfDue(base = this.connectedBase, authToken = this.connectedToken) {
     if (this.closed || !this.sessionId || Date.now() < this.nextAllowedPullMs) return null;
     try {
       return await this.pullContext(base, authToken);
@@ -634,12 +668,20 @@ export class CoreSDK {
     }
   }
 
-  async queryQueue(base, authToken, queueId) {
-    return this.postEnvelope(base.replace(/\/$/, ""), authToken, "queue.query", { queue_id: queueId }, this.sessionId ?? undefined);
+  async queryQueue(baseOrQueueId, authToken, queueId) {
+    const isShort = queueId === undefined && authToken === undefined;
+    const base = isShort ? this.connectedBase : baseOrQueueId;
+    const tok = isShort ? this.connectedToken : authToken;
+    const qid = isShort ? baseOrQueueId : queueId;
+    return this.postEnvelope(base.replace(/\/$/, ""), tok, "queue.query", { queue_id: qid }, this.sessionId ?? undefined);
   }
 
-  async cancelQueue(base, authToken, queueId) {
-    return this.postEnvelope(base.replace(/\/$/, ""), authToken, "queue.cancel", { queue_id: queueId }, this.sessionId ?? undefined);
+  async cancelQueue(baseOrQueueId, authToken, queueId) {
+    const isShort = queueId === undefined && authToken === undefined;
+    const base = isShort ? this.connectedBase : baseOrQueueId;
+    const tok = isShort ? this.connectedToken : authToken;
+    const qid = isShort ? baseOrQueueId : queueId;
+    return this.postEnvelope(base.replace(/\/$/, ""), tok, "queue.cancel", { queue_id: qid }, this.sessionId ?? undefined);
   }
 
   async onContextReceived(base, authToken, ctx, depth = 0) {
@@ -923,20 +965,32 @@ export class CoreSDK {
   }
 
   async postEnvelope(base, authToken, operation, payload, sessionId, extensions) {
-    const resp = await fetch(`${base}/g2a/v1/core`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({
-        g2a_version: G2A_WIRE_VERSION,
-        request_id: `req-${crypto.randomUUID().slice(0, 12)}`,
-        session_id: sessionId,
-        timestamp_ms: Date.now(),
-        operation,
-        payload,
-        extensions: extensions ?? {},
-      }),
-    });
-    const env = parseStrictJson(await resp.text());
+    let resp;
+    let raw;
+    try {
+      const signal = typeof AbortSignal?.timeout === "function" ? AbortSignal.timeout(this.requestTimeoutMs) : undefined;
+      resp = await fetch(`${base}/g2a/v1/core`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
+        signal,
+        body: JSON.stringify({
+          g2a_version: G2A_WIRE_VERSION,
+          request_id: `req-${crypto.randomUUID().slice(0, 12)}`,
+          session_id: sessionId,
+          timestamp_ms: Date.now(),
+          operation,
+          payload,
+          extensions: extensions ?? {},
+        }),
+      });
+      raw = await resp.text();
+    } catch (err) {
+      if (err?.name === "TimeoutError" || err?.name === "AbortError") {
+        throw new G2ACoreError("outcome_unknown", 504, `Request timed out: ${err.message ?? err}`);
+      }
+      throw err;
+    }
+    const env = parseStrictJson(raw);
     if (env.acceptance === "accepted") return env.result ?? {};
     const e = env.error ?? { code: "invalid_request", http_status: resp.status, message: "Rejected" };
     let retryAfterMs = e.retry_after_ms;

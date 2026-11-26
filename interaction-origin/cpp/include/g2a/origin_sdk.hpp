@@ -386,6 +386,37 @@ public:
         if (flush) flush_dirty_sync(false);
     }
 
+    void attach_visual_frame(JsonObject visual_ref, bool flush = false) {
+        std::lock_guard<std::recursive_mutex> lk(mu_);
+        visual_ref_ = std::move(visual_ref);
+        if (flush) flush_dirty_sync(false);
+    }
+
+    void attach_audio_segment(JsonObject audio_ref, bool flush = false) {
+        std::lock_guard<std::recursive_mutex> lk(mu_);
+        audio_ref_ = std::move(audio_ref);
+        if (flush) flush_dirty_sync(false);
+    }
+
+    void set_allowed_timeline_tags(std::vector<std::string> tags, bool flush = false) {
+        std::lock_guard<std::recursive_mutex> lk(mu_);
+        allowed_timeline_tags_ = std::move(tags);
+        if (flush) flush_dirty_sync(true);
+    }
+
+    struct OriginMetrics {
+        int64_t frames_synced = 0;
+        int64_t zero_change_skips = 0;
+        int64_t steps_executed = 0;
+        int64_t steps_settled_batch = 0;
+        int64_t steps_cancelled = 0;
+    };
+
+    OriginMetrics metrics() const {
+        std::lock_guard<std::recursive_mutex> lk(mu_);
+        return metrics_;
+    }
+
     void publish_capabilities_and_baseline(
         const std::string& execute_url = "",
         bool disabled = false,
@@ -427,15 +458,9 @@ public:
         if (!sync_enabled_ && pending_settled_.empty()) return false;
 
         auto [brief, grants] = collect_view();
-        JsonValue digest_doc = brief;
         JsonObject ext_obj;
-        if (!extensions_data_.empty()) {
-            for (const auto& [k, v] : extensions_data_) ext_obj.emplace(k, v);
-            JsonObject combined;
-            combined.emplace("brief", brief);
-            combined.emplace("ext", ext_obj);
-            digest_doc = std::move(combined);
-        }
+        for (const auto& [k, v] : extensions_data_) ext_obj.emplace(k, v);
+        JsonValue digest_doc = build_digest_doc(brief, ext_obj);
         std::string brief_digest = jcs::digest_sha256("g2a.brief.v1", digest_doc);
 
         std::map<std::pair<std::string, std::string>, std::string> cur_canon;
@@ -463,12 +488,14 @@ public:
         pending_settled_.clear();
 
         if (brief_digest == last_brief_digest_ && upserted.empty() && removed.empty() && settled_arr.empty()) {
+            metrics_.zero_change_skips++;
             return false;
         }
 
         int64_t prev_rev = current_rev_++;
         last_brief_digest_ = brief_digest;
         last_sent_methods_ = std::move(cur_canon);
+        metrics_.frames_synced++;
 
         JsonObject frame{
             {"slot_id", slot_id_},
@@ -482,7 +509,7 @@ public:
             {"removed_methods", removed},
             {"settled_executions", settled_arr},
         };
-        if (!ext_obj.empty()) frame.emplace("extensions_data", std::move(ext_obj));
+        append_optional_sync_fields(frame, std::move(ext_obj));
         transport_("origin.sync", frame);
         return true;
     }
@@ -491,16 +518,9 @@ public:
         std::lock_guard<std::recursive_mutex> lk(mu_);
         auto [brief, grants] = collect_view();
         current_rev_++;
-        JsonValue digest_doc = brief;
         JsonObject ext_obj;
-        if (!extensions_data_.empty()) {
-            for (const auto& [k, v] : extensions_data_) ext_obj.emplace(k, v);
-            JsonObject combined;
-            combined.emplace("brief", brief);
-            combined.emplace("ext", ext_obj);
-            digest_doc = std::move(combined);
-        }
-        last_brief_digest_ = jcs::digest_sha256("g2a.brief.v1", digest_doc);
+        for (const auto& [k, v] : extensions_data_) ext_obj.emplace(k, v);
+        last_brief_digest_ = jcs::digest_sha256("g2a.brief.v1", build_digest_doc(brief, ext_obj));
         last_sent_methods_.clear();
         JsonArray upserted;
         for (const auto& [key, g] : grants) {
@@ -511,6 +531,7 @@ public:
         JsonArray settled_arr;
         for (const auto& s : pending_settled_) settled_arr.push_back(s.to_json());
         pending_settled_.clear();
+        metrics_.frames_synced++;
 
         JsonObject frame{
             {"slot_id", slot_id_},
@@ -523,7 +544,7 @@ public:
             {"removed_methods", JsonArray{}},
             {"settled_executions", settled_arr},
         };
-        if (!ext_obj.empty()) frame.emplace("extensions_data", std::move(ext_obj));
+        append_optional_sync_fields(frame, std::move(ext_obj));
         transport_("origin.sync", frame);
     }
 
@@ -554,6 +575,7 @@ public:
             return {req.execution_id, "failed", std::nullopt, schema_err};
         }
 
+        metrics_.steps_executed++;
         EffectOutcome out = cap_it->second.handler(*req.actor, req.args, req.execution_id);
         if (out.kind == "executing") {
             in_flight_[req.execution_id] = std::move(out.cancel_fn);
@@ -598,7 +620,10 @@ public:
             pending_settled_.push_back(std::move(rep));
             ++count;
         }
-        if (count > 0) flush_dirty_sync(false);
+        if (count > 0) {
+            metrics_.steps_settled_batch += static_cast<int64_t>(count);
+            flush_dirty_sync(false);
+        }
         return count;
     }
 
@@ -609,6 +634,7 @@ public:
             auto fn = std::move(it->second);
             in_flight_.erase(it);
             if (fn) fn();
+            metrics_.steps_cancelled++;
             OriginExecuteReply rep{execution_id, "cancelled", std::nullopt, "cancelled_by_hub"};
             store_ledger_reply(rep);
             pending_settled_.push_back(rep);
@@ -856,10 +882,42 @@ private:
     int64_t current_rev_ = 0;
     bool sync_enabled_ = true;
 
+    JsonValue build_digest_doc(const JsonObject& brief, const JsonObject& ext_obj) const {
+        if (ext_obj.empty() && !visual_ref_ && !audio_ref_ && !allowed_timeline_tags_) {
+            return brief;
+        }
+        JsonObject combined;
+        combined.emplace("brief", brief);
+        if (!ext_obj.empty()) combined.emplace("ext", ext_obj);
+        if (visual_ref_) combined.emplace("visual", *visual_ref_);
+        if (audio_ref_) combined.emplace("audio", *audio_ref_);
+        if (allowed_timeline_tags_) {
+            JsonArray arr;
+            for (const auto& t : *allowed_timeline_tags_) arr.emplace_back(t);
+            combined.emplace("timelines", std::move(arr));
+        }
+        return combined;
+    }
+
+    void append_optional_sync_fields(JsonObject& frame, JsonObject&& ext_obj) const {
+        if (visual_ref_) frame.emplace("visual_ref", *visual_ref_);
+        if (audio_ref_) frame.emplace("audio_ref", *audio_ref_);
+        if (allowed_timeline_tags_) {
+            JsonArray arr;
+            for (const auto& t : *allowed_timeline_tags_) arr.emplace_back(t);
+            frame.emplace("allowed_timeline_tags", std::move(arr));
+        }
+        if (!ext_obj.empty()) frame.emplace("extensions_data", std::move(ext_obj));
+    }
+
     std::map<std::string, RegCap> capabilities_;
     std::map<std::string, bool> actors_;
     std::map<std::string, StateMod> modules_;
     std::map<std::string, JsonObject> extensions_data_;
+    std::optional<JsonObject> visual_ref_;
+    std::optional<JsonObject> audio_ref_;
+    std::optional<std::vector<std::string>> allowed_timeline_tags_;
+    OriginMetrics metrics_;
     std::map<std::string, std::function<void()>> in_flight_;
     std::map<std::string, OriginExecuteReply> ledger_;
     std::deque<std::string> ledger_order_;

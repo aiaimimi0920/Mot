@@ -445,6 +445,19 @@ struct InnerState {
     pending_settled: Vec<OriginExecuteReply>,
     last_sent_methods: BTreeMap<(String, String), String>,
     last_brief_digest: String,
+    visual_ref: Option<JsonObject>,
+    audio_ref: Option<JsonObject>,
+    allowed_timeline_tags: Option<Vec<String>>,
+    metrics: OriginMetrics,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OriginMetrics {
+    pub frames_synced: u64,
+    pub zero_change_skips: u64,
+    pub steps_executed: u64,
+    pub steps_settled_batch: u64,
+    pub steps_cancelled: u64,
 }
 
 pub struct OriginSdk {
@@ -489,6 +502,10 @@ impl OriginSdk {
                 pending_settled: Vec::new(),
                 last_sent_methods: BTreeMap::new(),
                 last_brief_digest: String::new(),
+                visual_ref: None,
+                audio_ref: None,
+                allowed_timeline_tags: None,
+                metrics: OriginMetrics::default(),
             }),
         }
     }
@@ -545,6 +562,40 @@ impl OriginSdk {
         }
     }
 
+    pub fn attach_visual_frame(&self, visual_ref: JsonObject, flush: bool) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.visual_ref = Some(visual_ref);
+        }
+        if flush {
+            self.flush_dirty_sync(false);
+        }
+    }
+
+    pub fn attach_audio_segment(&self, audio_ref: JsonObject, flush: bool) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.audio_ref = Some(audio_ref);
+        }
+        if flush {
+            self.flush_dirty_sync(false);
+        }
+    }
+
+    pub fn set_allowed_timeline_tags(&self, tags: Vec<String>, flush: bool) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.allowed_timeline_tags = Some(tags);
+        }
+        if flush {
+            self.flush_dirty_sync(true);
+        }
+    }
+
+    pub fn metrics(&self) -> OriginMetrics {
+        self.state.lock().unwrap().metrics
+    }
+
     pub fn publish_capabilities_and_baseline(&self, opts: SlotPublishOptions) {
         let cap_payload = {
             let st = self.state.lock().unwrap();
@@ -596,14 +647,7 @@ impl OriginSdk {
             }
             let (brief, grants) = collect_view(&st);
             let ext_json = build_ext_json(&st.extensions_data);
-            let digest_target = if ext_json.is_empty() {
-                JsonValue::Object(brief.clone())
-            } else {
-                let mut comb = JsonObject::new();
-                comb.insert("brief".to_owned(), JsonValue::Object(brief.clone()));
-                comb.insert("ext".to_owned(), JsonValue::Object(ext_json.clone()));
-                JsonValue::Object(comb)
-            };
+            let digest_target = build_digest_target(&st, &brief, &ext_json);
             let brief_digest = digest_sha256("g2a.brief.v1", &digest_target).unwrap_or_default();
 
             let mut cur_canon = BTreeMap::new();
@@ -632,11 +676,13 @@ impl OriginSdk {
                 && removed.is_empty()
                 && settled.is_empty()
             {
+                st.metrics.zero_change_skips += 1;
                 return false;
             }
 
             let prev_rev = st.current_rev;
             st.current_rev += 1;
+            st.metrics.frames_synced += 1;
             st.last_brief_digest = brief_digest;
             st.last_sent_methods = cur_canon;
 
@@ -651,9 +697,7 @@ impl OriginSdk {
             frame.insert("upserted_methods".to_owned(), JsonValue::Array(upserted));
             frame.insert("removed_methods".to_owned(), JsonValue::Array(removed));
             frame.insert("settled_executions".to_owned(), JsonValue::Array(settled));
-            if !ext_json.is_empty() {
-                frame.insert("extensions_data".to_owned(), JsonValue::Object(ext_json));
-            }
+            append_optional_sync_fields(&st, &mut frame, ext_json);
             Some(JsonValue::Object(frame))
         };
         if let Some(frame) = maybe_frame {
@@ -669,15 +713,9 @@ impl OriginSdk {
             let mut st = self.state.lock().unwrap();
             let (brief, grants) = collect_view(&st);
             let ext_json = build_ext_json(&st.extensions_data);
-            let digest_target = if ext_json.is_empty() {
-                JsonValue::Object(brief.clone())
-            } else {
-                let mut comb = JsonObject::new();
-                comb.insert("brief".to_owned(), JsonValue::Object(brief.clone()));
-                comb.insert("ext".to_owned(), JsonValue::Object(ext_json.clone()));
-                JsonValue::Object(comb)
-            };
+            let digest_target = build_digest_target(&st, &brief, &ext_json);
             st.current_rev += 1;
+            st.metrics.frames_synced += 1;
             st.last_brief_digest = digest_sha256("g2a.brief.v1", &digest_target).unwrap_or_default();
             st.last_sent_methods.clear();
             let mut upserted = JsonArray::new();
@@ -699,9 +737,7 @@ impl OriginSdk {
             frame.insert("upserted_methods".to_owned(), JsonValue::Array(upserted));
             frame.insert("removed_methods".to_owned(), JsonValue::Array(JsonArray::new()));
             frame.insert("settled_executions".to_owned(), JsonValue::Array(settled));
-            if !ext_json.is_empty() {
-                frame.insert("extensions_data".to_owned(), JsonValue::Object(ext_json));
-            }
+            append_optional_sync_fields(&st, &mut frame, ext_json);
             JsonValue::Object(frame)
         };
         (self.transport)("origin.sync", &frame);
@@ -781,6 +817,7 @@ impl OriginSdk {
             }
 
             let out = (reg.handler)(act, &req.args, &req.execution_id);
+            st.metrics.steps_executed += 1;
             match out {
                 EffectOutcome::StartedExecuting(cancel_fn) => {
                     st.in_flight.insert(req.execution_id.clone(), cancel_fn);
@@ -849,6 +886,7 @@ impl OriginSdk {
                 st.pending_settled.push(rep);
                 n += 1;
             }
+            st.metrics.steps_settled_batch += n as u64;
             n
         };
         if count > 0 {
@@ -869,6 +907,7 @@ impl OriginSdk {
                 };
                 store_ledger_reply(&mut st, r.clone());
                 st.pending_settled.push(r.clone());
+                st.metrics.steps_cancelled += 1;
                 (Some(cb), r, true)
             } else if let Some(prev) = st.ledger.get(execution_id) {
                 (None, prev.clone(), false)
@@ -996,6 +1035,52 @@ fn build_ext_json(ext: &BTreeMap<String, JsonObject>) -> JsonObject {
         out.insert(k.clone(), JsonValue::Object(v.clone()));
     }
     out
+}
+
+fn build_digest_target(st: &InnerState, brief: &JsonObject, ext_json: &JsonObject) -> JsonValue {
+    if ext_json.is_empty()
+        && st.visual_ref.is_none()
+        && st.audio_ref.is_none()
+        && st.allowed_timeline_tags.is_none()
+    {
+        return JsonValue::Object(brief.clone());
+    }
+    let mut comb = JsonObject::new();
+    comb.insert("brief".to_owned(), JsonValue::Object(brief.clone()));
+    if !ext_json.is_empty() {
+        comb.insert("ext".to_owned(), JsonValue::Object(ext_json.clone()));
+    }
+    if let Some(ref v) = st.visual_ref {
+        comb.insert("visual".to_owned(), JsonValue::Object(v.clone()));
+    }
+    if let Some(ref a) = st.audio_ref {
+        comb.insert("audio".to_owned(), JsonValue::Object(a.clone()));
+    }
+    if let Some(ref tags) = st.allowed_timeline_tags {
+        comb.insert(
+            "timelines".to_owned(),
+            JsonValue::Array(tags.iter().map(|t| JsonValue::from(t.as_str())).collect()),
+        );
+    }
+    JsonValue::Object(comb)
+}
+
+fn append_optional_sync_fields(st: &InnerState, frame: &mut JsonObject, ext_json: JsonObject) {
+    if let Some(ref v) = st.visual_ref {
+        frame.insert("visual_ref".to_owned(), JsonValue::Object(v.clone()));
+    }
+    if let Some(ref a) = st.audio_ref {
+        frame.insert("audio_ref".to_owned(), JsonValue::Object(a.clone()));
+    }
+    if let Some(ref tags) = st.allowed_timeline_tags {
+        frame.insert(
+            "allowed_timeline_tags".to_owned(),
+            JsonValue::Array(tags.iter().map(|t| JsonValue::from(t.as_str())).collect()),
+        );
+    }
+    if !ext_json.is_empty() {
+        frame.insert("extensions_data".to_owned(), JsonValue::Object(ext_json));
+    }
 }
 
 fn store_ledger_reply(st: &mut InnerState, rep: OriginExecuteReply) {
@@ -1368,5 +1453,15 @@ mod tests {
         let last_sync_wire = jcs::canonicalize_utf8(&locked_posts.last().unwrap().1).unwrap();
         assert!(last_sync_wire.contains("\"ex-rs-b1\""));
         assert!(last_sync_wire.contains("\"ex-rs-b2\""));
+        drop(locked_posts);
+
+        // Verify multimodal refs, allowed_timeline_tags sync, & OriginMetrics
+        let mut vref = JsonObject::new();
+        vref.insert("frame_id".to_owned(), JsonValue::from("vf-rs-1"));
+        sdk.attach_visual_frame(vref, false);
+        sdk.set_allowed_timeline_tags(vec!["branch_rust".to_owned()], true);
+        assert!(!sdk.flush_dirty_sync(false));
+        let m = sdk.metrics();
+        assert!(m.frames_synced >= 3 && m.zero_change_skips >= 2 && m.steps_settled_batch == 2 && m.steps_cancelled == 1);
     }
 }

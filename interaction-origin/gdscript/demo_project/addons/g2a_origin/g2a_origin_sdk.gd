@@ -33,6 +33,11 @@ var _capabilities: Dictionary = {}        # method_id -> Dictionary { def, effec
 var _actors: Dictionary = {}              # actor -> Variant (Node3D / RefCounted seat controller)
 var _signal_modules: Dictionary = {}      # module_name -> Dictionary { snapshot_fn, active_methods_fn }
 var _extensions_data: Dictionary = {}     # extension_name -> Dictionary
+var _visual_ref: Variant = null           # Optional Dictionary
+var _audio_ref: Variant = null            # Optional Dictionary
+var _allowed_timeline_tags: Variant = null # Optional Array[String]
+var frames_synced: int = 0
+var zero_change_skips: int = 0
 var _in_flight_steps: Dictionary = {}     # execution_id -> Callable (cancel_fn)
 var _execution_ledger: Dictionary = {}    # execution_id -> Dictionary (OriginExecuteReply)
 var _ledger_order: Array[String] = []
@@ -126,6 +131,21 @@ func attach_extension_data(extension_name: String, data: Dictionary, flush: bool
 	_extensions_data[extension_name] = data.duplicate(true)
 	if flush:
 		flush_dirty_sync(false)
+
+func attach_visual_frame(visual_ref: Dictionary, flush: bool = false) -> void:
+	_visual_ref = visual_ref.duplicate(true)
+	if flush:
+		flush_dirty_sync(false)
+
+func attach_audio_segment(audio_ref: Dictionary, flush: bool = false) -> void:
+	_audio_ref = audio_ref.duplicate(true)
+	if flush:
+		flush_dirty_sync(false)
+
+func set_allowed_timeline_tags(tags: Array, flush: bool = false) -> void:
+	_allowed_timeline_tags = tags.duplicate()
+	if flush:
+		flush_dirty_sync(true)
 
 func publish_capabilities_and_baseline(origin_execute_url: String = "") -> void:
 	var ids := _capabilities.keys()
@@ -231,7 +251,14 @@ func flush_dirty_sync(significant_event: bool = false) -> bool:
 	var settled := _pending_settled.duplicate(true)
 	_pending_settled.clear()
 
-	var digest_doc: Variant = {"brief": brief, "ext": _extensions_data} if not _extensions_data.is_empty() else brief
+	var has_extra := (not _extensions_data.is_empty()) or _visual_ref != null or _audio_ref != null or _allowed_timeline_tags != null
+	var digest_doc: Variant = {
+		"brief": brief,
+		"ext": _extensions_data,
+		"visual": _visual_ref,
+		"audio": _audio_ref,
+		"timelines": _allowed_timeline_tags,
+	} if has_extra else brief
 	var brief_digest := G2AJcs.compute_sha256("g2a.brief.v1", digest_doc)
 	var upserted: Array = []
 	var removed: Array = []
@@ -248,10 +275,12 @@ func flush_dirty_sync(significant_event: bool = false) -> bool:
 			removed.append({"method_id": parts[0], "actor": parts[1]})
 
 	if brief_digest == _last_sent_brief_digest and upserted.is_empty() and removed.is_empty() and settled.is_empty():
+		zero_change_skips += 1
 		return false
 
 	var prev_rev := current_rev
 	current_rev += 1
+	frames_synced += 1
 	_last_sent_brief_digest = brief_digest
 	_last_sent_methods = current_serialized
 	var delta_frame := {
@@ -266,6 +295,12 @@ func flush_dirty_sync(significant_event: bool = false) -> bool:
 		"removed_methods": removed,
 		"settled_executions": settled,
 	}
+	if _visual_ref != null:
+		delta_frame["visual_ref"] = _visual_ref.duplicate(true)
+	if _audio_ref != null:
+		delta_frame["audio_ref"] = _audio_ref.duplicate(true)
+	if _allowed_timeline_tags != null:
+		delta_frame["allowed_timeline_tags"] = _allowed_timeline_tags.duplicate()
 	if not _extensions_data.is_empty():
 		delta_frame["extensions_data"] = _extensions_data.duplicate(true)
 	_post_to_hub("origin.sync", delta_frame)
@@ -279,7 +314,15 @@ func flush_full_sync() -> void:
 	_pending_settled.clear()
 
 	current_rev += 1
-	var digest_doc: Variant = {"brief": brief, "ext": _extensions_data} if not _extensions_data.is_empty() else brief
+	frames_synced += 1
+	var has_extra := (not _extensions_data.is_empty()) or _visual_ref != null or _audio_ref != null or _allowed_timeline_tags != null
+	var digest_doc: Variant = {
+		"brief": brief,
+		"ext": _extensions_data,
+		"visual": _visual_ref,
+		"audio": _audio_ref,
+		"timelines": _allowed_timeline_tags,
+	} if has_extra else brief
 	_last_sent_brief_digest = G2AJcs.compute_sha256("g2a.brief.v1", digest_doc)
 	_last_sent_methods.clear()
 	for k in grants.keys():
@@ -296,6 +339,12 @@ func flush_full_sync() -> void:
 		"removed_methods": [],
 		"settled_executions": settled,
 	}
+	if _visual_ref != null:
+		full_frame["visual_ref"] = _visual_ref.duplicate(true)
+	if _audio_ref != null:
+		full_frame["audio_ref"] = _audio_ref.duplicate(true)
+	if _allowed_timeline_tags != null:
+		full_frame["allowed_timeline_tags"] = _allowed_timeline_tags.duplicate()
 	if not _extensions_data.is_empty():
 		full_frame["extensions_data"] = _extensions_data.duplicate(true)
 	_post_to_hub("origin.sync", full_frame)

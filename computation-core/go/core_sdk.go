@@ -111,6 +111,49 @@ func (c *CoreSDK) SlotDigest(slotID string) string {
 	return c.slotDigests[slotID]
 }
 
+func (c *CoreSDK) GetCachedCapabilities(slotID string) []CapabilityEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if slotID == "" && c.frozenScope != nil {
+		slotID = c.frozenScope.SlotID
+	}
+	digest := c.slotDigests[slotID]
+	if digest == "" && c.frozenScope != nil {
+		digest = c.frozenScope.CapabilityTableDigest
+	}
+	src := c.capabilityCache[digest]
+	out := make([]CapabilityEntry, len(src))
+	copy(out, src)
+	return out
+}
+
+func (c *CoreSDK) SendHeartbeat(ctx context.Context) (int64, error) {
+	raw, err := c.postEnvelope(ctx, "session.heartbeat", map[string]any{}, c.SessionID(), nil)
+	if err != nil {
+		return 0, err
+	}
+	var res struct {
+		LeaseDeadlineMs int64 `json:"lease_deadline_ms"`
+	}
+	_ = json.Unmarshal(raw, &res)
+	return res.LeaseDeadlineMs, nil
+}
+
+func (c *CoreSDK) ResumeSession(ctx context.Context) (bool, error) {
+	raw, err := c.postEnvelope(ctx, "session.resume", map[string]any{}, c.SessionID(), nil)
+	if err != nil {
+		return false, err
+	}
+	var res struct {
+		ActionsPaused bool `json:"actions_paused"`
+	}
+	_ = json.Unmarshal(raw, &res)
+	c.mu.Lock()
+	c.actionsPaused = res.ActionsPaused
+	c.mu.Unlock()
+	return res.ActionsPaused, nil
+}
+
 func (c *CoreSDK) Connect(
 	ctx context.Context,
 	hubEndpoint string,
@@ -693,19 +736,18 @@ func (c *CoreSDK) heartbeatLoop(ctx context.Context) {
 func (c *CoreSDK) sseStreamLoop(ctx context.Context) {
 	readyOnce := sync.Once{}
 	isReconnect := false
+	attempt := 0
 	for ctx.Err() == nil {
 		c.mu.Lock()
 		base, tok, sid, lastID := c.hubEndpoint, c.authToken, c.sessionID, c.lastEventID
 		c.mu.Unlock()
 		if isReconnect {
-			if raw, err := c.postEnvelope(ctx, "session.resume", map[string]any{}, sid, nil); err == nil {
-				var res struct {
-					ActionsPaused bool `json:"actions_paused"`
+			if _, err := c.ResumeSession(ctx); err != nil {
+				var gerr *G2AError
+				if errors.As(err, &gerr) && (gerr.Code == "revoked" || gerr.Code == "permission_denied") {
+					c.Shutdown(context.Background(), false)
+					return
 				}
-				_ = json.Unmarshal(raw, &res)
-				c.mu.Lock()
-				c.actionsPaused = res.ActionsPaused
-				c.mu.Unlock()
 			}
 		}
 		u := fmt.Sprintf("%s/g2a/v1/core/events?session_id=%s", base, url.QueryEscape(sid))
@@ -725,9 +767,10 @@ func (c *CoreSDK) sseStreamLoop(ctx context.Context) {
 		resp, err := sseClient.Do(req)
 		if err != nil {
 			isReconnect = true
-			time.Sleep(150 * time.Millisecond)
+			sleepReconnectBackoff(ctx, &attempt)
 			continue
 		}
+		attempt = 0
 		readyOnce.Do(func() { close(c.streamReady) })
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 64*1024), 2<<20)
@@ -746,26 +789,34 @@ func (c *CoreSDK) sseStreamLoop(ctx context.Context) {
 		}
 		_ = resp.Body.Close()
 		isReconnect = true
-		time.Sleep(150 * time.Millisecond)
+		sleepReconnectBackoff(ctx, &attempt)
 	}
 }
 
 func (c *CoreSDK) wsStreamLoop(ctx context.Context) {
 	readyOnce := sync.Once{}
 	isReconnect := false
+	attempt := 0
 	for ctx.Err() == nil {
 		c.mu.Lock()
 		base, tok, sid, lastID := c.hubEndpoint, c.authToken, c.sessionID, c.lastEventID
 		c.mu.Unlock()
 		if isReconnect {
-			_, _ = c.postEnvelope(ctx, "session.resume", map[string]any{}, sid, nil)
+			if _, err := c.ResumeSession(ctx); err != nil {
+				var gerr *G2AError
+				if errors.As(err, &gerr) && (gerr.Code == "revoked" || gerr.Code == "permission_denied") {
+					c.Shutdown(context.Background(), false)
+					return
+				}
+			}
 		}
 		conn, reader, err := dialRFC6455(ctx, base, sid, tok, isReconnect, lastID)
 		if err != nil {
 			isReconnect = true
-			time.Sleep(150 * time.Millisecond)
+			sleepReconnectBackoff(ctx, &attempt)
 			continue
 		}
+		attempt = 0
 		go func(cl net.Conn) {
 			<-ctx.Done()
 			_ = cl.Close()
@@ -790,7 +841,25 @@ func (c *CoreSDK) wsStreamLoop(ctx context.Context) {
 	reconnect:
 		_ = conn.Close()
 		isReconnect = true
-		time.Sleep(150 * time.Millisecond)
+		sleepReconnectBackoff(ctx, &attempt)
+	}
+}
+
+func sleepReconnectBackoff(ctx context.Context, attempt *int) {
+	shift := *attempt
+	if shift > 5 {
+		shift = 5
+	}
+	*attempt = *attempt + 1
+	ms := 150 * (1 << shift)
+	if ms > 4000 {
+		ms = 4000
+	}
+	t := time.NewTimer(time.Duration(ms) * time.Millisecond)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
 	}
 }
 
@@ -974,6 +1043,12 @@ func (c *CoreSDK) postEnvelope(
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		if ctx.Err() == nil {
+			var netErr net.Error
+			if (errors.As(err, &netErr) && netErr.Timeout()) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, &G2AError{Code: "outcome_unknown", HTTPStatus: 504, Message: "HTTP request timed out: " + err.Error()}
+			}
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()

@@ -5,6 +5,7 @@ import hashlib
 import http.client
 import json
 import os
+import random
 import socket
 import ssl
 import struct
@@ -16,7 +17,8 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import OrderedDict
-from typing import Any, Callable, Dict, List, Optional, Protocol
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Protocol, Union
 
 from .jcs import jcs_sha256, parse_strict_json
 from .memory import InMemoryCompanionStore, MemoryRecord, SpoilerGuard
@@ -174,6 +176,16 @@ class QueueBuilder:
         return self._sdk.submit_queue_with_standard_recovery(self.build(queue_id=queue_id))
 
 
+@dataclass
+class CoreMetrics:
+    contexts_received: int = 0
+    queues_submitted: int = 0
+    reconciled_unknowns: int = 0
+    cooldown_shield_hits: int = 0
+    backoff_shield_hits: int = 0
+    stream_reconnects: int = 0
+
+
 class CoreSDK:
     """Tier 3 Computation Core SDK implementing Chapter 4 of G2A_PSEUDOCODE_API (V0.0.1)."""
 
@@ -226,6 +238,7 @@ class CoreSDK:
         self._hb_thread: Optional[threading.Thread] = None
         self._sse_thread: Optional[threading.Thread] = None
         self.on_receipt_callback: Optional[Callable[[QueueReceipt], None]] = None
+        self.metrics = CoreMetrics()
 
     @property
     def is_stream_ready(self) -> bool:
@@ -384,19 +397,70 @@ class CoreSDK:
 
     # --- Reconnect & Resume State Machine (§4.2) ---
 
+    def get_cached_capabilities(self, slot_id: Optional[str] = None) -> List[CapabilityEntry]:
+        target_slot = slot_id or (self.scope.slot_id if self.scope is not None else "")
+        digest = self.slot_digest_index.get(target_slot, "")
+        if not digest and self.scope is not None:
+            digest = self.scope.capability_table_digest
+        return list(self.capability_cache.get(digest, []))
+
+    def send_heartbeat(self) -> Dict[str, Any]:
+        if not self.session_id or self.closed:
+            raise G2AError("revoked", 403, "Session is closed")
+        return self._post_envelope("session.heartbeat", {}, session_id=self.session_id)
+
+    def resume_session(self) -> Dict[str, Any]:
+        if not self.session_id or self.closed:
+            raise G2AError("revoked", 403, "Session is closed")
+        res = self._post_envelope("session.resume", {}, session_id=self.session_id)
+        self.actions_paused = bool(res.get("actions_paused", False))
+        if isinstance(res.get("latest_context"), dict):
+            self.latest_context = ProjectedContext.from_dict(res["latest_context"])
+        return res
+
+    def query_queue(self, queue_id: str) -> QueueReceipt:
+        if not self.session_id or self.closed:
+            raise G2AError("revoked", 403, "Session is closed")
+        res = self._post_envelope("queue.query", {"queue_id": queue_id}, session_id=self.session_id)
+        receipt = QueueReceipt.from_dict(res)
+        self._record_receipt(receipt)
+        return receipt
+
+    def cancel_queue(self, queue_id: str) -> QueueReceipt:
+        if not self.session_id or self.closed:
+            raise G2AError("revoked", 403, "Session is closed")
+        res = self._post_envelope("queue.cancel", {"queue_id": queue_id}, session_id=self.session_id)
+        receipt = QueueReceipt.from_dict(res)
+        self._record_receipt(receipt)
+        return receipt
+
+    def send_chat(self, text: str, audience: str = "player_only", message_id: Optional[str] = None) -> Dict[str, Any]:
+        if not self.session_id or self.closed:
+            raise G2AError("revoked", 403, "Session is closed")
+        if self.scope is not None and not self.scope.allow_chat:
+            raise G2AError("permission_denied", 403, "FrozenScope forbids chat.send")
+        return self._post_envelope(
+            "chat.send",
+            {
+                "message_id": message_id or generate_id("msg"),
+                "audience": audience,
+                "text": text,
+                "provenance": "ai_companion",
+            },
+            session_id=self.session_id,
+        )
+
     def on_stream_reconnected(self) -> None:
         if self.closed or not self.session_id:
             return
+        self.metrics.stream_reconnects += 1
         try:
-            res = self._post_envelope("session.resume", {}, session_id=self.session_id)
-            self.actions_paused = bool(res.get("actions_paused", False))
-            if isinstance(res.get("latest_context"), dict):
-                self.latest_context = ProjectedContext.from_dict(res["latest_context"])
+            self.resume_session()
         except G2AError as err:
             if err.code in ("revoked", "permission_denied"):
                 self.shutdown_session_cleanly(notify_hub=False)
             else:
-                time.sleep(0.5)
+                time.sleep(0.25)
 
     def on_event_session_resumed(self, fresh_ctx: ProjectedContext) -> None:
         self.actions_paused = False
@@ -422,17 +486,20 @@ class CoreSDK:
         if self.closed or not self.session_id:
             return None
         if int(time.time() * 1000) < self.next_allowed_pull_ms:
+            self.metrics.backoff_shield_hits += 1
             return None
         try:
             return self.pull_context()
         except G2AError as err:
             if err.code == "resource_limit":
+                self.metrics.backoff_shield_hits += 1
                 return None
             raise
 
     def on_context_received(self, ctx: ProjectedContext, _replan_depth: int = 0) -> Optional[QueueReceipt]:
         if self.closed or self.actions_paused or not self.session_id or not self.scope:
             return None
+        self.metrics.contexts_received += 1
         self.latest_context = ctx
         caps = self.capability_cache.get(ctx.capability_table_digest, [])
         allowed_tags = set(ctx.allowed_timeline_tags) if ctx.allowed_timeline_tags is not None else None
@@ -488,8 +555,10 @@ class CoreSDK:
             if queue.trigger == "proactive":
                 fp = jcs_sha256("g2a.fp.v1", [s.to_dict() for s in queue.steps])
                 if now_ms < self.refusal_cooldowns.get(fp, 0):
+                    self.metrics.cooldown_shield_hits += 1
                     return None
         try:
+            self.metrics.queues_submitted += 1
             res = self._post_envelope("queue.submit", queue.to_dict(), session_id=self.session_id)
             receipt = QueueReceipt.from_dict(res)
             self._record_receipt(receipt)
@@ -517,6 +586,7 @@ class CoreSDK:
                 return None
             if err.code == "outcome_unknown":
                 # 504 timeout rule: NEVER blindly resend queue.submit or mint a new queue_id; reconcile via queue.query!
+                self.metrics.reconciled_unknowns += 1
                 return self.reconcile_unknown_queue(queue.queue_id)
             if err.code == "resource_limit":
                 wait_sec = min((err.retry_after_ms or 500) / 1000.0, 2.0)
@@ -757,6 +827,7 @@ class CoreSDK:
     def _start_event_stream_async(self) -> None:
         def _stream_worker() -> None:
             first_connect = True
+            backoff_attempt = 0
             while not self._stop_event.is_set() and not self.closed and self.session_id:
                 replay_param = "" if first_connect else "&replay=1"
                 cursor_id = self.last_event_id if not first_connect else ""
@@ -787,6 +858,7 @@ class CoreSDK:
                         handlers.append(urllib.request.HTTPSHandler(context=self.ssl_context))
                     opener = urllib.request.build_opener(*handlers)
                     with opener.open(req, timeout=60.0) as resp:
+                        backoff_attempt = 0
                         self._stream_ready.set()
                         data_lines: List[str] = []
                         while not self._stop_event.is_set() and not self.closed:
@@ -806,11 +878,15 @@ class CoreSDK:
                     if herr.code in (401, 403):
                         self.shutdown_session_cleanly(notify_hub=False)
                         return
-                    time.sleep(0.2)
+                    delay = min(0.15 * (2 ** min(backoff_attempt, 5)), 4.0) * (0.85 + 0.3 * random.random())
+                    backoff_attempt += 1
+                    self._stop_event.wait(delay)
                 except Exception:
                     if self._stop_event.is_set() or self.closed:
                         return
-                    time.sleep(0.2)
+                    delay = min(0.15 * (2 ** min(backoff_attempt, 5)), 4.0) * (0.85 + 0.3 * random.random())
+                    backoff_attempt += 1
+                    self._stop_event.wait(delay)
 
         self._sse_thread = threading.Thread(target=_stream_worker, name="g2a-core-sse", daemon=True)
         self._sse_thread.start()
@@ -844,6 +920,7 @@ class CoreSDK:
 
         def _ws_worker() -> None:
             first_connect = True
+            backoff_attempt = 0
             while not self._stop_event.is_set() and not self.closed and self.session_id:
                 parsed = urllib.parse.urlparse(self.hub_endpoint)
                 is_tls = parsed.scheme in ("https", "wss")
@@ -910,6 +987,7 @@ class CoreSDK:
                     if actual_accept != expected_accept:
                         raise ConnectionError("Invalid RFC 6455 Sec-WebSocket-Accept header")
 
+                    backoff_attempt = 0
                     self._stream_ready.set()
                     while not self._stop_event.is_set() and not self.closed:
                         b0, b1 = _recv_exact(raw_sock, 2)
@@ -938,7 +1016,9 @@ class CoreSDK:
                 except Exception:
                     if self._stop_event.is_set() or self.closed:
                         return
-                    time.sleep(0.2)
+                    delay = min(0.15 * (2 ** min(backoff_attempt, 5)), 4.0) * (0.85 + 0.3 * random.random())
+                    backoff_attempt += 1
+                    self._stop_event.wait(delay)
                 finally:
                     if raw_sock is not None:
                         try:

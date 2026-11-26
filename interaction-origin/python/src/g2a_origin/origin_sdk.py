@@ -665,6 +665,15 @@ class _SignalModule:
     dirty: bool = True
 
 
+@dataclass
+class OriginMetrics:
+    frames_synced: int = 0
+    zero_change_skips: int = 0
+    steps_executed: int = 0
+    steps_settled_batch: int = 0
+    steps_cancelled: int = 0
+
+
 class OriginSDK:
     def __init__(
         self,
@@ -719,6 +728,7 @@ class OriginSDK:
         self._outbound_ready = threading.Event()
         self._outbound_reply_conn: Optional[http.client.HTTPConnection] = None
         self.origin_execute_url: str = ""
+        self.metrics = OriginMetrics()
 
     @classmethod
     def from_local_hub(
@@ -1343,10 +1353,12 @@ class OriginSDK:
             and not removed
             and not settled_batch
         ):
+            self.metrics.zero_change_skips += 1
             return False
 
         prev_rev = self.current_rev
         self.current_rev += 1
+        self.metrics.frames_synced += 1
         frame = {
             "slot_id": self.slot_id,
             "epoch": self.current_epoch,
@@ -1382,6 +1394,7 @@ class OriginSDK:
 
         brief, current_grants, settled_batch = self.engine_dispatcher.run_on_game_thread(_snap)
         self.current_rev += 1
+        self.metrics.frames_synced += 1
         frame = {
             "slot_id": self.slot_id,
             "epoch": self.current_epoch,
@@ -1513,6 +1526,7 @@ class OriginSDK:
 
         self.engine_dispatcher.run_on_game_thread(_finish_batch)
         if settled_count["n"] > 0:
+            self.metrics.steps_settled_batch += settled_count["n"]
             self.flush_dirty_sync(significant_event=False)
         return settled_count["n"]
 
