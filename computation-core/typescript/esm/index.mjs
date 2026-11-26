@@ -495,6 +495,33 @@ export function resolvePrerequisiteSteps(methodId, actor, args = {}, ctx, capabi
   return [{ step_index: 0, method_id: methodId, actor, args: { ...args } }];
 }
 
+export function compileOpenAiTools(capabilities = [], ctx) {
+  const safeIdent = (raw) => String(raw ?? "").trim().replace(/[^a-zA-Z0-9_]+/g, "_").replace(/^_+|_+$/g, "") || "op";
+  const capMap = new Map(capabilities.map((c) => [c.method_id, c]));
+  const tools = [];
+  for (const grant of ctx?.active_methods ?? []) {
+    const cap = capMap.get(grant.method_id);
+    if (!cap) continue;
+    const name = `g2a_act__${safeIdent(cap.method_id)}_${safeIdent(cap.name)}__${safeIdent(grant.actor)}`.slice(0, 64);
+    const schema = cap.params_schema ? structuredClone(cap.params_schema) : { type: "object" };
+    if (!schema.type) schema.type = "object";
+    const props = { ...(schema.properties ?? {}) };
+    if (grant.targets?.length > 0) {
+      props.target_id = { ...(props.target_id ?? {}), type: "string", enum: grant.targets.map((t) => t.target_id) };
+    }
+    schema.properties = props;
+    tools.push({
+      type: "function",
+      function: {
+        name,
+        description: `[${cap.method_id} actor=${grant.actor} readiness=${grant.readiness}] ${cap.description}`,
+        parameters: schema,
+      },
+    });
+  }
+  return tools;
+}
+
 export class QueueBuilder {
   constructor(sdk, base, authToken, ctx, intentSummary = "Execute planned companion queue", capabilities = [], permittedMethods = undefined) {
     this.sdk = sdk;
@@ -569,8 +596,11 @@ export class CoreSDK {
     this.capabilityCache = new Map();
     this.slotDigests = new Map();
     this.pendingConfirmQueues = new Map();
+    this.confirmHoldIds = new Set();
     this.earlyConfirmedQueues = new Set();
     this.earlyDeclinedQueues = new Map();
+    this.declinedQueueIds = new Set();
+    this.confirmedReceipts = new Map();
     this.refusalCooldowns = new Map();
     this.seenEvents = new Set();
     this.lastEventId = "";
@@ -763,6 +793,35 @@ export class CoreSDK {
     return this.postEnvelope(base.replace(/\/$/, ""), tok, "queue.cancel", { queue_id: qid }, this.sessionId ?? undefined);
   }
 
+  async waitForQueueTerminal(queueId, initialReceipt = null, timeoutMs = 5000) {
+    const isNonTerminal = (st) => st === "running" || st === "executing" || st === "awaiting_confirmation";
+    let rec = initialReceipt;
+    if (rec && !isNonTerminal(rec.queue_state)) return rec;
+    const end = Date.now() + timeoutMs;
+    while (Date.now() < end && !this.closed) {
+      if (this.declinedQueueIds.has(queueId)) return { queue_id: queueId, queue_state: "cancelled", step_receipts: [] };
+      const confRec = this.confirmedReceipts.get(queueId);
+      if (confRec) {
+        if (!isNonTerminal(confRec.queue_state)) return confRec;
+        rec = confRec;
+      }
+      const everHeld = this.confirmHoldIds.has(queueId);
+      if (initialReceipt === null && !everHeld) return null;
+      if (everHeld && !confRec) {
+        await new Promise((r) => setTimeout(r, 35));
+        continue;
+      }
+      try {
+        rec = await this.queryQueue(queueId);
+      } catch {
+        break;
+      }
+      if (rec && !isNonTerminal(rec.queue_state)) return rec;
+      await new Promise((r) => setTimeout(r, 35));
+    }
+    return rec;
+  }
+
   async executeGoal(objective, options = {}) {
     const maxTurns = options.maxTurns ?? 6;
     const timeoutMs = options.timeoutMs ?? 10000;
@@ -800,7 +859,7 @@ export class CoreSDK {
       turnsUsed++;
       const qid = `Q-${crypto.randomUUID().slice(0, 12)}`;
       submittedQueues.push(qid);
-      lastReceipt = await this.submitQueueWithRecovery(this.connectedBase, this.connectedToken, {
+      const initialRec = await this.submitQueueWithRecovery(this.connectedBase, this.connectedToken, {
         queue_id: qid,
         epoch: synth.epoch,
         based_on_rev: synth.rev,
@@ -809,6 +868,10 @@ export class CoreSDK {
         intent_summary: dec.intent_summary || objective,
         steps: filtered,
       });
+      lastReceipt = await this.waitForQueueTerminal(qid, initialRec, Math.max(100, deadline - Date.now()));
+      if (initialRec === null && lastReceipt?.queue_state === "cancelled") {
+        return { goal_id: goalId, objective, succeeded: false, status: "declined_by_player", turns_used: turnsUsed, submitted_queues: submittedQueues, final_context: lastCtx, failure_reason: "declined_by_player" };
+      }
 
       for (const sr of lastReceipt?.step_receipts ?? []) {
         if (sr.state === "failed" && sr.step_index >= 0 && sr.step_index < filtered.length) {
@@ -882,10 +945,12 @@ export class CoreSDK {
     } catch (err) {
       if (!(err instanceof G2ACoreError)) throw err;
       if (err.code === "confirmation_required") {
+        this.confirmHoldIds.add(queue.queue_id);
         if (this.earlyConfirmedQueues.delete(queue.queue_id)) return this.submitQueueWithRecovery(cleanBase, authToken, queue, depth);
         const earlyCd = this.earlyDeclinedQueues.get(queue.queue_id);
         if (earlyCd !== undefined) {
           this.earlyDeclinedQueues.delete(queue.queue_id);
+          this.declinedQueueIds.add(queue.queue_id);
           const fp = await jcsSha256("g2a.fp.v1", queue.steps);
           this.refusalCooldowns.set(fp, Date.now() + earlyCd);
           return null;
@@ -925,11 +990,13 @@ export class CoreSDK {
       const q = qid ? this.pendingConfirmQueues.get(qid) : undefined;
       if (q) {
         this.pendingConfirmQueues.delete(q.queue_id);
-        await this.submitQueueWithRecovery(base, authToken, q);
+        const rec = await this.submitQueueWithRecovery(base, authToken, q);
+        if (rec) this.confirmedReceipts.set(q.queue_id, rec);
       } else if (qid) this.earlyConfirmedQueues.add(qid);
     } else if (env.event === "queue.declined") {
       const qid = typeof env.payload?.queue_id === "string" ? env.payload.queue_id : "";
       const cdMs = Number(env.payload?.cooldown_ms ?? 60000);
+      if (qid) this.declinedQueueIds.add(qid);
       const q = qid ? this.pendingConfirmQueues.get(qid) : undefined;
       if (q) {
         this.pendingConfirmQueues.delete(q.queue_id);

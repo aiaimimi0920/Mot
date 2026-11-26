@@ -13,6 +13,7 @@ import {
   MEMORY_BUNDLE_FORMAT_V1,
   MemoryService,
   OpenAICompatibleLLMPlanner,
+  compileOpenAiTools,
   escapeUntrustedFenceJson,
   jcsSha256,
   validateOutboundUrlAgainstSsrf,
@@ -186,6 +187,10 @@ if (fs.existsSync(hubPath)) {
       { slot_id: "s1", epoch: 1, rev: 1, capability_table_digest: "sha256:00", state_brief: {}, active_methods: [{ method_id: "#02", actor: "companion", readiness: "staged", targets: [{ target_id: "chest_R", label: "Right Chest", readiness: "staged" }] }] }
     );
     assert.equal(stagedFiltered.planned_steps.length, 0);
+
+    const tsTools = compileOpenAiTools(coreSdk.getCachedCapabilities(), pulled);
+    assert.equal(tsTools.length, 1);
+    assert.deepEqual(tsTools[0].function.parameters.properties.target_id.enum, ["chest_R"]);
 
     await origSdk.reportPlayerCommand("open right chest");
     const deadline = Date.now() + 3000;

@@ -27,8 +27,11 @@ public sealed class CoreSdk : IAsyncDisposable
     private readonly Dictionary<string, List<CapabilityEntry>> _capabilityCache = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _slotDigests = new(StringComparer.Ordinal);
     private readonly Dictionary<string, MethodCallQueue> _pendingConfirmQueues = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _confirmHoldIds = new(StringComparer.Ordinal);
     private readonly HashSet<string> _earlyConfirmedIds = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _earlyDeclinedIds = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _declinedQueueIds = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, QueueReceipt> _confirmedReceipts = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _refusalCooldowns = new(StringComparer.Ordinal);
     private readonly HashSet<string> _seenSet = new(StringComparer.Ordinal);
     private readonly Queue<string> _seenOrder = new();
@@ -245,12 +248,14 @@ public sealed class CoreSdk : IAsyncDisposable
                 bool immediateResubmit = false;
                 lock (_gate)
                 {
+                    _confirmHoldIds.Add(queue.QueueId);
                     if (_earlyConfirmedIds.Remove(queue.QueueId))
                     {
                         immediateResubmit = true;
                     }
                     else if (_earlyDeclinedIds.Remove(queue.QueueId, out long cdMs))
                     {
+                        _declinedQueueIds.Add(queue.QueueId);
                         string declFp = JcsDigest.ComputeSha256("g2a.fp.v1", queue.Steps);
                         _refusalCooldowns[declFp] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + cdMs;
                         return null;
@@ -301,13 +306,20 @@ public sealed class CoreSdk : IAsyncDisposable
             if (_pendingConfirmQueues.Remove(queueId, out var q)) pending = q;
             else _earlyConfirmedIds.Add(queueId);
         }
-        return pending != null ? await SubmitQueueWithRecoveryAsync(pending, ct) : null;
+        if (pending == null) return null;
+        var rec = await SubmitQueueWithRecoveryAsync(pending, ct);
+        if (rec != null)
+        {
+            lock (_gate) { _confirmedReceipts[queueId] = rec; }
+        }
+        return rec;
     }
 
     public void OnEventQueueDeclined(string queueId, long cooldownMs = 60000)
     {
         lock (_gate)
         {
+            _declinedQueueIds.Add(queueId);
             if (_pendingConfirmQueues.Remove(queueId, out var q))
             {
                 string fp = JcsDigest.ComputeSha256("g2a.fp.v1", q.Steps);
@@ -318,6 +330,52 @@ public sealed class CoreSdk : IAsyncDisposable
                 _earlyDeclinedIds[queueId] = cooldownMs;
             }
         }
+    }
+
+    public async Task<QueueReceipt?> WaitForQueueTerminalAsync(
+        string queueId,
+        QueueReceipt? initialReceipt = null,
+        CancellationToken ct = default)
+    {
+        static bool IsNonTerminal(string? st) => st is "running" or "executing" or "awaiting_confirmation";
+        var rec = initialReceipt;
+        if (rec != null && !IsNonTerminal(rec.QueueState)) return rec;
+
+        while (!ct.IsCancellationRequested && !Closed)
+        {
+            bool everHeld, declined;
+            QueueReceipt? confRec;
+            lock (_gate)
+            {
+                everHeld = _confirmHoldIds.Contains(queueId);
+                declined = _declinedQueueIds.Contains(queueId);
+                _confirmedReceipts.TryGetValue(queueId, out confRec);
+            }
+            if (declined)
+                return new QueueReceipt(queueId, "cancelled", new List<StepReceipt>());
+            if (confRec != null)
+            {
+                if (!IsNonTerminal(confRec.QueueState)) return confRec;
+                rec = confRec;
+            }
+            if (initialReceipt == null && !everHeld) return null;
+            if (everHeld && confRec == null)
+            {
+                await Task.Delay(35, ct);
+                continue;
+            }
+            try
+            {
+                rec = await QueryQueueAsync(queueId, ct);
+            }
+            catch (G2ACoreException)
+            {
+                break;
+            }
+            if (rec != null && !IsNonTerminal(rec.QueueState)) return rec;
+            await Task.Delay(35, ct);
+        }
+        return rec;
     }
 
     public async Task ShutdownAsync(bool notifyHub = true)
@@ -396,7 +454,7 @@ public sealed class CoreSdk : IAsyncDisposable
             turns++;
             string qid = "Q-" + Guid.NewGuid().ToString("N")[..12];
             submitted.Add(qid);
-            lastRec = await SubmitQueueWithRecoveryAsync(new MethodCallQueue(
+            var initialRec = await SubmitQueueWithRecoveryAsync(new MethodCallQueue(
                 QueueId: qid,
                 Epoch: synth.Epoch,
                 BasedOnRev: synth.Rev,
@@ -404,6 +462,9 @@ public sealed class CoreSdk : IAsyncDisposable
                 Supersedes: turns == 1,
                 IntentSummary: string.IsNullOrEmpty(dec.IntentSummary) ? objective : dec.IntentSummary,
                 Steps: filtered), ct);
+            lastRec = await WaitForQueueTerminalAsync(qid, initialRec, ct);
+            if (initialRec == null && lastRec?.QueueState == "cancelled")
+                return new GoalExecutionReport(goalId, objective, false, "declined_by_player", turns, submitted, lastCtx, "declined_by_player");
 
             if (lastRec != null)
             {

@@ -1755,6 +1755,339 @@ class TestOptimizationsAndStress(unittest.TestCase):
                 if hub_proc.stderr:
                     hub_proc.stderr.close()
 
+    def test_mcp_server_native_tool_calling_sustained_goal_and_confirm_hold(self) -> None:
+        import urllib.request
+        from g2a_core import (
+            G2AMCPServer,
+            compile_context_tools,
+            decompose_compound_objective,
+            discover_local_hub_manifest,
+        )
+        from g2a_origin import (
+            ActiveMethodGrant as OrigGrant,
+            CapabilityEntry as OrigCap,
+            ImmediateSucceeded,
+            OriginSDK,
+            StartedExecuting,
+            StepExecutionToken,
+            TargetCandidate as OrigTarget,
+        )
+
+        # 1. Bilingual compound objective decomposition
+        self.assertEqual(
+            decompose_compound_objective("先去拿左边的铁钥匙，然后打开右边的宝箱，最后通知队友"),
+            ["去拿左边的铁钥匙", "打开右边的宝箱", "通知队友"],
+        )
+        self.assertEqual(
+            decompose_compound_objective("First scout the ridge, then disarm the trap, finally signal the squad"),
+            ["scout the ridge", "disarm the trap", "signal the squad"],
+        )
+
+        # 2. Native OpenAI `tools` Function-Calling E2E + Anthropic/MCP schema shapes + automatic staged unrolling
+        caps = [
+            CapabilityEntry("#01", "move_to", "Approach target", ["companion"], {"type": "object", "required": ["target_id"]}, sustained=True),
+            CapabilityEntry("#02", "open_vault", "Unlock vault", ["companion"], {"type": "object", "required": ["target_id"]}),
+            CapabilityEntry("#99", "admin_wipe", "Ungranted capability", ["companion"], {"type": "object"}),
+        ]
+        ctx_staged = ProjectedContext(
+            slot_id="slot-tools",
+            epoch=1,
+            rev=5,
+            capability_table_digest="sha256:00",
+            player_command="Unlock beta vault",
+            state_brief={"room": "sanctum"},
+            active_methods=[
+                ActiveMethodGrant(
+                    "#01",
+                    "companion",
+                    "ready",
+                    [OrigTarget_c := TargetCandidate("vault_alpha", "Alpha Vault", "ready"), TargetCandidate("vault_beta", "Beta Vault", "ready")],
+                ),
+                ActiveMethodGrant(
+                    "#02",
+                    "companion",
+                    "staged",
+                    [
+                        TargetCandidate("vault_alpha", "Alpha Vault", "staged", prerequisite_hint="Move closer"),
+                        TargetCandidate("vault_beta", "Beta Vault", "staged", prerequisite_hint="Move closer"),
+                    ],
+                ),
+            ],
+        )
+        _ = OrigTarget_c
+        anth_tools, _ = compile_context_tools(caps, ctx_staged, fmt="anthropic", include_meta_tools=False)
+        mcp_tools, _ = compile_context_tools(caps, ctx_staged, fmt="mcp", include_meta_tools=False)
+        self.assertEqual(len(anth_tools), 2)  # #99 ungranted excluded!
+        self.assertIn("input_schema", anth_tools[0])
+        self.assertIn("inputSchema", mcp_tools[0])
+
+        captured_llm_req: dict = {}
+
+        class _MockToolLLMHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                ln = int(self.headers.get("Content-Length", "0"))
+                captured_llm_req.update(json.loads(self.rfile.read(ln).decode("utf-8")))
+                open_tool = next(
+                    t["function"]["name"]
+                    for t in captured_llm_req["tools"]
+                    if "open_vault" in t["function"]["name"]
+                )
+                reply = {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": open_tool,
+                                            "arguments": json.dumps({"target_id": "vault_beta"}),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+                raw = json.dumps(reply).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        mock_llm = ThreadingHTTPServer(("127.0.0.1", 0), _MockToolLLMHandler)
+        llm_port = mock_llm.server_address[1]
+        threading.Thread(target=mock_llm.serve_forever, daemon=True).start()
+        try:
+            tool_planner = OpenAICompatibleLLMPlanner(
+                base_url=f"http://127.0.0.1:{llm_port}/v1",
+                model="mock-tool-gpt",
+                allow_loopback=True,
+                use_native_tools=True,
+            )
+            dec = tool_planner.plan(caps, ctx_staged, [])
+            # Even though the LLM called staged #02 directly, tool_calls_to_plan_decision auto-prepended ready #01!
+            self.assertEqual([(s.method_id, s.args) for s in dec.planned_steps], [("#01", {"target_id": "vault_beta"}), ("#02", {"target_id": "vault_beta"})])
+            sent_open_schema = next(t["function"]["parameters"] for t in captured_llm_req["tools"] if "open_vault" in t["function"]["name"])
+            self.assertEqual(sent_open_schema["properties"]["target_id"]["enum"], ["vault_alpha", "vault_beta"])
+        finally:
+            mock_llm.shutdown()
+            mock_llm.server_close()
+
+        # 3. Live 3-Tier G2AMCPServer JSON-RPC 2.0 + Sustained Queue Terminal Settlement + Confirmation Hold in execute_goal
+        hub_bin = resolve_hub_binary(ROOT_DIR)
+        no_proxy = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_path = os.path.join(tmp, "w21_mcp_runtime.json")
+            ledger_path = os.path.join(tmp, "w21_mcp_ledger.json")
+            hub_proc = subprocess.Popen(
+                [
+                    hub_bin,
+                    "-origin-addr", "127.0.0.1:0",
+                    "-core-addr", "127.0.0.1:0",
+                    "-consent-addr", "127.0.0.1:0",
+                    "-ledger", ledger_path,
+                    "-runtime-file", runtime_path,
+                    "-auto-approve-scope",
+                    "-print-ports-json",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert hub_proc.stdout is not None
+                _ = json.loads(hub_proc.stdout.readline().strip())
+                deadline = time.time() + 3.0
+                while time.time() < deadline and not os.path.exists(runtime_path):
+                    time.sleep(0.02)
+                consent_url = discover_local_hub_manifest(runtime_file=runtime_path)["dashboard_url"].rstrip("/")
+
+                world = {"near_altar": False, "altar_cleansed": False, "seal_detonated": False}
+
+                def _setup_sanctum(orig: OriginSDK) -> None:
+                    def _move_effect(actor: str, _subj: object, args: dict, tok: StepExecutionToken):
+                        tid = str(args["target_id"])
+
+                        def _walk() -> None:
+                            time.sleep(0.06)
+                            if tid == "altar_north":
+                                world["near_altar"] = True
+                            orig.complete_step(tok.execution_id, True, {"arrived": tid})
+
+                        threading.Thread(target=_walk, daemon=True).start()
+                        return StartedExecuting(cancel_fn=lambda: None)
+
+                    def _cleanse_effect(_actor: str, _subj: object, args: dict, _tok: StepExecutionToken):
+                        world["altar_cleansed"] = True
+                        return ImmediateSucceeded({"cleansed": args["target_id"]})
+
+                    def _detonate_effect(_actor: str, _subj: object, args: dict, _tok: StepExecutionToken):
+                        world["seal_detonated"] = True
+                        return ImmediateSucceeded({"detonated": args["target_id"]})
+
+                    orig.register_capability(
+                        OrigCap("#01", "move_to", "Walk to target", ["companion"], {"type": "object", "required": ["target_id"]}, sustained=True),
+                        effect_handler=_move_effect,
+                    )
+                    orig.register_capability(
+                        OrigCap("#02", "cleanse_altar", "Cleanse altar", ["companion"], {"type": "object", "required": ["target_id"]}),
+                        effect_handler=_cleanse_effect,
+                    )
+                    orig.register_capability(
+                        OrigCap(
+                            "#03",
+                            "detonate_seal",
+                            "High-impact seal detonation",
+                            ["companion"],
+                            {"type": "object", "required": ["target_id"]},
+                            default_policy="confirm",
+                        ),
+                        effect_handler=_detonate_effect,
+                    )
+                    orig.bind_state_module(
+                        "sanctum",
+                        lambda: dict(world),
+                        lambda: [
+                            OrigGrant("#01", "companion", "ready", [OrigTarget("altar_north", "North Altar", "ready")]),
+                            OrigGrant(
+                                "#02",
+                                "companion",
+                                "ready" if world["near_altar"] else "staged",
+                                [
+                                    OrigTarget(
+                                        "altar_north",
+                                        "North Altar",
+                                        "ready" if world["near_altar"] else "staged",
+                                        prerequisite_hint=None if world["near_altar"] else "requires_proximity",
+                                    )
+                                ],
+                            ),
+                            OrigGrant(
+                                "#03",
+                                "companion",
+                                "ready",
+                                [
+                                    OrigTarget("seal_alpha", "Alpha Seal", "ready"),
+                                    OrigTarget("seal_beta", "Beta Seal", "ready"),
+                                ],
+                            ),
+                        ],
+                    )
+
+                def _confirm_goal_planner(caps, ctx, memories) -> PlanDecision:
+                    cmd = ctx.player_command or ""
+                    if "贝塔" in cmd:
+                        return PlanDecision(
+                            intent_summary="Detonate beta seal",
+                            planned_steps=[QueueStep(0, "#03", "companion", {"target_id": "seal_beta"})],
+                            goal_status="completed",
+                        )
+                    if "阿尔法" in cmd:
+                        return PlanDecision(
+                            intent_summary="Detonate alpha seal",
+                            planned_steps=[QueueStep(0, "#03", "companion", {"target_id": "seal_alpha"})],
+                            goal_status="completed",
+                        )
+                    return PlanDecision()
+
+                with OriginSDK.connect_quick(slot_id="slot-w21-mcp", runtime_file=runtime_path, setup_fn=_setup_sanctum):
+                    with CoreSDK.connect_quick(
+                        slot_id="slot-w21-mcp",
+                        auth_token="core-w21-mcp",
+                        planner=_confirm_goal_planner,
+                        runtime_file=runtime_path,
+                    ) as core_sdk:
+                        mcp = G2AMCPServer(core_sdk)
+                        mcp_url = mcp.start_http()
+                        try:
+                            def _mcp_rpc(method: str, params: dict | None = None, req_id: int = 1) -> dict:
+                                req = urllib.request.Request(
+                                    mcp_url,
+                                    data=json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}}).encode("utf-8"),
+                                    method="POST",
+                                    headers={"Content-Type": "application/json"},
+                                )
+                                with no_proxy.open(req, timeout=5.0) as resp:
+                                    return json.loads(resp.read().decode("utf-8"))
+
+                            init_res = _mcp_rpc("initialize")["result"]
+                            self.assertEqual(init_res["protocolVersion"], "2024-11-05")
+                            self.assertEqual(init_res["serverInfo"]["version"], "0.0.1")
+
+                            res_read = _mcp_rpc("resources/read", {"uri": "g2a://context/live"})["result"]
+                            live_ctx_doc = json.loads(res_read["contents"][0]["text"])
+                            self.assertEqual(live_ctx_doc["slot_id"], "slot-w21-mcp")
+
+                            listed_tools = _mcp_rpc("tools/list")["result"]["tools"]
+                            cleanse_tool = next(t["name"] for t in listed_tools if "cleanse_altar" in t["name"])
+
+                            # Call staged cleanse_altar over MCP -> auto-unrolls sustained move_to + awaits terminal settlement!
+                            call_res = _mcp_rpc("tools/call", {"name": cleanse_tool, "arguments": {"target_id": "altar_north"}})["result"]
+                            self.assertFalse(call_res["isError"], f"MCP call_res={call_res}")
+                            call_payload = json.loads(call_res["content"][0]["text"])
+                            self.assertEqual(call_payload["queue_state"], "completed")
+                            self.assertTrue(world["near_altar"])
+                            self.assertTrue(world["altar_cleansed"])
+
+                            # Helper to decide pending confirmation prompt on Hub
+                            def _decide_next_prompt(approve: bool) -> None:
+                                end_w = time.time() + 3.0
+                                while time.time() < end_w:
+                                    with no_proxy.open(f"{consent_url}/trusted/pending", timeout=2.0) as r:
+                                        prompts = json.loads(r.read().decode("utf-8")).get("queue_prompts") or []
+                                    if prompts:
+                                        qp = prompts[0]
+                                        d_req = urllib.request.Request(
+                                            f"{consent_url}/trusted/decide-queue",
+                                            data=json.dumps(
+                                                {
+                                                    "session_id": qp["session_id"],
+                                                    "queue_id": qp["queue_id"],
+                                                    "queue_digest": qp["queue_digest"],
+                                                    "fingerprint": qp["fingerprint"],
+                                                    "approved": approve,
+                                                }
+                                            ).encode("utf-8"),
+                                            method="POST",
+                                            headers={"Content-Type": "application/json"},
+                                        )
+                                        with no_proxy.open(d_req, timeout=2.0):
+                                            pass
+                                        return
+                                    time.sleep(0.03)
+
+                            # Case A: Player declines default_policy="confirm" queue (seal_beta) -> execute_goal returns declined_by_player!
+                            threading.Thread(target=_decide_next_prompt, args=(False,), daemon=True).start()
+                            rep_declined = core_sdk.execute_goal("引爆贝塔封印", max_turns=3, timeout_sec=4.0)
+                            self.assertFalse(rep_declined.succeeded)
+                            self.assertEqual(rep_declined.status, "declined_by_player")
+                            self.assertFalse(world["seal_detonated"])
+
+                            # Case B: Player approves default_policy="confirm" queue (seal_alpha) -> execute_goal completes in 1 turn!
+                            threading.Thread(target=_decide_next_prompt, args=(True,), daemon=True).start()
+                            rep_approved = core_sdk.execute_goal("引爆阿尔法封印", max_turns=3, timeout_sec=4.0)
+                            self.assertTrue(rep_approved.succeeded)
+                            self.assertEqual(rep_approved.status, "completed")
+                            self.assertEqual(rep_approved.turns_used, 1)
+                            self.assertTrue(world["seal_detonated"])
+                        finally:
+                            mcp.stop_http()
+            finally:
+                hub_proc.terminate()
+                hub_proc.wait(timeout=3)
+                if hub_proc.stdout:
+                    hub_proc.stdout.close()
+                if hub_proc.stderr:
+                    hub_proc.stderr.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -235,6 +235,14 @@ def main() -> None:
     memsrv_p.add_argument("--host", default="127.0.0.1")
     memsrv_p.add_argument("--port", type=int, default=19290)
 
+    mcp_p = sub.add_parser("serve-mcp", help="Expose a G2A slot as a Model Context Protocol (MCP) JSON-RPC 2.0 server")
+    mcp_p.add_argument("--hub", default="auto", help="Hub Core URL or 'auto' for hub.runtime.json")
+    mcp_p.add_argument("--slot", required=True)
+    mcp_p.add_argument("--token", default="core-mcp-agent")
+    mcp_p.add_argument("--memory-db", default="companion_memory.db")
+    mcp_p.add_argument("--host", default="127.0.0.1")
+    mcp_p.add_argument("--http-port", type=int, default=0, help="If >0, serve HTTP JSON-RPC on /mcp instead of stdio")
+
     args = parser.parse_args()
     if args.subcmd == "run":
         _cmd_run(args)
@@ -277,6 +285,30 @@ def main() -> None:
                 time.sleep(1.0)
         except KeyboardInterrupt:
             srv.stop()
+            store.close()
+    elif args.subcmd == "serve-mcp":
+        from .mcp_bridge import G2AMCPServer
+
+        store = SQLiteCompanionStore(args.memory_db)
+        try:
+            with CoreSDK.connect_quick(
+                slot_id=args.slot,
+                auth_token=args.token,
+                hub_endpoint=args.hub,
+                memory_store=store,
+            ) as sdk:
+                mcp_srv = G2AMCPServer(sdk)
+                if args.http_port > 0:
+                    url = mcp_srv.start_http(host=args.host, port=args.http_port)
+                    print(f"[G2A MCP Server V0.0.1] Listening on {url}", flush=True)
+                    try:
+                        while True:
+                            time.sleep(1.0)
+                    except KeyboardInterrupt:
+                        mcp_srv.stop_http()
+                else:
+                    mcp_srv.serve_stdio()
+        finally:
             store.close()
     else:
         parser.print_help()

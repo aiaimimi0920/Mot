@@ -57,8 +57,11 @@ type CoreSDK struct {
 	slotDigests         map[string]string
 	capabilityCache     map[string][]CapabilityEntry
 	pendingConfirm      map[string]MethodCallQueue
+	confirmHolds        map[string]struct{}
 	earlyConfirmed      map[string]struct{}
 	earlyDeclined       map[string]int64
+	declinedQueues      map[string]struct{}
+	confirmedRecs       map[string]*QueueReceipt
 	refusalCooldowns    map[string]int64
 	streamReady         chan struct{}
 	cancelBg            context.CancelFunc
@@ -78,8 +81,11 @@ func NewCoreSDK(planner CognitivePlanner, allowLoopback bool) *CoreSDK {
 		slotDigests:      make(map[string]string),
 		capabilityCache:  make(map[string][]CapabilityEntry),
 		pendingConfirm:   make(map[string]MethodCallQueue),
+		confirmHolds:     make(map[string]struct{}),
 		earlyConfirmed:   make(map[string]struct{}),
 		earlyDeclined:    make(map[string]int64),
+		declinedQueues:   make(map[string]struct{}),
+		confirmedRecs:    make(map[string]*QueueReceipt),
 		refusalCooldowns: make(map[string]int64),
 		streamReady:      make(chan struct{}),
 		httpClient: &http.Client{
@@ -478,6 +484,7 @@ func (c *CoreSDK) submitQueueDepth(ctx context.Context, queue MethodCallQueue, d
 	switch gerr.Code {
 	case "confirmation_required":
 		c.mu.Lock()
+		c.confirmHolds[queue.QueueID] = struct{}{}
 		if _, fastConfirmed := c.earlyConfirmed[queue.QueueID]; fastConfirmed {
 			delete(c.earlyConfirmed, queue.QueueID)
 			c.mu.Unlock()
@@ -485,6 +492,7 @@ func (c *CoreSDK) submitQueueDepth(ctx context.Context, queue MethodCallQueue, d
 		}
 		if cdMs, fastDeclined := c.earlyDeclined[queue.QueueID]; fastDeclined {
 			delete(c.earlyDeclined, queue.QueueID)
+			c.declinedQueues[queue.QueueID] = struct{}{}
 			fpDecl, _ := DigestSHA256("g2a.fp.v1", queue.Steps)
 			if fpDecl != "" {
 				c.refusalCooldowns[fpDecl] = time.Now().UnixMilli() + cdMs
@@ -550,7 +558,13 @@ func (c *CoreSDK) OnEventQueueConfirmed(ctx context.Context, queueID string) (*Q
 	if exists {
 		delete(c.pendingConfirm, queueID)
 		c.mu.Unlock()
-		return c.SubmitQueueWithRecovery(ctx, q)
+		rec, err := c.SubmitQueueWithRecovery(ctx, q)
+		if rec != nil {
+			c.mu.Lock()
+			c.confirmedRecs[queueID] = rec
+			c.mu.Unlock()
+		}
+		return rec, err
 	}
 	c.earlyConfirmed[queueID] = struct{}{}
 	c.mu.Unlock()
@@ -563,6 +577,7 @@ func (c *CoreSDK) OnEventQueueDeclined(queueID string, cooldownMs int64) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.declinedQueues[queueID] = struct{}{}
 	if q, exists := c.pendingConfirm[queueID]; exists {
 		delete(c.pendingConfirm, queueID)
 		if fp, err := DigestSHA256("g2a.fp.v1", q.Steps); err == nil && fp != "" {
@@ -571,6 +586,55 @@ func (c *CoreSDK) OnEventQueueDeclined(queueID string, cooldownMs int64) {
 		return
 	}
 	c.earlyDeclined[queueID] = cooldownMs
+}
+
+func isNonTerminalQueueState(state string) bool {
+	return state == "running" || state == "executing" || state == "awaiting_confirmation"
+}
+
+// WaitForQueueTerminal awaits terminal settlement of sustained ("running") steps or confirmation holds.
+func (c *CoreSDK) WaitForQueueTerminal(ctx context.Context, queueID string, initialRec *QueueReceipt) (*QueueReceipt, error) {
+	rec := initialRec
+	if rec != nil && !isNonTerminalQueueState(rec.QueueState) {
+		return rec, nil
+	}
+	for ctx.Err() == nil {
+		c.mu.Lock()
+		closed := c.closed
+		_, everHeld := c.confirmHolds[queueID]
+		_, declined := c.declinedQueues[queueID]
+		confRec := c.confirmedRecs[queueID]
+		c.mu.Unlock()
+		if closed {
+			return rec, nil
+		}
+		if declined {
+			return &QueueReceipt{QueueID: queueID, QueueState: "cancelled"}, nil
+		}
+		if confRec != nil {
+			if !isNonTerminalQueueState(confRec.QueueState) {
+				return confRec, nil
+			}
+			rec = confRec
+		}
+		if initialRec == nil && !everHeld {
+			return nil, nil
+		}
+		if everHeld && confRec == nil {
+			time.Sleep(35 * time.Millisecond)
+			continue
+		}
+		queried, err := c.QueryQueue(ctx, queueID)
+		if err != nil {
+			break
+		}
+		rec = queried
+		if rec != nil && !isNonTerminalQueueState(rec.QueueState) {
+			return rec, nil
+		}
+		time.Sleep(35 * time.Millisecond)
+	}
+	return rec, nil
 }
 
 func (c *CoreSDK) Shutdown(ctx context.Context, notifyHub bool) {
@@ -664,14 +728,24 @@ func (c *CoreSDK) ExecuteGoal(
 		turns++
 		qid := "Q-" + randomHex(6)
 		submitted = append(submitted, qid)
-		rec, err := c.SubmitQueueWithRecovery(ctx, MethodCallQueue{
+		initialRec, err := c.SubmitQueueWithRecovery(ctx, MethodCallQueue{
 			QueueID: qid, Epoch: synth.Epoch, BasedOnRev: synth.Rev,
 			Trigger: "player_command", Supersedes: turns == 1, IntentSummary: dec.IntentSummary, Steps: filtered,
 		})
 		if err != nil {
 			return nil, err
 		}
+		rec, err := c.WaitForQueueTerminal(ctx, qid, initialRec)
+		if err != nil {
+			return nil, err
+		}
 		lastRec = rec
+		if initialRec == nil && rec != nil && rec.QueueState == "cancelled" {
+			return &GoalExecutionReport{
+				GoalID: goalID, Objective: objective, Succeeded: false, Status: "declined_by_player",
+				TurnsUsed: turns, SubmittedQueues: submitted, FinalContext: lastCtx, FailureReason: "declined_by_player",
+			}, nil
+		}
 		if rec != nil {
 			for _, sr := range rec.StepReceipts {
 				if sr.State == "failed" && sr.StepIndex >= 0 && sr.StepIndex < len(filtered) {

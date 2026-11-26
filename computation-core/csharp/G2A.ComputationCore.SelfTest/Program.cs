@@ -184,6 +184,10 @@ internal static class Program
                 if (deicticHit?.TargetId != "chest_R")
                     throw new Exception("Expected ResolveDeicticTarget to match chest_R");
 
+                var csTools = OpenAICompatibleLlmPlanner.CompileOpenAiTools(coreSdk.GetCachedCapabilities(), pulled);
+                if (csTools.Count != 1 || !(csTools[0]["function"] is Dictionary<string, object?> csFn) || !csFn["name"]!.ToString()!.StartsWith("g2a_act__", StringComparison.Ordinal))
+                    throw new Exception("Expected CompileOpenAiTools to produce context-scoped function tool");
+
                 bool caughtInactive = false;
                 try
                 {

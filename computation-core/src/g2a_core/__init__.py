@@ -31,13 +31,22 @@ from .agent_runtime import (
     AgentGoalState,
     AgentGoalTracker,
     GoalExecutionReport,
+    decompose_compound_objective,
     rank_deictic_candidates,
     resolve_deictic_target,
     resolve_prerequisite_steps,
 )
+from .mcp_bridge import G2AMCPServer, ToolBinding, compile_context_tools, tool_calls_to_plan_decision
 from .relay_server import CloudRelayServer
 from .memory_server import MemoryHTTPClient, MemoryHTTPServer
-from .core_sdk import CognitivePlannerPort, CoreMetrics, CoreSDK, FunctionCognitivePlanner, QueueBuilder
+from .core_sdk import (
+    CognitivePlannerPort,
+    CoreMetrics,
+    CoreSDK,
+    FunctionCognitivePlanner,
+    QueueBuilder,
+    discover_local_hub_manifest,
+)
 from .async_sdk import AsyncCoreSDK, AsyncQueueBuilder
 
 __all__ = [
@@ -73,13 +82,19 @@ __all__ = [
     "QueueBuilder",
     "CoreMetrics",
     "CoreSDK",
+    "discover_local_hub_manifest",
     "AsyncQueueBuilder",
     "AsyncCoreSDK",
     "ActionOutcomeRecord",
     "AgentGoalState",
     "AgentGoalTracker",
     "GoalExecutionReport",
+    "decompose_compound_objective",
     "rank_deictic_candidates",
     "resolve_deictic_target",
     "resolve_prerequisite_steps",
+    "ToolBinding",
+    "compile_context_tools",
+    "tool_calls_to_plan_decision",
+    "G2AMCPServer",
 ]

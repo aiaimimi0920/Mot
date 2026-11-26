@@ -245,6 +245,27 @@ class ActionOutcomeRecord:
         return out
 
 
+def decompose_compound_objective(objective: str) -> List[str]:
+    """
+    Splits multi-clause natural-language instructions (EN/ZH sequential connectors such as
+    '先...再...最后...' / 'first ... then ... finally ...') into ordered sub-objectives.
+    """
+    raw = (objective or "").strip()
+    if not raw:
+        return []
+    parts = re.split(
+        r"(?:；|;|\bthen\b|\band then\b|\bfinally\b|\bafterwards\b|，然后|然后|，再|再去|，接着|接着|，最后|最后)",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    cleaned: List[str] = []
+    for p in parts:
+        s = re.sub(r"^(?:first\s*,?\s*|先)", "", p.strip(), flags=re.IGNORECASE).strip(" ，,。.")
+        if s:
+            cleaned.append(s)
+    return cleaned if cleaned else [raw]
+
+
 @dataclass
 class AgentGoalState:
     goal_id: str
@@ -252,6 +273,8 @@ class AgentGoalState:
     status: str = "in_progress"  # "in_progress" | "awaiting_execution" | "completed" | "blocked" | "exhausted"
     max_turns: int = 6
     turns_used: int = 0
+    subgoals: List[str] = field(default_factory=list)
+    current_subgoal_index: int = 0
     created_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
     submitted_queues: List[str] = field(default_factory=list)
     recent_outcomes: List[ActionOutcomeRecord] = field(default_factory=list)
@@ -303,6 +326,7 @@ class AgentGoalTracker:
                 objective=objective,
                 status="in_progress",
                 max_turns=max(1, max_turns),
+                subgoals=decompose_compound_objective(objective),
             )
             self.active_goal = goal
             return goal

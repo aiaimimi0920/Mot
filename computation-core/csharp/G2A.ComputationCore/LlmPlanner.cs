@@ -212,6 +212,57 @@ public sealed class OpenAICompatibleLlmPlanner : ICognitivePlanner, IDisposable
         return new List<QueueStep> { new(0, methodId, actor, stepArgs) };
     }
 
+    public static List<Dictionary<string, object?>> CompileOpenAiTools(
+        IReadOnlyList<CapabilityEntry> capabilities,
+        ProjectedContext ctx)
+    {
+        static string SafeIdent(string s)
+        {
+            var chars = s.Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray();
+            string cleaned = string.Join("_", new string(chars).Split('_', StringSplitOptions.RemoveEmptyEntries));
+            return string.IsNullOrEmpty(cleaned) ? "op" : cleaned;
+        }
+
+        var capMap = capabilities.ToDictionary(c => c.MethodId, StringComparer.Ordinal);
+        var tools = new List<Dictionary<string, object?>>();
+        foreach (var grant in ctx.ActiveMethods ?? new List<ActiveMethodGrant>())
+        {
+            if (!capMap.TryGetValue(grant.MethodId, out var cap)) continue;
+            string name = $"g2a_act__{SafeIdent(cap.MethodId)}_{SafeIdent(cap.Name)}__{SafeIdent(grant.Actor)}";
+            if (name.Length > 64) name = name[..64];
+
+            var schema = cap.ParamsSchema != null
+                ? new Dictionary<string, object?>(cap.ParamsSchema)
+                : new Dictionary<string, object?> { ["type"] = "object" };
+            schema.TryAdd("type", "object");
+
+            var props = schema.TryGetValue("properties", out var pObj) && pObj is Dictionary<string, object?> existing
+                ? new Dictionary<string, object?>(existing)
+                : new Dictionary<string, object?>();
+            if (grant.Targets.Count > 0)
+            {
+                props["target_id"] = new Dictionary<string, object?>
+                {
+                    ["type"] = "string",
+                    ["enum"] = grant.Targets.Select(t => (object?)t.TargetId).ToList()
+                };
+            }
+            schema["properties"] = props;
+
+            tools.Add(new Dictionary<string, object?>
+            {
+                ["type"] = "function",
+                ["function"] = new Dictionary<string, object?>
+                {
+                    ["name"] = name,
+                    ["description"] = $"[{cap.MethodId} actor={grant.Actor} readiness={grant.Readiness}] {cap.Description}",
+                    ["parameters"] = schema
+                }
+            });
+        }
+        return tools;
+    }
+
     public static bool ValidateObjectSchema(Dictionary<string, object?> args, Dictionary<string, object?>? schema, int depth = 0)
     {
         if (depth > 16) return false;

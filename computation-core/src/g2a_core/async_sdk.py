@@ -385,11 +385,28 @@ class AsyncCoreSDK:
                     steps=filtered,
                 )
                 submitted_tuples = [(s.method_id, s.actor, s.args) for s in filtered]
-                last_receipt = await self.submit_queue_with_standard_recovery(q)
-                if last_receipt is not None:
-                    d.goal_tracker.record_receipt(last_receipt, submitted_tuples, synth_ctx)
-                    if last_receipt.latest_context is not None:
-                        last_ctx = last_receipt.latest_context
+                initial_rec = await self.submit_queue_with_standard_recovery(q)
+                last_receipt = await self.wait_for_queue_terminal(
+                    q.queue_id,
+                    initial_receipt=initial_rec,
+                    submitted_steps=submitted_tuples if (initial_rec is None or initial_rec.queue_state in ("running", "executing")) else None,
+                    submit_ctx=synth_ctx,
+                    timeout_sec=max(0.1, deadline - time.monotonic()),
+                )
+                if last_receipt is not None and last_receipt.queue_state == "cancelled" and initial_rec is None:
+                    return GoalExecutionReport(
+                        goal_id=goal.goal_id,
+                        objective=objective,
+                        succeeded=False,
+                        status="declined_by_player",
+                        turns_used=goal.turns_used,
+                        submitted_queues=list(goal.submitted_queues),
+                        outcomes=list(goal.recent_outcomes),
+                        final_context=last_ctx,
+                        failure_reason="declined_by_player",
+                    )
+                if last_receipt is not None and last_receipt.latest_context is not None:
+                    last_ctx = last_receipt.latest_context
 
                 fresh_after = await _pull_fresh_async()
                 if fresh_after is not None:
@@ -440,6 +457,46 @@ class AsyncCoreSDK:
         finally:
             d._in_execute_goal = False
             d.goal_tracker.clear_goal()
+
+    async def wait_for_queue_terminal(
+        self,
+        queue_id: str,
+        initial_receipt: Optional[QueueReceipt] = None,
+        submitted_steps: Optional[List[Tuple[str, str, Dict[str, Any]]]] = None,
+        submit_ctx: Optional[ProjectedContext] = None,
+        timeout_sec: float = 5.0,
+    ) -> Optional[QueueReceipt]:
+        rec = initial_receipt
+        if rec is not None and rec.queue_state not in ("running", "executing", "awaiting_confirmation"):
+            return rec
+        d = self._sync_delegate
+        end_t = time.monotonic() + timeout_sec
+        while time.monotonic() < end_t and not d.closed:
+            with d._state_lock:
+                ever_held = queue_id in d._confirm_hold_ids
+                was_declined = queue_id in d._declined_queue_ids
+                matched_done = next((r for r in reversed(d.completed_receipts) if r.queue_id == queue_id), None)
+
+            if was_declined:
+                return QueueReceipt(queue_id=queue_id, queue_state="cancelled", step_receipts=[])
+            if matched_done is not None and matched_done.queue_state not in ("running", "executing", "awaiting_confirmation"):
+                return matched_done
+            if initial_receipt is None and not ever_held:
+                return None
+            if ever_held and matched_done is None:
+                await asyncio.sleep(min(0.05, max(0.01, end_t - time.monotonic())))
+                continue
+
+            try:
+                rec = await self.query_queue(queue_id)
+            except G2AError:
+                break
+            if rec is not None and rec.queue_state not in ("running", "executing", "awaiting_confirmation"):
+                if submitted_steps is not None:
+                    d.goal_tracker.record_receipt(rec, submitted_steps, submit_ctx)
+                return rec
+            await asyncio.sleep(min(0.04, max(0.01, end_t - time.monotonic())))
+        return rec
 
     async def _invoke_planner(
         self,
@@ -532,17 +589,24 @@ class AsyncCoreSDK:
             d.metrics.queues_submitted += 1
             res = await asyncio.to_thread(d._post_envelope, "queue.submit", queue.to_dict(), d.session_id)
             receipt = QueueReceipt.from_dict(res)
+            d.goal_tracker.record_receipt(
+                receipt,
+                [(s.method_id, s.actor, s.args) for s in queue.steps],
+                d.latest_context,
+            )
             d._record_receipt(receipt)
             return receipt
         except G2AError as err:
             if err.code == "confirmation_required":
                 resubmit_now = False
                 with d._state_lock:
+                    d._confirm_hold_ids.add(queue.queue_id)
                     if queue.queue_id in d._early_confirmed_queues:
                         d._early_confirmed_queues.pop(queue.queue_id, None)
                         resubmit_now = True
                     elif queue.queue_id in d._early_declined_queues:
                         cd_ms = d._early_declined_queues.pop(queue.queue_id)
+                        d._declined_queue_ids[queue.queue_id] = None
                         fp = jcs_sha256("g2a.fp.v1", [s.to_dict() for s in queue.steps])
                         d.refusal_cooldowns[fp] = int(time.time() * 1000) + cd_ms
                     else:

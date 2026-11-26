@@ -318,6 +318,72 @@ func ResolvePrerequisiteSteps(
 	return []QueueStep{{StepIndex: 0, MethodID: methodID, Actor: actor, Args: args}}
 }
 
+func safeToolIdent(raw string) string {
+	var b strings.Builder
+	lastUnderscore := false
+	for _, r := range raw {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			b.WriteRune(r)
+			lastUnderscore = (r == '_')
+		} else if !lastUnderscore && b.Len() > 0 {
+			b.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+	res := strings.Trim(b.String(), "_")
+	if res == "" {
+		return "op"
+	}
+	return res
+}
+
+// CompileOpenAITools compiles currently granted (method_id, actor) pairs in ctx.ActiveMethods
+// into OpenAI Function-Calling tool schemas with live TargetCandidate target_id enums.
+func CompileOpenAITools(caps []CapabilityEntry, ctx ProjectedContext) []map[string]any {
+	capByID := make(map[string]CapabilityEntry, len(caps))
+	for _, c := range caps {
+		capByID[c.MethodID] = c
+	}
+	tools := make([]map[string]any, 0, len(ctx.ActiveMethods))
+	for _, grant := range ctx.ActiveMethods {
+		capDef, ok := capByID[grant.MethodID]
+		if !ok {
+			continue
+		}
+		tName := fmt.Sprintf("g2a_act__%s_%s__%s", safeToolIdent(capDef.MethodID), safeToolIdent(capDef.Name), safeToolIdent(grant.Actor))
+		if len(tName) > 64 {
+			tName = tName[:64]
+		}
+		schema := map[string]any{"type": "object"}
+		for k, v := range capDef.ParamsSchema {
+			schema[k] = v
+		}
+		props := map[string]any{}
+		if existingProps, ok := schema["properties"].(map[string]any); ok {
+			for k, v := range existingProps {
+				props[k] = v
+			}
+		}
+		if len(grant.Targets) > 0 {
+			cands := make([]string, 0, len(grant.Targets))
+			for _, t := range grant.Targets {
+				cands = append(cands, t.TargetID)
+			}
+			props["target_id"] = map[string]any{"type": "string", "enum": cands}
+		}
+		schema["properties"] = props
+		tools = append(tools, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        tName,
+				"description": fmt.Sprintf("[%s actor=%s readiness=%s] %s", capDef.MethodID, grant.Actor, grant.Readiness, capDef.Description),
+				"parameters":  schema,
+			},
+		})
+	}
+	return tools
+}
+
 func validateSchemaObject(args map[string]any, schema map[string]any, depth int) bool {
 	if depth > 16 {
 		return false

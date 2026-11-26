@@ -37,6 +37,7 @@ class OpenAICompatibleLLMPlanner:
         timeout_sec: float = 15.0,
         fallback_planner: Optional[Any] = None,
         ssl_context: Optional[ssl.SSLContext] = None,
+        use_native_tools: bool = False,
     ) -> None:
         validate_outbound_url_against_ssrf(base_url, allow_loopback=allow_loopback)
         self.base_url = base_url.rstrip("/")
@@ -46,6 +47,7 @@ class OpenAICompatibleLLMPlanner:
         self.timeout_sec = timeout_sec
         self.fallback_planner = fallback_planner
         self.ssl_context = ssl_context
+        self.use_native_tools = use_native_tools
 
         parsed = urllib.parse.urlparse(f"{self.base_url}/chat/completions")
         self._is_https = parsed.scheme == "https"
@@ -210,15 +212,22 @@ class OpenAICompatibleLLMPlanner:
     ) -> PlanDecision:
         cap_by_id = {c.method_id: c for c in capabilities}
         messages = self._build_messages(capabilities, context, recalled_memories, active_goal, recent_outcomes)
-        req_body = json.dumps(
-            {
-                "model": self.model,
-                "temperature": 0.1,
-                "response_format": {"type": "json_object"},
-                "messages": messages,
-            },
-            ensure_ascii=False,
-        ).encode("utf-8")
+        body_obj: Dict[str, Any] = {
+            "model": self.model,
+            "temperature": 0.1,
+            "messages": messages,
+        }
+        bindings = {}
+        if self.use_native_tools:
+            from .mcp_bridge import compile_context_tools
+
+            tools_spec, bindings = compile_context_tools(capabilities, context, fmt="openai", include_meta_tools=True)
+            if tools_spec:
+                body_obj["tools"] = tools_spec
+                body_obj["tool_choice"] = "auto"
+        else:
+            body_obj["response_format"] = {"type": "json_object"}
+        req_body = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
 
         headers = {"Content-Type": "application/json", "Connection": "keep-alive"}
         if self.api_key:
@@ -249,7 +258,12 @@ class OpenAICompatibleLLMPlanner:
                     raise
 
             payload = json.loads(raw_resp.decode("utf-8"))
-            content = payload["choices"][0]["message"]["content"]
+            msg = payload["choices"][0]["message"]
+            if self.use_native_tools and isinstance(msg.get("tool_calls"), list) and msg["tool_calls"]:
+                from .mcp_bridge import tool_calls_to_plan_decision
+
+                return tool_calls_to_plan_decision(msg["tool_calls"], bindings, capabilities, context)
+            content = msg.get("content") or ""
             parsed = parse_strict_json(self._strip_markdown_fences(content))
             if not isinstance(parsed, dict):
                 return PlanDecision()

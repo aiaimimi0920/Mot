@@ -45,8 +45,15 @@ class _TracingPlanner:
         capabilities: List[CapabilityEntry],
         context: ProjectedContext,
         recalled_memories: List[MemoryRecord],
+        active_goal: Any = None,
+        recent_outcomes: Any = None,
     ) -> PlanDecision:
-        decision = self._inner.plan(capabilities, context, recalled_memories)
+        try:
+            decision = self._inner.plan(
+                capabilities, context, recalled_memories, active_goal=active_goal, recent_outcomes=recent_outcomes
+            )
+        except TypeError:
+            decision = self._inner.plan(capabilities, context, recalled_memories)
         entry = {
             "timestamp_ms": int(time.time() * 1000),
             "epoch": context.epoch,
@@ -337,6 +344,27 @@ class LivePlaygroundStack:
                     assert stack_ref._store is not None
                     ok = stack_ref._store.delete_player_record("player-local", str(data.get("memory_id", "")))
                     self._send_json(200, {"deleted": ok})
+                    return
+                if self.path == "/api/goal":
+                    if not stack_ref._sdk or not stack_ref.try_attach_core():
+                        self._send_json(503, {"error": "unavailable", "message": "CoreSDK not yet attached to slot"})
+                        return
+                    rep = stack_ref._sdk.execute_goal(
+                        str(data.get("objective", "")),
+                        max_turns=int(data.get("max_turns", 5)),
+                        timeout_sec=float(data.get("timeout_sec", 8.0)),
+                    )
+                    self._send_json(
+                        200,
+                        {
+                            "goal_id": rep.goal_id,
+                            "succeeded": rep.succeeded,
+                            "status": rep.status,
+                            "turns_used": rep.turns_used,
+                            "submitted_queues": rep.submitted_queues,
+                            "failure_reason": rep.failure_reason,
+                        },
+                    )
                     return
                 self._send_json(404, {"error": "not_found"})
 

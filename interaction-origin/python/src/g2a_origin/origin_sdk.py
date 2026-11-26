@@ -149,7 +149,7 @@ class ImmediateFailed:
 
 @dataclass
 class StartedExecuting:
-    cancel_fn: Callable[[], None]
+    cancel_fn: Callable[[], None] = field(default_factory=lambda: (lambda: None))
 
 
 EffectInvocationResult = Union[ImmediateSucceeded, ImmediateFailed, StartedExecuting]

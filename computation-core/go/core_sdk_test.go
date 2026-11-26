@@ -305,4 +305,26 @@ func TestLiveThreeTierGoCoreWebSocketAndExtensions(t *testing.T) {
 	if len(sanStaged.PlannedSteps) != 0 {
 		t.Fatal("expected SanitizeLLMPlan to reject staged Step-0")
 	}
+
+	compiledTools := CompileOpenAITools(
+		[]CapabilityEntry{{MethodID: "#01", Name: "ping_beacon", Description: "Ping beacon", PermittedActors: []string{"companion"}}},
+		ProjectedContext{
+			SlotID: "s1", Epoch: 1, Rev: 2,
+			ActiveMethods: []ActiveMethodGrant{{
+				MethodID: "#01", Actor: "companion", Readiness: "ready",
+				Targets: []TargetCandidate{{TargetID: "b_right", Label: "Right Beacon", Readiness: "ready"}},
+			}},
+		},
+	)
+	if len(compiledTools) != 1 {
+		t.Fatalf("expected 1 compiled OpenAI tool, got %d", len(compiledTools))
+	}
+	fnSpec, _ := compiledTools[0]["function"].(map[string]any)
+	paramsSpec, _ := fnSpec["parameters"].(map[string]any)
+	propsSpec, _ := paramsSpec["properties"].(map[string]any)
+	tidSpec, _ := propsSpec["target_id"].(map[string]any)
+	tidEnums, _ := tidSpec["enum"].([]string)
+	if len(tidEnums) != 1 || tidEnums[0] != "b_right" {
+		t.Fatalf("expected target_id enum [b_right], got %+v", tidEnums)
+	}
 }

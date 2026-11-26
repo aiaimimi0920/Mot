@@ -254,8 +254,10 @@ class CoreSDK:
         self.slot_digest_index: Dict[str, str] = {}
         self._state_lock = threading.RLock()
         self.pending_confirm_queues: Dict[str, MethodCallQueue] = {}
+        self._confirm_hold_ids: Set[str] = set()
         self._early_confirmed_queues: OrderedDict[str, None] = OrderedDict()
         self._early_declined_queues: OrderedDict[str, int] = OrderedDict()
+        self._declined_queue_ids: OrderedDict[str, None] = OrderedDict()
         self.completed_receipts: List[QueueReceipt] = []
         self.seen_event_ids: OrderedDict[str, None] = OrderedDict()
         self.last_event_id: str = ""
@@ -662,6 +664,58 @@ class CoreSDK:
             self.goal_tracker.clear_goal(status=decision.goal_status)
         return None
 
+    def wait_for_queue_terminal(
+        self,
+        queue_id: str,
+        initial_receipt: Optional[QueueReceipt] = None,
+        submitted_steps: Optional[List[Tuple[str, str, Dict[str, Any]]]] = None,
+        submit_ctx: Optional[ProjectedContext] = None,
+        timeout_sec: float = 5.0,
+    ) -> Optional[QueueReceipt]:
+        """
+        Awaits terminal settlement of a submitted `MethodCallQueue` across:
+          1. Sustained in-flight execution (`queue_state` in `("running", "executing")`) via `queue.query`;
+          2. Player confirmation hold (`pending_confirm_queues`) waking reactively on `queue.confirmed` / `queue.declined`.
+        """
+        rec = initial_receipt
+        if rec is not None and rec.queue_state not in ("running", "executing", "awaiting_confirmation"):
+            return rec
+
+        end_t = time.monotonic() + timeout_sec
+        while time.monotonic() < end_t and not self.closed:
+            with self._state_lock:
+                ever_held = queue_id in self._confirm_hold_ids
+                was_declined = queue_id in self._declined_queue_ids
+                matched_done = next((r for r in reversed(self.completed_receipts) if r.queue_id == queue_id), None)
+
+            if was_declined:
+                return QueueReceipt(queue_id=queue_id, queue_state="cancelled", step_receipts=[])
+
+            if matched_done is not None and matched_done.queue_state not in ("running", "executing", "awaiting_confirmation"):
+                return matched_done
+
+            if initial_receipt is None and not ever_held:
+                return None
+
+            if ever_held and matched_done is None:
+                self._goal_wakeup.clear()
+                self._goal_wakeup.wait(timeout=min(0.06, max(0.01, end_t - time.monotonic())))
+                continue
+
+            try:
+                rec = self.query_queue(queue_id)
+            except G2AError:
+                break
+
+            if rec is not None and rec.queue_state not in ("running", "executing", "awaiting_confirmation"):
+                if submitted_steps is not None:
+                    self.goal_tracker.record_receipt(rec, submitted_steps, submit_ctx)
+                return rec
+
+            self._goal_wakeup.clear()
+            self._goal_wakeup.wait(timeout=min(0.05, max(0.01, end_t - time.monotonic())))
+        return rec
+
     def execute_goal(
         self,
         objective: str,
@@ -808,7 +862,27 @@ class CoreSDK:
                     intent_summary=decision.intent_summary or objective,
                     steps=filtered_steps,
                 )
-                last_receipt = self.submit_queue_with_standard_recovery(queue, _submit_ctx=synth_ctx)
+                submitted_tuples = [(s.method_id, s.actor, s.args) for s in filtered_steps]
+                initial_rec = self.submit_queue_with_standard_recovery(queue, _submit_ctx=synth_ctx)
+                last_receipt = self.wait_for_queue_terminal(
+                    queue.queue_id,
+                    initial_receipt=initial_rec,
+                    submitted_steps=submitted_tuples if (initial_rec is None or initial_rec.queue_state in ("running", "executing")) else None,
+                    submit_ctx=synth_ctx,
+                    timeout_sec=max(0.1, deadline - time.monotonic()),
+                )
+                if last_receipt is not None and last_receipt.queue_state == "cancelled" and initial_rec is None:
+                    return GoalExecutionReport(
+                        goal_id=goal.goal_id,
+                        objective=objective,
+                        succeeded=False,
+                        status="declined_by_player",
+                        turns_used=goal.turns_used,
+                        submitted_queues=list(goal.submitted_queues),
+                        outcomes=list(goal.recent_outcomes),
+                        final_context=last_ctx,
+                        failure_reason="declined_by_player",
+                    )
                 if last_receipt is not None and last_receipt.latest_context is not None:
                     last_ctx = last_receipt.latest_context
 
@@ -898,13 +972,16 @@ class CoreSDK:
                 # Reconcile atomically in case SSE/WS delivered queue.confirmed or queue.declined before HTTP 409 arrived!
                 resubmit_now = False
                 with self._state_lock:
+                    self._confirm_hold_ids.add(queue.queue_id)
                     if queue.queue_id in self._early_confirmed_queues:
                         self._early_confirmed_queues.pop(queue.queue_id, None)
                         resubmit_now = True
                     elif queue.queue_id in self._early_declined_queues:
                         cd_ms = self._early_declined_queues.pop(queue.queue_id)
+                        self._declined_queue_ids[queue.queue_id] = None
                         fp = jcs_sha256("g2a.fp.v1", [s.to_dict() for s in queue.steps])
                         self.refusal_cooldowns[fp] = int(time.time() * 1000) + cd_ms
+                        self._goal_wakeup.set()
                     else:
                         self.pending_confirm_queues[queue.queue_id] = queue
                 if resubmit_now:
@@ -936,11 +1013,16 @@ class CoreSDK:
                 if len(self._early_confirmed_queues) > 256:
                     self._early_confirmed_queues.popitem(last=False)
         if original is not None:
-            return self.submit_queue_with_standard_recovery(original)
+            rec = self.submit_queue_with_standard_recovery(original)
+            self._goal_wakeup.set()
+            return rec
         return None
 
     def on_event_queue_declined(self, queue_id: str, cooldown_ms: int = 60000) -> None:
         with self._state_lock:
+            self._declined_queue_ids[queue_id] = None
+            if len(self._declined_queue_ids) > 256:
+                self._declined_queue_ids.popitem(last=False)
             declined = self.pending_confirm_queues.pop(queue_id, None)
             if declined is not None:
                 fp = jcs_sha256("g2a.fp.v1", [s.to_dict() for s in declined.steps])
@@ -949,6 +1031,7 @@ class CoreSDK:
                 self._early_declined_queues[queue_id] = cooldown_ms
                 if len(self._early_declined_queues) > 256:
                     self._early_declined_queues.popitem(last=False)
+        self._goal_wakeup.set()
 
     def reconcile_unknown_queue(self, queue_id: str) -> Optional[QueueReceipt]:
         if not self.session_id or self.closed:
