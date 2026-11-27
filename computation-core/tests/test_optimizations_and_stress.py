@@ -2094,6 +2094,7 @@ class TestOptimizationsAndStress(unittest.TestCase):
         from g2a_origin import (
             ActiveMethodGrant as OrigGrant,
             CapabilityEntry as OrigCap,
+            G2AOriginError,
             ImmediateSucceeded,
             LoopbackHTTPTransportClient,
             OriginSDK,
@@ -2242,7 +2243,7 @@ class TestOptimizationsAndStress(unittest.TestCase):
 
                     # Settle sustained step while Hub is OFFLINE -> OriginSDK rolls back rev & preserves settled_executions!
                     gate_state["lever"] = "locked_down"
-                    with self.assertRaises(Exception):
+                    with self.assertRaises(G2AOriginError):
                         held_token["tok"].complete_succeeded({"lever": "locked_down"})
 
                     # Restart a brand-new Hub process with an empty ledger (ephemeral SlotView lost)!
@@ -2290,6 +2291,188 @@ class TestOptimizationsAndStress(unittest.TestCase):
                                 proc.stderr.close()
         finally:
             relay.stop()
+
+    def test_sdk_ergonomics_schema_builder_invoke_capability_and_async_parity(self) -> None:
+        import asyncio
+        from g2a_core import AsyncCoreSDK, CoreSDK, G2AError
+        from g2a_origin import (
+            ActiveMethodGrant as OrigGrant,
+            CapabilityEntry as OrigCap,
+            ImmediateSucceeded,
+            OriginSDK,
+            SchemaBuilder,
+            StartedExecuting,
+            StepExecutionToken,
+            TargetCandidate as OrigTarget,
+        )
+
+        hub_bin = resolve_hub_binary(ROOT_DIR)
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_path = os.path.join(tmp, "w23_runtime.json")
+            ledger_path = os.path.join(tmp, "w23_ledger.json")
+            hub_proc = subprocess.Popen(
+                [
+                    hub_bin,
+                    "-origin-addr", "127.0.0.1:0",
+                    "-core-addr", "127.0.0.1:0",
+                    "-consent-addr", "127.0.0.1:0",
+                    "-ledger", ledger_path,
+                    "-runtime-file", runtime_path,
+                    "-auto-approve-scope",
+                    "-print-ports-json",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert hub_proc.stdout is not None
+                _ = json.loads(hub_proc.stdout.readline().strip())
+                deadline = time.time() + 3.0
+                while time.time() < deadline and not os.path.exists(runtime_path):
+                    time.sleep(0.02)
+
+                world: dict[str, object] = {"near": "", "opened": ""}
+
+                def _setup_origin(orig: OriginSDK) -> None:
+                    move_schema = SchemaBuilder.object().string("target_id", required=True).build()
+                    vault_schema = (
+                        SchemaBuilder.object()
+                        .string("target_id", required=True)
+                        .string_enum("mode", ["careful", "fast"], required=True)
+                        .integer("torque", required=False, minimum=1, maximum=100)
+                        .build()
+                    )
+
+                    def _move_effect(_a, _s, args, tok: StepExecutionToken):
+                        target = str(args["target_id"])
+
+                        def _finish() -> None:
+                            time.sleep(0.03)
+                            world["near"] = target
+                            orig.notify_module_changed("vaults", significant_event=True)
+                            tok.complete_succeeded({"arrived": target})
+
+                        threading.Thread(target=_finish, daemon=True).start()
+                        return StartedExecuting()
+
+                    def _unlock_effect(_a, _s, args, _tok: StepExecutionToken):
+                        world["opened"] = f"{args['target_id']}:{args['mode']}"
+                        return ImmediateSucceeded({"opened": world["opened"]})
+
+                    orig.register_capability(
+                        OrigCap("#01", "move_to", "Approach target", ["companion"], move_schema, sustained=True),
+                        effect_handler=_move_effect,
+                    )
+                    orig.register_capability(
+                        OrigCap("#02", "unlock_vault", "Unlock vault", ["companion"], vault_schema),
+                        effect_handler=_unlock_effect,
+                    )
+                    orig.bind_state_module(
+                        "vaults",
+                        lambda: dict(world),
+                        lambda: [
+                            OrigGrant(
+                                "#01",
+                                "companion",
+                                "ready",
+                                [
+                                    OrigTarget("vault_left", "Left Vault", "ready", player_anchor="left 4.0m"),
+                                    OrigTarget("vault_right", "Right Vault", "ready", player_anchor="right 3.5m"),
+                                ],
+                            ),
+                            OrigGrant(
+                                "#02",
+                                "companion",
+                                "ready" if world["near"] else "staged",
+                                [
+                                    OrigTarget(
+                                        "vault_left",
+                                        "Left Vault",
+                                        "ready" if world["near"] == "vault_left" else "staged",
+                                        prerequisite_hint=None if world["near"] == "vault_left" else "requires_proximity",
+                                        player_anchor="left 4.0m",
+                                    ),
+                                    OrigTarget(
+                                        "vault_right",
+                                        "Right Vault",
+                                        "ready" if world["near"] == "vault_right" else "staged",
+                                        prerequisite_hint=None if world["near"] == "vault_right" else "requires_proximity",
+                                        player_anchor="right 3.5m",
+                                    ),
+                                ],
+                            ),
+                        ],
+                    )
+
+                pushed_revs: list[int] = []
+                cap_updates: list[int] = []
+                with OriginSDK.connect_quick(slot_id="slot-w23-sdk", runtime_file=runtime_path, setup_fn=_setup_origin) as orig_sdk:
+                    with CoreSDK.connect_quick(slot_id="slot-w23-sdk", auth_token="core-w23-sync", runtime_file=runtime_path) as core_sdk:
+                        core_sdk.on_context_callback = lambda c: pushed_revs.append(c.rev)
+                        core_sdk.on_capabilities_updated_callback = lambda caps: cap_updates.append(len(caps))
+
+                        # 1. SchemaBuilder enum validation pre-flight rejection via invoke_capability!
+                        with self.assertRaises(G2AError) as e_bad:
+                            core_sdk.invoke_capability("unlock_vault", {"mode": "explosive"}, deictic_hint="右边的宝库")
+                        self.assertEqual(e_bad.exception.code, "invalid_arguments")
+
+                        # 2. One-line invoke_capability by name + bilingual deictic_hint + staged sustained unrolling + terminal wait!
+                        rec = core_sdk.invoke_capability(
+                            "unlock_vault",
+                            {"mode": "careful", "torque": 42},
+                            deictic_hint="去开右边的宝库",
+                            trigger="player_command",
+                            timeout_sec=5.0,
+                        )
+                        self.assertIsNotNone(rec)
+                        assert rec is not None
+                        self.assertEqual(rec.queue_state, "completed")
+                        self.assertEqual(world["near"], "vault_right")
+                        self.assertEqual(world["opened"], "vault_right:careful")
+                        end_p = time.time() + 2.0
+                        while time.time() < end_p and not pushed_revs:
+                            time.sleep(0.02)
+                        self.assertGreaterEqual(len(pushed_revs), 1)
+
+                        # 3. Verify on_capabilities_updated_callback fires on live Origin republish!
+                        orig_sdk.register_capability(
+                            OrigCap("#03", "inspect_seal", "Inspect seal", ["companion"], SchemaBuilder.object().build()),
+                            effect_handler=lambda _a, _s, _args, _t: ImmediateSucceeded({"inspected": True}),
+                        )
+                        orig_sdk.publish_capabilities_and_baseline()
+                        end_c = time.time() + 3.0
+                        while time.time() < end_c and not cap_updates:
+                            time.sleep(0.03)
+                        self.assertEqual(cap_updates, [3])
+
+                    # 4. AsyncCoreSDK.invoke_capability one-line async parity on staged left vault!
+                    async def _test_async_invoke() -> None:
+                        async with await AsyncCoreSDK.connect_quick(
+                            slot_id="slot-w23-sdk",
+                            auth_token="core-w23-async",
+                            runtime_file=runtime_path,
+                        ) as async_core:
+                            rec_async = await async_core.invoke_capability(
+                                "unlock_vault",
+                                {"mode": "fast"},
+                                deictic_hint="open the left vault",
+                                trigger="player_command",
+                                timeout_sec=5.0,
+                            )
+                            self.assertIsNotNone(rec_async)
+                            assert rec_async is not None
+                            self.assertEqual(rec_async.queue_state, "completed")
+                            self.assertEqual(world["opened"], "vault_left:fast")
+
+                    asyncio.run(_test_async_invoke())
+            finally:
+                hub_proc.terminate()
+                hub_proc.wait(timeout=3)
+                if hub_proc.stdout:
+                    hub_proc.stdout.close()
+                if hub_proc.stderr:
+                    hub_proc.stderr.close()
 
 
 if __name__ == "__main__":

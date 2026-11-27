@@ -214,7 +214,12 @@ public sealed class OpenAICompatibleLlmPlanner : ICognitivePlanner, IDisposable
 
     public static List<Dictionary<string, object?>> CompileOpenAiTools(
         IReadOnlyList<CapabilityEntry> capabilities,
-        ProjectedContext ctx)
+        ProjectedContext ctx) => CompileContextTools(capabilities, ctx, "openai");
+
+    public static List<Dictionary<string, object?>> CompileContextTools(
+        IReadOnlyList<CapabilityEntry> capabilities,
+        ProjectedContext ctx,
+        string provider = "openai")
     {
         static string SafeIdent(string s)
         {
@@ -225,6 +230,7 @@ public sealed class OpenAICompatibleLlmPlanner : ICognitivePlanner, IDisposable
 
         var capMap = capabilities.ToDictionary(c => c.MethodId, StringComparer.Ordinal);
         var tools = new List<Dictionary<string, object?>>();
+        string fmt = (provider ?? "openai").ToLowerInvariant();
         foreach (var grant in ctx.ActiveMethods ?? new List<ActiveMethodGrant>())
         {
             if (!capMap.TryGetValue(grant.MethodId, out var cap)) continue;
@@ -248,17 +254,29 @@ public sealed class OpenAICompatibleLlmPlanner : ICognitivePlanner, IDisposable
                 };
             }
             schema["properties"] = props;
+            string desc = $"[{cap.MethodId} actor={grant.Actor} readiness={grant.Readiness}] {cap.Description}";
 
-            tools.Add(new Dictionary<string, object?>
+            if (fmt == "anthropic")
             {
-                ["type"] = "function",
-                ["function"] = new Dictionary<string, object?>
+                tools.Add(new Dictionary<string, object?> { ["name"] = name, ["description"] = desc, ["input_schema"] = schema });
+            }
+            else if (fmt == "mcp")
+            {
+                tools.Add(new Dictionary<string, object?> { ["name"] = name, ["description"] = desc, ["inputSchema"] = schema });
+            }
+            else
+            {
+                tools.Add(new Dictionary<string, object?>
                 {
-                    ["name"] = name,
-                    ["description"] = $"[{cap.MethodId} actor={grant.Actor} readiness={grant.Readiness}] {cap.Description}",
-                    ["parameters"] = schema
-                }
-            });
+                    ["type"] = "function",
+                    ["function"] = new Dictionary<string, object?>
+                    {
+                        ["name"] = name,
+                        ["description"] = desc,
+                        ["parameters"] = schema
+                    }
+                });
+            }
         }
         return tools;
     }

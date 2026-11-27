@@ -340,6 +340,14 @@ func safeToolIdent(raw string) string {
 // CompileOpenAITools compiles currently granted (method_id, actor) pairs in ctx.ActiveMethods
 // into OpenAI Function-Calling tool schemas with live TargetCandidate target_id enums.
 func CompileOpenAITools(caps []CapabilityEntry, ctx ProjectedContext) []map[string]any {
+	return CompileContextTools(caps, ctx, "openai")
+}
+
+// CompileContextTools compiles active G2A grants into "openai", "anthropic", or "mcp" native tool schemas.
+func CompileContextTools(caps []CapabilityEntry, ctx ProjectedContext, provider string) []map[string]any {
+	if provider == "" {
+		provider = "openai"
+	}
 	capByID := make(map[string]CapabilityEntry, len(caps))
 	for _, c := range caps {
 		capByID[c.MethodID] = c
@@ -372,16 +380,104 @@ func CompileOpenAITools(caps []CapabilityEntry, ctx ProjectedContext) []map[stri
 			props["target_id"] = map[string]any{"type": "string", "enum": cands}
 		}
 		schema["properties"] = props
-		tools = append(tools, map[string]any{
-			"type": "function",
-			"function": map[string]any{
+		desc := fmt.Sprintf("[%s actor=%s readiness=%s] %s", capDef.MethodID, grant.Actor, grant.Readiness, capDef.Description)
+		switch strings.ToLower(provider) {
+		case "anthropic":
+			tools = append(tools, map[string]any{
+				"name":         tName,
+				"description":  desc,
+				"input_schema": schema,
+			})
+		case "mcp":
+			tools = append(tools, map[string]any{
 				"name":        tName,
-				"description": fmt.Sprintf("[%s actor=%s readiness=%s] %s", capDef.MethodID, grant.Actor, grant.Readiness, capDef.Description),
-				"parameters":  schema,
-			},
-		})
+				"description": desc,
+				"inputSchema": schema,
+			})
+		default:
+			tools = append(tools, map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":        tName,
+					"description": desc,
+					"parameters":  schema,
+				},
+			})
+		}
 	}
 	return tools
+}
+
+// ToolCallsToPlanDecision decodes native LLM tool_calls / tool_use blocks back into a validated G2A PlanDecision,
+// automatically unrolling staged spatial prerequisites.
+func ToolCallsToPlanDecision(toolCalls []map[string]any, caps []CapabilityEntry, ctx ProjectedContext, intentSummary string) PlanDecision {
+	capByID := make(map[string]CapabilityEntry, len(caps))
+	for _, c := range caps {
+		capByID[c.MethodID] = c
+	}
+	lookup := make(map[string][2]string, len(ctx.ActiveMethods))
+	for _, grant := range ctx.ActiveMethods {
+		capDef, ok := capByID[grant.MethodID]
+		if !ok {
+			continue
+		}
+		tName := fmt.Sprintf("g2a_act__%s_%s__%s", safeToolIdent(capDef.MethodID), safeToolIdent(capDef.Name), safeToolIdent(grant.Actor))
+		if len(tName) > 64 {
+			tName = tName[:64]
+		}
+		lookup[tName] = [2]string{grant.MethodID, grant.Actor}
+	}
+
+	var steps []QueueStep
+	for _, tc := range toolCalls {
+		var name string
+		var args map[string]any
+		if fnMap, ok := tc["function"].(map[string]any); ok {
+			name, _ = fnMap["name"].(string)
+			switch rawA := fnMap["arguments"].(type) {
+			case string:
+				_ = UnmarshalStrict([]byte(rawA), &args)
+			case map[string]any:
+				args = rawA
+			}
+		} else {
+			name, _ = tc["name"].(string)
+			if inp, ok := tc["input"].(map[string]any); ok {
+				args = inp
+			} else if argM, ok := tc["arguments"].(map[string]any); ok {
+				args = argM
+			}
+		}
+		pair, found := lookup[name]
+		if !found {
+			continue
+		}
+		if args == nil {
+			args = map[string]any{}
+		}
+		chain := ResolvePrerequisiteSteps(pair[0], pair[1], args, ctx, caps)
+		for _, st := range chain {
+			steps = append(steps, QueueStep{
+				StepIndex: len(steps),
+				MethodID:  st.MethodID,
+				Actor:     st.Actor,
+				Args:      st.Args,
+			})
+		}
+	}
+	if intentSummary == "" {
+		intentSummary = "Execute native tool calls"
+	}
+	return SanitizeLLMPlan(map[string]any{
+		"intent_summary": intentSummary,
+		"steps": func() []any {
+			out := make([]any, 0, len(steps))
+			for _, s := range steps {
+				out = append(out, map[string]any{"method_id": s.MethodID, "actor": s.Actor, "args": s.Args})
+			}
+			return out
+		}(),
+	}, capByID, ctx)
 }
 
 func validateSchemaObject(args map[string]any, schema map[string]any, depth int) bool {

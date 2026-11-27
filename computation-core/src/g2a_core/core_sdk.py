@@ -216,6 +216,11 @@ class QueueBuilder:
     def submit(self, queue_id: Optional[str] = None) -> Optional[QueueReceipt]:
         return self._sdk.submit_queue_with_standard_recovery(self.build(queue_id=queue_id))
 
+    def submit_and_wait(self, queue_id: Optional[str] = None, timeout_sec: float = 15.0) -> Optional[QueueReceipt]:
+        q = self.build(queue_id=queue_id)
+        initial = self._sdk.submit_queue_with_standard_recovery(q, _submit_ctx=self._ctx)
+        return self._sdk.wait_for_queue_terminal(q.queue_id, initial_receipt=initial, timeout_sec=timeout_sec)
+
 
 @dataclass
 class CoreMetrics:
@@ -288,6 +293,9 @@ class CoreSDK:
         self._hb_thread: Optional[threading.Thread] = None
         self._sse_thread: Optional[threading.Thread] = None
         self.on_receipt_callback: Optional[Callable[[QueueReceipt], None]] = None
+        self.on_context_callback: Optional[Callable[[ProjectedContext], None]] = None
+        self.on_capabilities_updated_callback: Optional[Callable[[List[CapabilityEntry]], None]] = None
+        self.on_session_closed_callback: Optional[Callable[[], None]] = None
         self.metrics = CoreMetrics()
         self.goal_tracker = AgentGoalTracker()
 
@@ -421,6 +429,89 @@ class CoreSDK:
         if ctx is None:
             ctx = self.pull_context()
         return QueueBuilder(self, ctx, intent_summary=intent_summary, trigger=trigger, supersedes=supersedes)
+
+    def invoke_capability(
+        self,
+        method_id_or_name: str,
+        args: Optional[Dict[str, Any]] = None,
+        *,
+        actor: Optional[str] = None,
+        deictic_hint: Optional[str] = None,
+        intent_summary: Optional[str] = None,
+        trigger: Optional[str] = None,
+        auto_prerequisites: bool = True,
+        wait_terminal: bool = True,
+        timeout_sec: float = 15.0,
+    ) -> Optional[QueueReceipt]:
+        """
+        One-line imperative capability invocation:
+          - Resolves either `method_id` ("#02") or human-readable `name` ("unlock_chest");
+          - Auto-selects permitted active `actor` (preferring "companion") if omitted;
+          - Optionally resolves `args["target_id"]` via bilingual `deictic_hint` ("右边的宝箱");
+          - Auto-unrolls `"staged"` spatial prerequisites and awaits terminal settlement.
+        """
+        from .agent_runtime import resolve_deictic_target
+
+        ctx = self.pull_context_if_due() or self.latest_context
+        if ctx is None:
+            ctx = self.pull_context()
+
+        for attempt in range(2):
+            caps = self.get_cached_capabilities(ctx.slot_id)
+            resolved_mid = method_id_or_name
+            matched_cap = next((c for c in caps if c.method_id == method_id_or_name), None)
+            if matched_cap is None:
+                lowered = method_id_or_name.strip().lower()
+                matched_cap = next((c for c in caps if c.name.lower() == lowered), None)
+                if matched_cap is not None:
+                    resolved_mid = matched_cap.method_id
+
+            allowed_actors: Optional[List[str]] = None
+            if self.scope is not None and resolved_mid in self.scope.permitted_methods:
+                allowed_actors = self.scope.permitted_methods[resolved_mid]
+
+            resolved_actor = actor
+            if not resolved_actor:
+                matching_grants = [
+                    g
+                    for g in ctx.active_methods
+                    if g.method_id == resolved_mid and (allowed_actors is None or g.actor in allowed_actors)
+                ]
+                if any(g.actor == "companion" for g in matching_grants):
+                    resolved_actor = "companion"
+                elif matching_grants:
+                    resolved_actor = matching_grants[0].actor
+                elif allowed_actors:
+                    resolved_actor = "companion" if "companion" in allowed_actors else allowed_actors[0]
+                else:
+                    resolved_actor = "companion"
+
+            step_args = dict(args or {})
+            if deictic_hint and "target_id" not in step_args:
+                grant = next((g for g in ctx.active_methods if g.method_id == resolved_mid and g.actor == resolved_actor), None)
+                if grant is not None and grant.targets:
+                    cand = resolve_deictic_target(deictic_hint, grant.targets)
+                    if cand is not None:
+                        step_args["target_id"] = cand.target_id
+
+            summary = intent_summary or f"Invoke {matched_cap.name if matched_cap else resolved_mid}"
+            builder = self.build_queue(ctx, intent_summary=summary, trigger=trigger)
+            if auto_prerequisites:
+                builder.add_step_auto(resolved_mid, resolved_actor, step_args)
+            else:
+                builder.add_step(resolved_mid, resolved_actor, step_args)
+            res = builder.submit_and_wait(timeout_sec=timeout_sec) if wait_terminal else builder.submit()
+            if res is not None:
+                return res
+            if (
+                attempt == 0
+                and self.latest_context is not None
+                and (self.latest_context.epoch > ctx.epoch or self.latest_context.rev > ctx.rev)
+            ):
+                ctx = self.latest_context
+                continue
+            return None
+        return None
 
     def __enter__(self) -> "CoreSDK":
         return self
@@ -1069,7 +1160,10 @@ class CoreSDK:
         payload = env.get("payload") or {}
         if ev_name == "context.push" and isinstance(payload, dict):
             self.next_allowed_pull_ms = 0
-            self.on_context_received(ProjectedContext.from_dict(payload))
+            pushed_ctx = ProjectedContext.from_dict(payload)
+            if self.on_context_callback is not None:
+                self.on_context_callback(pushed_ctx)
+            self.on_context_received(pushed_ctx)
         elif ev_name == "capabilities.updated" and isinstance(payload, dict):
             cap_digest = payload.get("capability_table_digest")
             raw_table = payload.get("capability_table")
@@ -1102,6 +1196,8 @@ class CoreSDK:
                                 if kept:
                                     narrowed[mid] = kept
                             self.scope.permitted_methods = narrowed
+                    if self.on_capabilities_updated_callback is not None:
+                        self.on_capabilities_updated_callback(caps_sorted)
         elif ev_name == "queue.confirmed" and isinstance(payload, dict):
             qid = payload.get("queue_id")
             if isinstance(qid, str):
@@ -1114,6 +1210,8 @@ class CoreSDK:
             self.on_event_session_resumed(ProjectedContext.from_dict(payload))
         elif ev_name == "session.closed":
             self.shutdown_session_cleanly(notify_hub=False)
+            if self.on_session_closed_callback is not None:
+                self.on_session_closed_callback()
         self._goal_wakeup.set()
 
     # --- Transport Internals ---

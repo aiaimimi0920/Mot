@@ -370,7 +370,7 @@ public sealed class OriginSdk
                     shouldSync = true;
                     return failRep;
                 case EffectInvocationResult.StartedExecuting exec:
-                    _inFlightSteps[req.ExecutionId] = exec.CancelFn;
+                    _inFlightSteps[req.ExecutionId] = exec.CancelFn ?? (() => { });
                     var execRep = new OriginExecuteReply(req.ExecutionId, "executing");
                     StoreLedgerReply(execRep);
                     return execRep;
@@ -403,6 +403,11 @@ public sealed class OriginSdk
     {
         CompleteStepsBatch(new[] { (executionId, succeeded, summary, reason) });
     }
+
+    public bool IsStepInFlight(string executionId) =>
+        _dispatcher.RunOnGameThread(() => _inFlightSteps.ContainsKey(executionId));
+
+    public StepExecutionToken CreateStepToken(string executionId) => new(this, executionId);
 
     public int CompleteStepsBatch(
         IEnumerable<(string ExecutionId, bool Succeeded, Dictionary<string, object?>? Summary, string? Reason)> settlements)
@@ -721,4 +726,105 @@ public sealed class OriginSdk
         if (TryGetDouble(spec, "exclusiveMaximum", out double exMax) && val >= exMax)
             throw new G2AOriginException("invalid_arguments", 400, $"Argument '{name}' must be below exclusiveMaximum");
     }
+}
+
+public sealed class StepExecutionToken
+{
+    private readonly OriginSdk _sdk;
+    public string ExecutionId { get; }
+
+    internal StepExecutionToken(OriginSdk sdk, string executionId)
+    {
+        _sdk = sdk;
+        ExecutionId = executionId;
+    }
+
+    public bool IsInFlight => _sdk.IsStepInFlight(ExecutionId);
+
+    public void CompleteSucceeded(Dictionary<string, object?>? summary = null) =>
+        _sdk.CompleteStep(ExecutionId, true, summary, null);
+
+    public void CompleteFailed(string reason) =>
+        _sdk.CompleteStep(ExecutionId, false, null, reason);
+}
+
+public sealed class SchemaBuilder
+{
+    private readonly Dictionary<string, object?> _properties = new(StringComparer.Ordinal);
+    private readonly List<string> _required = new();
+    private bool _allowAdditional;
+
+    public SchemaBuilder(bool allowAdditional = false) => _allowAdditional = allowAdditional;
+
+    public static SchemaBuilder Object(bool allowAdditional = false) => new(allowAdditional);
+
+    private SchemaBuilder AddProp(string name, Dictionary<string, object?> spec, bool required)
+    {
+        _properties[name] = spec;
+        if (required && !_required.Contains(name)) _required.Add(name);
+        return this;
+    }
+
+    public SchemaBuilder StringField(string name, bool required = true, int? minLength = null, int? maxLength = null)
+    {
+        var spec = new Dictionary<string, object?> { ["type"] = "string" };
+        if (minLength.HasValue) spec["minLength"] = minLength.Value;
+        if (maxLength.HasValue) spec["maxLength"] = maxLength.Value;
+        return AddProp(name, spec, required);
+    }
+
+    public SchemaBuilder StringEnum(string name, IEnumerable<string> values, bool required = true) =>
+        AddProp(name, new Dictionary<string, object?>
+        {
+            ["type"] = "string",
+            ["enum"] = values.Select(v => (object?)v).ToList()
+        }, required);
+
+    public SchemaBuilder IntegerField(string name, bool required = true, long? minimum = null, long? maximum = null)
+    {
+        var spec = new Dictionary<string, object?> { ["type"] = "integer" };
+        if (minimum.HasValue) spec["minimum"] = minimum.Value;
+        if (maximum.HasValue) spec["maximum"] = maximum.Value;
+        return AddProp(name, spec, required);
+    }
+
+    public SchemaBuilder NumberField(string name, bool required = true, double? minimum = null, double? maximum = null)
+    {
+        var spec = new Dictionary<string, object?> { ["type"] = "number" };
+        if (minimum.HasValue) spec["minimum"] = minimum.Value;
+        if (maximum.HasValue) spec["maximum"] = maximum.Value;
+        return AddProp(name, spec, required);
+    }
+
+    public SchemaBuilder BooleanField(string name, bool required = false) =>
+        AddProp(name, new Dictionary<string, object?> { ["type"] = "boolean" }, required);
+
+    public SchemaBuilder StringArray(string name, bool required = false, int? minItems = null, int? maxItems = null)
+    {
+        var spec = new Dictionary<string, object?>
+        {
+            ["type"] = "array",
+            ["items"] = new Dictionary<string, object?> { ["type"] = "string" }
+        };
+        if (minItems.HasValue) spec["minItems"] = minItems.Value;
+        if (maxItems.HasValue) spec["maxItems"] = maxItems.Value;
+        return AddProp(name, spec, required);
+    }
+
+    public SchemaBuilder ObjectField(string name, Dictionary<string, object?> childSchema, bool required = false) =>
+        AddProp(name, new Dictionary<string, object?>(childSchema), required);
+
+    public SchemaBuilder AllowAdditional(bool allow = true)
+    {
+        _allowAdditional = allow;
+        return this;
+    }
+
+    public Dictionary<string, object?> Build() => new()
+    {
+        ["type"] = "object",
+        ["required"] = _required.Select(r => (object?)r).ToList(),
+        ["additionalProperties"] = _allowAdditional,
+        ["properties"] = new Dictionary<string, object?>(_properties)
+    };
 }

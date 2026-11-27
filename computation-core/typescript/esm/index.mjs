@@ -496,6 +496,10 @@ export function resolvePrerequisiteSteps(methodId, actor, args = {}, ctx, capabi
 }
 
 export function compileOpenAiTools(capabilities = [], ctx) {
+  return compileContextTools(capabilities, ctx, "openai");
+}
+
+export function compileContextTools(capabilities = [], ctx, provider = "openai") {
   const safeIdent = (raw) => String(raw ?? "").trim().replace(/[^a-zA-Z0-9_]+/g, "_").replace(/^_+|_+$/g, "") || "op";
   const capMap = new Map(capabilities.map((c) => [c.method_id, c]));
   const tools = [];
@@ -510,16 +514,39 @@ export function compileOpenAiTools(capabilities = [], ctx) {
       props.target_id = { ...(props.target_id ?? {}), type: "string", enum: grant.targets.map((t) => t.target_id) };
     }
     schema.properties = props;
-    tools.push({
-      type: "function",
-      function: {
-        name,
-        description: `[${cap.method_id} actor=${grant.actor} readiness=${grant.readiness}] ${cap.description}`,
-        parameters: schema,
-      },
-    });
+    const description = `[${cap.method_id} actor=${grant.actor} readiness=${grant.readiness}] ${cap.description}`;
+    if (provider === "anthropic") tools.push({ name, description, input_schema: schema });
+    else if (provider === "mcp") tools.push({ name, description, inputSchema: schema });
+    else tools.push({ type: "function", function: { name, description, parameters: schema } });
   }
   return tools;
+}
+
+export function toolCallsToPlanDecision(toolCalls = [], capabilities = [], ctx, intentSummary = "Execute native tool calls") {
+  const safeIdent = (raw) => String(raw ?? "").trim().replace(/[^a-zA-Z0-9_]+/g, "_").replace(/^_+|_+$/g, "") || "op";
+  const capMap = new Map(capabilities.map((c) => [c.method_id, c]));
+  const lookup = new Map();
+  for (const grant of ctx?.active_methods ?? []) {
+    const cap = capMap.get(grant.method_id);
+    if (!cap) continue;
+    const name = `g2a_act__${safeIdent(cap.method_id)}_${safeIdent(cap.name)}__${safeIdent(grant.actor)}`.slice(0, 64);
+    lookup.set(name, { methodId: grant.method_id, actor: grant.actor });
+  }
+  const rawSteps = [];
+  for (const tc of toolCalls ?? []) {
+    const fn = tc?.function;
+    const name = typeof fn?.name === "string" ? fn.name : typeof tc?.name === "string" ? tc.name : "";
+    const bound = lookup.get(name);
+    if (!bound) continue;
+    let args = {};
+    if (typeof fn?.arguments === "string") args = parseStrictJson(fn.arguments);
+    else if (fn?.arguments && typeof fn.arguments === "object") args = fn.arguments;
+    else if (tc?.input && typeof tc.input === "object") args = tc.input;
+    else if (tc?.arguments && typeof tc.arguments === "object") args = tc.arguments;
+    const chain = resolvePrerequisiteSteps(bound.methodId, bound.actor, args, ctx, capabilities);
+    for (const st of chain) rawSteps.push({ method_id: st.method_id, actor: st.actor, args: st.args });
+  }
+  return OpenAICompatibleLLMPlanner.sanitizePlan({ intent_summary: intentSummary, steps: rawSteps }, capMap, ctx);
 }
 
 export class QueueBuilder {
@@ -583,10 +610,16 @@ export class QueueBuilder {
   async submit(queueId) {
     return this.sdk.submitQueueWithRecovery(this.base, this.authToken, this.build(queueId));
   }
+
+  async submitAndWait(queueId, timeoutMs = 10000) {
+    const q = this.build(queueId);
+    const initial = await this.sdk.submitQueueWithRecovery(this.base, this.authToken, q);
+    return this.sdk.waitForQueueTerminal(q.queue_id, initial, timeoutMs);
+  }
 }
 
 export class CoreSDK {
-  constructor(planner, allowLoopback = false, streamMode = "websocket", memoryStore = undefined, requestTimeoutMs = 10000) {
+  constructor(planner = () => ({ intent_summary: "" }), allowLoopback = false, streamMode = "websocket", memoryStore = undefined, requestTimeoutMs = 10000) {
     this.planner = planner;
     this.allowLoopback = allowLoopback;
     this.streamMode = streamMode;
@@ -617,6 +650,13 @@ export class CoreSDK {
     this.connectedSlotId = "";
     this.permittedMethods = undefined;
     this.sessionId = null;
+    this.scope = null;
+    this.negotiatedExtensions = [];
+    this.latestContext = null;
+    this.metrics = { contextsReceived: 0, queuesSubmitted: 0, backoffShieldHits: 0 };
+    this.onContext = undefined;
+    this.onCapabilitiesUpdated = undefined;
+    this.onSessionClosed = undefined;
     this.actionsPaused = false;
     this.closed = false;
   }
@@ -672,6 +712,7 @@ export class CoreSDK {
         slot_id: slotId,
         player_id: options.playerId,
         faction_id: options.factionId,
+        consumption_cap: options.consumptionCap,
         requested_scope: options.requestedScope ?? { allow_chat: true },
         cached_capability_digest: cachedDigest,
       },
@@ -689,6 +730,8 @@ export class CoreSDK {
     this.connectedBase = base;
     this.connectedToken = authToken;
     this.connectedSlotId = slotId;
+    this.scope = res.frozen_scope ?? {};
+    this.negotiatedExtensions = Array.isArray(res.negotiated_extensions) ? res.negotiated_extensions : [];
     this.permittedMethods = res.frozen_scope?.permitted_methods;
     this.playerId = String(res.frozen_scope?.player_id ?? options.playerId ?? "player-local");
     this.closed = false;
@@ -761,20 +804,69 @@ export class CoreSDK {
   }
 
   async pullContext(base = this.connectedBase, authToken = this.connectedToken) {
-    return this.postEnvelope(base.replace(/\/$/, ""), authToken, "context.pull", {}, this.sessionId ?? undefined);
+    const ctx = await this.postEnvelope(base.replace(/\/$/, ""), authToken, "context.pull", {}, this.sessionId ?? undefined);
+    this.latestContext = ctx;
+    return ctx;
   }
 
   async pullContextIfDue(base = this.connectedBase, authToken = this.connectedToken) {
-    if (this.closed || !this.sessionId || Date.now() < this.nextAllowedPullMs) return null;
+    if (this.closed || !this.sessionId) return null;
+    if (Date.now() < this.nextAllowedPullMs) {
+      this.metrics.backoffShieldHits++;
+      return null;
+    }
     try {
       return await this.pullContext(base, authToken);
     } catch (err) {
       if (err instanceof G2ACoreError && err.code === "resource_limit") {
+        this.metrics.backoffShieldHits++;
         if (err.retryAfterMs !== undefined) this.nextAllowedPullMs = Date.now() + err.retryAfterMs;
         return null;
       }
       throw err;
     }
+  }
+
+  async invokeCapability(methodIdOrName, args = {}, options = {}) {
+    let ctx = (await this.pullContextIfDue()) ?? this.latestContext ?? (await this.pullContext());
+    const caps = this.getCachedCapabilities(ctx.slot_id);
+    const matched =
+      caps.find((c) => c.method_id === methodIdOrName) ??
+      caps.find((c) => c.name.toLowerCase() === String(methodIdOrName).trim().toLowerCase());
+    const resolvedMid = matched?.method_id ?? methodIdOrName;
+    const allowedActors = this.permittedMethods?.[resolvedMid];
+    let resolvedActor = options.actor ?? "";
+    if (!resolvedActor) {
+      const matching = (ctx.active_methods ?? []).filter(
+        (g) => g.method_id === resolvedMid && (!allowedActors || allowedActors.includes(g.actor))
+      );
+      if (matching.some((g) => g.actor === "companion")) resolvedActor = "companion";
+      else if (matching.length > 0) resolvedActor = matching[0].actor;
+      else resolvedActor = "companion";
+    }
+    const stepArgs = { ...args };
+    if (options.deicticHint && stepArgs.target_id === undefined) {
+      const grant = (ctx.active_methods ?? []).find((g) => g.method_id === resolvedMid && g.actor === resolvedActor);
+      if (grant?.targets?.length > 0) {
+        const cand = resolveDeicticTarget(options.deicticHint, grant.targets);
+        if (cand) stepArgs.target_id = cand.target_id;
+      }
+    }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const builder = this.createQueueBuilder(ctx, options.intentSummary ?? `Invoke ${matched?.name ?? resolvedMid}`);
+      if (options.autoPrerequisites ?? true) builder.addStepAuto(resolvedMid, resolvedActor, stepArgs);
+      else builder.addStep(resolvedMid, resolvedActor, stepArgs);
+      const rec = (options.waitTerminal ?? true)
+        ? await builder.submitAndWait(undefined, options.timeoutMs ?? 10000)
+        : await builder.submit();
+      if (rec) return rec;
+      if (attempt === 0 && this.latestContext && (this.latestContext.epoch > ctx.epoch || this.latestContext.rev > ctx.rev)) {
+        ctx = this.latestContext;
+        continue;
+      }
+      return null;
+    }
+    return null;
   }
 
   async queryQueue(baseOrQueueId, authToken, queueId) {
@@ -941,6 +1033,7 @@ export class CoreSDK {
       if (now < (this.refusalCooldowns.get(fp) ?? 0)) return null;
     }
     try {
+      this.metrics.queuesSubmitted++;
       return await this.postEnvelope(cleanBase, authToken, "queue.submit", queue, this.sessionId);
     } catch (err) {
       if (!(err instanceof G2ACoreError)) throw err;
@@ -958,7 +1051,11 @@ export class CoreSDK {
         this.pendingConfirmQueues.set(queue.queue_id, queue);
         return null;
       }
-      if (err.code === "stale_context" && err.freshContext && depth < 2) return this.onContextReceived(cleanBase, authToken, err.freshContext, depth + 1);
+      if (err.code === "stale_context" && err.freshContext) {
+        this.latestContext = err.freshContext;
+        if (depth < 2) return this.onContextReceived(cleanBase, authToken, err.freshContext, depth + 1);
+        return null;
+      }
       if (err.code === "outcome_unknown") return this.queryQueue(cleanBase, authToken, queue.queue_id);
       return null;
     }
@@ -976,6 +1073,9 @@ export class CoreSDK {
     }
     if (env.event === "context.push") {
       this.nextAllowedPullMs = 0;
+      this.latestContext = env.payload;
+      this.metrics.contextsReceived++;
+      this.onContext?.(env.payload);
       await this.onContextReceived(base, authToken, env.payload);
     } else if (env.event === "capabilities.updated") {
       const capDigest = typeof env.payload?.capability_table_digest === "string" ? env.payload.capability_table_digest : "";
@@ -997,6 +1097,10 @@ export class CoreSDK {
           }
           this.permittedMethods = narrowed;
         }
+        if (this.scope) {
+          this.scope = { ...this.scope, capability_table_digest: capDigest, permitted_methods: this.permittedMethods };
+        }
+        this.onCapabilitiesUpdated?.(capTable);
       }
     } else if (env.event === "queue.confirmed") {
       const qid = typeof env.payload?.queue_id === "string" ? env.payload.queue_id : "";
@@ -1021,6 +1125,7 @@ export class CoreSDK {
       await this.onContextReceived(base, authToken, env.payload);
     } else if (env.event === "session.closed") {
       this.shutdown();
+      this.onSessionClosed?.();
     }
   }
 

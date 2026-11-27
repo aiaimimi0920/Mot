@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import {
   OriginSDK,
+  SchemaBuilder,
   canonicalizeJcs,
   formatPlayerDeicticAnchor,
   jcsSha256,
   parseStrictJson,
+  startedExecuting,
   validateArgsAgainstSchema,
 } from "../esm/index.mjs";
 
@@ -59,5 +61,51 @@ const failRep = await npc.handleOriginExecute({
 });
 assert.equal(failRep.state, "failed");
 assert.equal(failRep.failure_reason, "missing_required_arg:volume");
+
+// Verify fluent SchemaBuilder DSL, 0-arg startedExecuting(), and 5th-arg StepExecutionToken
+let capturedToken = null;
+const builtSchema = SchemaBuilder.object()
+  .stringEnum("stance", ["guard", "sprint"])
+  .integer("power", true, { minimum: 1, maximum: 100 })
+  .boolean("silent", false)
+  .build();
+npc.postToHub = async () => {};
+npc.registerCapability(
+  {
+    method_id: "#08",
+    name: "channel_shield",
+    description: "Channel shield",
+    permitted_actors: ["boss"],
+    params_schema: builtSchema,
+    sustained: true,
+  },
+  (_actor, _subj, _args, _eid, token) => {
+    capturedToken = token;
+    return startedExecuting();
+  }
+);
+const badEnum = await npc.handleOriginExecute({
+  slot_id: "slot-ts-npc",
+  epoch: 1,
+  kind: "invoke",
+  execution_id: "ex-ts-enum",
+  method_id: "#08",
+  actor: "boss",
+  args: { stance: "fly", power: 10 },
+});
+assert.equal(badEnum.state, "failed");
+const execOk = await npc.handleOriginExecute({
+  slot_id: "slot-ts-npc",
+  epoch: 1,
+  kind: "invoke",
+  execution_id: "ex-ts-tok",
+  method_id: "#08",
+  actor: "boss",
+  args: { stance: "guard", power: 40 },
+});
+assert.equal(execOk.state, "executing");
+assert.equal(capturedToken.isInFlight, true);
+await capturedToken.completeSucceeded({ shielded: true });
+assert.equal(capturedToken.isInFlight, false);
 
 console.log(`TypeScript @g2a/interaction-origin SelfTest PASSED | JCS=${got}`);

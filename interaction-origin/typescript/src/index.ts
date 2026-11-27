@@ -186,13 +186,107 @@ export interface OriginExecuteReply {
 export type EffectInvocationResult =
   | { kind: "succeeded"; effect_summary?: Record<string, unknown> }
   | { kind: "failed"; reason: string }
-  | { kind: "executing"; cancel_fn: () => void };
+  | { kind: "executing"; cancel_fn?: () => void };
+
+export function immediateSucceeded(effect_summary?: Record<string, unknown>): EffectInvocationResult {
+  return { kind: "succeeded", effect_summary };
+}
+
+export function immediateFailed(reason: string): EffectInvocationResult {
+  return { kind: "failed", reason };
+}
+
+export function startedExecuting(cancel_fn?: () => void): EffectInvocationResult {
+  return { kind: "executing", cancel_fn };
+}
+
+export interface StepExecutionToken {
+  readonly executionId: string;
+  readonly isInFlight: boolean;
+  completeSucceeded(summary?: Record<string, unknown>): Promise<void>;
+  completeFailed(reason: string): Promise<void>;
+}
+
+export class SchemaBuilder {
+  private properties: Record<string, Record<string, unknown>> = {};
+  private required: string[] = [];
+  private additional = false;
+
+  constructor(allowAdditional = false) {
+    this.additional = allowAdditional;
+  }
+
+  static object(allowAdditional = false): SchemaBuilder {
+    return new SchemaBuilder(allowAdditional);
+  }
+
+  private addProp(name: string, spec: Record<string, unknown>, isRequired: boolean): this {
+    this.properties[name] = spec;
+    if (isRequired && !this.required.includes(name)) this.required.push(name);
+    return this;
+  }
+
+  string(name: string, required = true, options?: { minLength?: number; maxLength?: number }): this {
+    const spec: Record<string, unknown> = { type: "string" };
+    if (options?.minLength !== undefined) spec.minLength = options.minLength;
+    if (options?.maxLength !== undefined) spec.maxLength = options.maxLength;
+    return this.addProp(name, spec, required);
+  }
+
+  stringEnum(name: string, values: string[], required = true): this {
+    return this.addProp(name, { type: "string", enum: [...values] }, required);
+  }
+
+  integer(name: string, required = true, options?: { minimum?: number; maximum?: number }): this {
+    const spec: Record<string, unknown> = { type: "integer" };
+    if (options?.minimum !== undefined) spec.minimum = options.minimum;
+    if (options?.maximum !== undefined) spec.maximum = options.maximum;
+    return this.addProp(name, spec, required);
+  }
+
+  number(name: string, required = true, options?: { minimum?: number; maximum?: number }): this {
+    const spec: Record<string, unknown> = { type: "number" };
+    if (options?.minimum !== undefined) spec.minimum = options.minimum;
+    if (options?.maximum !== undefined) spec.maximum = options.maximum;
+    return this.addProp(name, spec, required);
+  }
+
+  boolean(name: string, required = false): this {
+    return this.addProp(name, { type: "boolean" }, required);
+  }
+
+  stringArray(name: string, required = false, options?: { minItems?: number; maxItems?: number }): this {
+    const spec: Record<string, unknown> = { type: "array", items: { type: "string" } };
+    if (options?.minItems !== undefined) spec.minItems = options.minItems;
+    if (options?.maxItems !== undefined) spec.maxItems = options.maxItems;
+    return this.addProp(name, spec, required);
+  }
+
+  objectField(name: string, childSchema: Record<string, unknown>, required = false): this {
+    return this.addProp(name, { ...childSchema }, required);
+  }
+
+  allowAdditional(allow = true): this {
+    this.additional = allow;
+    return this;
+  }
+
+  build(): Record<string, unknown> {
+    return {
+      type: "object",
+      required: [...this.required],
+      additionalProperties: this.additional,
+      properties: { ...this.properties },
+    };
+  }
+}
 
 export type DomainEffectHandler = (
   actor: string,
   subject: unknown,
   args: Record<string, unknown>,
-  executionId: string
+  executionId: string,
+  token: StepExecutionToken
 ) => EffectInvocationResult;
 
 export interface SlotPublishOptions {
@@ -573,9 +667,10 @@ export class OriginSDK {
     if (schemaErr) {
       return { execution_id: req.execution_id, state: "failed", failure_reason: schemaErr };
     }
-    const out = reg.handler(req.actor, this.actors.get(req.actor), req.args, req.execution_id);
+    const token = this.createStepToken(req.execution_id);
+    const out = reg.handler(req.actor, this.actors.get(req.actor), req.args, req.execution_id, token);
     if (out.kind === "executing") {
-      this.inFlight.set(req.execution_id, out.cancel_fn);
+      this.inFlight.set(req.execution_id, out.cancel_fn ?? (() => {}));
       const rep: OriginExecuteReply = { execution_id: req.execution_id, state: "executing" };
       this.storeLedgerReply(rep);
       return rep;
@@ -598,6 +693,26 @@ export class OriginSDK {
         if (!this.inFlight.has(oldId)) this.ledger.delete(oldId);
       }
     }
+  }
+
+  isStepInFlight(executionId: string): boolean {
+    return this.inFlight.has(executionId);
+  }
+
+  createStepToken(executionId: string): StepExecutionToken {
+    const sdk = this;
+    return {
+      executionId,
+      get isInFlight(): boolean {
+        return sdk.isStepInFlight(executionId);
+      },
+      completeSucceeded(summary?: Record<string, unknown>): Promise<void> {
+        return sdk.completeStep(executionId, true, summary);
+      },
+      completeFailed(reason: string): Promise<void> {
+        return sdk.completeStep(executionId, false, undefined, reason);
+      },
+    };
   }
 
   async completeStep(executionId: string, succeeded: boolean, summary?: Record<string, unknown>, reason?: string): Promise<void> {

@@ -187,11 +187,16 @@ internal static class Program
                 var csTools = OpenAICompatibleLlmPlanner.CompileOpenAiTools(coreSdk.GetCachedCapabilities(), pulled);
                 if (csTools.Count != 1 || !(csTools[0]["function"] is Dictionary<string, object?> csFn) || !csFn["name"]!.ToString()!.StartsWith("g2a_act__", StringComparison.Ordinal))
                     throw new Exception("Expected CompileOpenAiTools to produce context-scoped function tool");
+                var mcpTools = OpenAICompatibleLlmPlanner.CompileContextTools(coreSdk.GetCachedCapabilities(), pulled, "mcp");
+                if (mcpTools.Count != 1 || !mcpTools[0].ContainsKey("inputSchema"))
+                    throw new Exception("Expected CompileContextTools('mcp') to emit inputSchema");
+                if (coreSdk.LatestContext is null)
+                    throw new Exception("Expected LatestContext to be populated after PullContext");
 
                 bool caughtInactive = false;
                 try
                 {
-                    coreSdk.CreateQueueBuilder(pulled).AddStep("#99", "companion");
+                    coreSdk.CreateQueueBuilder().AddStep("#99", "companion");
                 }
                 catch (G2ACoreException gex) when (gex.Code == "invalid_arguments")
                 {
@@ -199,12 +204,11 @@ internal static class Program
                 }
                 if (!caughtInactive) throw new Exception("Expected QueueBuilder pre-flight rejection for inactive method");
 
-                var receipt = await coreSdk
-                    .CreateQueueBuilder(pulled, "Open gold chest")
-                    .AddStep("#02", "companion", new Dictionary<string, object?> { ["target_id"] = "chest_gold" })
-                    .SubmitAsync("Q-cs-e2e-1");
+                var receipt = await coreSdk.InvokeCapabilityAsync(
+                    "open_chest",
+                    new Dictionary<string, object?> { ["target_id"] = "chest_gold" });
                 if (receipt?.QueueState != "completed" || !chestOpened)
-                    throw new Exception("Expected completed queue and opened chest in C# 3-tier E2E");
+                    throw new Exception("Expected completed queue and opened chest via InvokeCapabilityAsync in C# 3-tier E2E");
 
                 await coreSdk.ShutdownAsync(notifyHub: true);
             }

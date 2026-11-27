@@ -128,7 +128,101 @@ struct EffectOutcome {
 
     static EffectOutcome ImmediateSucceeded(JsonObject s = {}) { return {"succeeded", std::move(s), "", nullptr}; }
     static EffectOutcome ImmediateFailed(std::string reason) { return {"failed", {}, std::move(reason), nullptr}; }
-    static EffectOutcome StartedExecuting(std::function<void()> cancel) { return {"executing", {}, "", std::move(cancel)}; }
+    static EffectOutcome StartedExecuting(std::function<void()> cancel = nullptr) { return {"executing", {}, "", std::move(cancel)}; }
+};
+
+class SchemaBuilder {
+public:
+    explicit SchemaBuilder(bool allow_additional = false) : allow_additional_(allow_additional) {}
+
+    static SchemaBuilder object(bool allow_additional = false) { return SchemaBuilder(allow_additional); }
+
+    SchemaBuilder& string_field(
+        const std::string& name,
+        bool required = true,
+        std::optional<int64_t> min_len = std::nullopt,
+        std::optional<int64_t> max_len = std::nullopt) {
+        JsonObject spec{{"type", "string"}};
+        if (min_len) spec["minLength"] = *min_len;
+        if (max_len) spec["maxLength"] = *max_len;
+        return add_prop(name, std::move(spec), required);
+    }
+
+    SchemaBuilder& string_enum(const std::string& name, const std::vector<std::string>& values, bool required = true) {
+        JsonArray arr;
+        for (const auto& v : values) arr.emplace_back(v);
+        return add_prop(name, JsonObject{{"type", "string"}, {"enum", std::move(arr)}}, required);
+    }
+
+    SchemaBuilder& integer_field(
+        const std::string& name,
+        bool required = true,
+        std::optional<int64_t> min_val = std::nullopt,
+        std::optional<int64_t> max_val = std::nullopt) {
+        JsonObject spec{{"type", "integer"}};
+        if (min_val) spec["minimum"] = *min_val;
+        if (max_val) spec["maximum"] = *max_val;
+        return add_prop(name, std::move(spec), required);
+    }
+
+    SchemaBuilder& number_field(
+        const std::string& name,
+        bool required = true,
+        std::optional<double> min_val = std::nullopt,
+        std::optional<double> max_val = std::nullopt) {
+        JsonObject spec{{"type", "number"}};
+        if (min_val) spec["minimum"] = *min_val;
+        if (max_val) spec["maximum"] = *max_val;
+        return add_prop(name, std::move(spec), required);
+    }
+
+    SchemaBuilder& boolean_field(const std::string& name, bool required = false) {
+        return add_prop(name, JsonObject{{"type", "boolean"}}, required);
+    }
+
+    SchemaBuilder& string_array(
+        const std::string& name,
+        bool required = false,
+        std::optional<int64_t> min_items = std::nullopt,
+        std::optional<int64_t> max_items = std::nullopt) {
+        JsonObject spec{{"type", "array"}, {"items", JsonObject{{"type", "string"}}}};
+        if (min_items) spec["minItems"] = *min_items;
+        if (max_items) spec["maxItems"] = *max_items;
+        return add_prop(name, std::move(spec), required);
+    }
+
+    SchemaBuilder& object_field(const std::string& name, JsonObject child_schema, bool required = false) {
+        return add_prop(name, std::move(child_schema), required);
+    }
+
+    SchemaBuilder& allow_additional(bool allow = true) {
+        allow_additional_ = allow;
+        return *this;
+    }
+
+    JsonObject build() const {
+        JsonArray req_arr;
+        for (const auto& r : required_) req_arr.emplace_back(r);
+        return JsonObject{
+            {"type", "object"},
+            {"required", std::move(req_arr)},
+            {"additionalProperties", allow_additional_},
+            {"properties", properties_},
+        };
+    }
+
+private:
+    SchemaBuilder& add_prop(const std::string& name, JsonObject spec, bool required) {
+        properties_[name] = std::move(spec);
+        if (required && std::find(required_.begin(), required_.end(), name) == required_.end()) {
+            required_.push_back(name);
+        }
+        return *this;
+    }
+
+    JsonObject properties_;
+    std::vector<std::string> required_;
+    bool allow_additional_ = false;
 };
 
 struct Pose3D {
@@ -755,6 +849,34 @@ public:
     }
 
     const CapabilityEntry& get_capability(const std::string& id) const { return capabilities_.at(id).def; }
+
+    bool is_step_in_flight(const std::string& execution_id) const {
+        std::lock_guard<std::recursive_mutex> lk(mu_);
+        return in_flight_.find(execution_id) != in_flight_.end();
+    }
+
+    class StepExecutionToken {
+    public:
+        StepExecutionToken(OriginSdk* sdk, std::string execution_id)
+            : sdk_(sdk), execution_id_(std::move(execution_id)) {}
+
+        const std::string& execution_id() const { return execution_id_; }
+        bool is_in_flight() const { return sdk_ && sdk_->is_step_in_flight(execution_id_); }
+        void complete_succeeded(JsonObject summary = {}) const {
+            if (sdk_) sdk_->complete_step(execution_id_, true, std::move(summary), "");
+        }
+        void complete_failed(const std::string& reason) const {
+            if (sdk_) sdk_->complete_step(execution_id_, false, JsonObject{}, reason);
+        }
+
+    private:
+        OriginSdk* sdk_;
+        std::string execution_id_;
+    };
+
+    StepExecutionToken make_step_token(const std::string& execution_id) {
+        return StepExecutionToken(this, execution_id);
+    }
 
 private:
     struct RegCap {

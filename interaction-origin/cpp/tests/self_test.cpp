@@ -301,6 +301,24 @@ int main() {
     auto m_snap = ext_sdk.metrics();
     assert(m_snap.frames_synced >= 3 && m_snap.zero_change_skips >= 1 && m_snap.steps_settled_batch == 3);
 
+    // 12. Verify fluent SchemaBuilder DSL & StepExecutionToken handle
+    auto built_schema = SchemaBuilder::object()
+        .string_enum("mode", {"careful", "fast"}, true)
+        .integer_field("power", true, 1, 100)
+        .boolean_field("silent", false)
+        .build();
+    ext_sdk.register_capability(
+        {"#11", "tune_crystal", "Tune crystal", {"companion"}, built_schema, true, {}, "allow"},
+        [](const std::string&, const JsonObject&, const std::string&) {
+            return EffectOutcome::StartedExecuting();
+        });
+    assert(ext_sdk.handle_origin_execute({"slot-ext-cpp", 1, "invoke", "ex-bad-enum", "#11", "companion", JsonObject{{"mode", "wild"}, {"power", int64_t(10)}}}).state == "failed");
+    assert(ext_sdk.handle_origin_execute({"slot-ext-cpp", 1, "invoke", "ex-tok-1", "#11", "companion", JsonObject{{"mode", "careful"}, {"power", int64_t(50)}}}).state == "executing");
+    auto cpp_tok = ext_sdk.make_step_token("ex-tok-1");
+    assert(cpp_tok.is_in_flight());
+    cpp_tok.complete_succeeded(JsonObject{{"tuned", true}});
+    assert(!cpp_tok.is_in_flight());
+
     std::cout << "C++17 G2A OriginSdk SelfTest PASSED | JCS=" << digest << "\n";
     return 0;
 }

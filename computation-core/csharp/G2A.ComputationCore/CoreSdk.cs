@@ -39,6 +39,11 @@ public sealed class CoreSdk : IAsyncDisposable
     private string _hubEndpoint = "";
     private string _authToken = "";
     private FrozenScope? _frozenScope;
+    private List<string> _negotiatedExtensions = new();
+    private ProjectedContext? _latestContext;
+    private long _contextsReceived;
+    private long _queuesSubmitted;
+    private long _backoffShieldHits;
     private string _lastEventId = "";
     private long _nextAllowedPullMs;
     private CancellationTokenSource? _bgCts;
@@ -46,8 +51,19 @@ public sealed class CoreSdk : IAsyncDisposable
 
     public string? SessionId { get; private set; }
     public FrozenScope? CurrentScope { get { lock (_gate) return _frozenScope; } }
+    public IReadOnlyList<string> NegotiatedExtensions { get { lock (_gate) return _negotiatedExtensions.ToList(); } }
+    public ProjectedContext? LatestContext { get { lock (_gate) return _latestContext; } }
     public bool ActionsPaused { get; private set; }
     public bool Closed { get; private set; }
+
+    public Action<ProjectedContext>? OnContext { get; set; }
+    public Action<IReadOnlyList<CapabilityEntry>>? OnCapabilitiesUpdated { get; set; }
+    public Action? OnSessionClosed { get; set; }
+
+    public CoreMetricsSnapshot GetMetrics()
+    {
+        lock (_gate) return new CoreMetricsSnapshot(_contextsReceived, _queuesSubmitted, _backoffShieldHits);
+    }
 
     public Func<string, object?, string?, CancellationToken, Task<JsonElement>>? CustomPostTransport { get; set; }
 
@@ -64,12 +80,20 @@ public sealed class CoreSdk : IAsyncDisposable
         _http = new HttpClient(new SocketsHttpHandler { UseProxy = false }) { Timeout = TimeSpan.FromSeconds(12) };
     }
 
+    public CoreSdk(
+        Func<IReadOnlyList<CapabilityEntry>, ProjectedContext, IReadOnlyList<MemoryRecord>, PlanDecision> syncPlanner,
+        InMemoryCompanionStore? memoryStore = null,
+        bool allowLoopback = false,
+        string streamMode = "websocket")
+        : this(new DelegatePlanner(syncPlanner), memoryStore, allowLoopback, streamMode) { }
+
     public async Task<FrozenScope> ConnectAsync(
         string hubEndpoint,
         string authToken,
         string slotId,
         string? playerId = null,
         string? factionId = null,
+        long? consumptionCap = null,
         Dictionary<string, object?>? requestedScope = null,
         Dictionary<string, object?>? extensions = null,
         bool startBackgroundLoops = true,
@@ -95,11 +119,15 @@ public sealed class CoreSdk : IAsyncDisposable
         if (!string.IsNullOrEmpty(playerId)) payload["player_id"] = playerId;
         if (!string.IsNullOrEmpty(factionId)) payload["faction_id"] = factionId;
         if (!string.IsNullOrEmpty(cachedDigest)) payload["cached_capability_digest"] = cachedDigest;
+        if (consumptionCap.HasValue) payload["consumption_cap"] = consumptionCap.Value;
 
         var resEl = await PostEnvelopeAsync("session.authorize", payload, null, extensions, ct);
         string sid = resEl.GetProperty("session_id").GetString()!;
         string capDigest = resEl.GetProperty("capability_table_digest").GetString()!;
         var scope = resEl.GetProperty("frozen_scope").Deserialize<FrozenScope>()!;
+        var negExts = resEl.TryGetProperty("negotiated_extensions", out var neEl) && neEl.ValueKind == JsonValueKind.Array
+            ? neEl.EnumerateArray().Select(x => x.GetString() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList()
+            : new List<string>();
 
         if (resEl.TryGetProperty("capability_table", out var capTblEl) && capTblEl.ValueKind == JsonValueKind.Array)
         {
@@ -114,6 +142,7 @@ public sealed class CoreSdk : IAsyncDisposable
         {
             SessionId = sid;
             _frozenScope = scope;
+            _negotiatedExtensions = negExts;
             _slotDigests[slotId] = capDigest;
             _bgCts = new CancellationTokenSource();
         }
@@ -156,9 +185,78 @@ public sealed class CoreSdk : IAsyncDisposable
     }
 
     public QueueBuilder CreateQueueBuilder(
-        ProjectedContext context,
+        ProjectedContext? context = null,
         string intentSummary = "Execute planned companion queue",
-        string? trigger = null) => new(this, context, intentSummary, trigger);
+        string? trigger = null)
+    {
+        var resolved = context ?? LatestContext
+            ?? throw new G2ACoreException("invalid_request", 400, "No cached ProjectedContext; call PullContextAsync first or pass context");
+        return new QueueBuilder(this, resolved, intentSummary, trigger);
+    }
+
+    public async Task<QueueReceipt?> InvokeCapabilityAsync(
+        string methodIdOrName,
+        Dictionary<string, object?>? args = null,
+        string? actor = null,
+        string? deicticHint = null,
+        string? intentSummary = null,
+        string? trigger = null,
+        bool autoPrerequisites = true,
+        bool waitTerminal = true,
+        CancellationToken ct = default)
+    {
+        var ctx = await PullContextIfDueAsync(ct) ?? LatestContext ?? await PullContextAsync(ct);
+        var caps = GetCachedCapabilities(ctx.SlotId);
+        var matchedCap = caps.FirstOrDefault(c => c.MethodId == methodIdOrName)
+            ?? caps.FirstOrDefault(c => string.Equals(c.Name, methodIdOrName.Trim(), StringComparison.OrdinalIgnoreCase));
+        string resolvedMid = matchedCap?.MethodId ?? methodIdOrName;
+
+        var scope = CurrentScope;
+        List<string>? allowedActors = null;
+        if (scope?.PermittedMethods != null && scope.PermittedMethods.TryGetValue(resolvedMid, out var list))
+            allowedActors = list;
+
+        string resolvedActor = actor ?? "";
+        if (string.IsNullOrEmpty(resolvedActor))
+        {
+            var matching = (ctx.ActiveMethods ?? new List<ActiveMethodGrant>())
+                .Where(g => g.MethodId == resolvedMid && (allowedActors == null || allowedActors.Contains(g.Actor)))
+                .ToList();
+            if (matching.Any(g => g.Actor == "companion")) resolvedActor = "companion";
+            else if (matching.Count > 0) resolvedActor = matching[0].Actor;
+            else resolvedActor = "companion";
+        }
+
+        var stepArgs = args != null ? new Dictionary<string, object?>(args) : new Dictionary<string, object?>();
+        if (!string.IsNullOrEmpty(deicticHint) && !stepArgs.ContainsKey("target_id"))
+        {
+            var grant = (ctx.ActiveMethods ?? new List<ActiveMethodGrant>())
+                .FirstOrDefault(g => g.MethodId == resolvedMid && g.Actor == resolvedActor);
+            if (grant is { Targets.Count: > 0 })
+            {
+                var cand = OpenAICompatibleLlmPlanner.ResolveDeicticTarget(deicticHint, grant.Targets);
+                if (cand != null) stepArgs["target_id"] = cand.TargetId;
+            }
+        }
+
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            string summary = intentSummary ?? $"Invoke {matchedCap?.Name ?? resolvedMid}";
+            var builder = CreateQueueBuilder(ctx, summary, trigger);
+            if (autoPrerequisites) builder.AddStepAuto(resolvedMid, resolvedActor, stepArgs);
+            else builder.AddStep(resolvedMid, resolvedActor, stepArgs);
+            var rec = waitTerminal ? await builder.SubmitAndWaitAsync(ct: ct) : await builder.SubmitAsync(ct: ct);
+            if (rec != null) return rec;
+            var fresh = LatestContext;
+            if (attempt == 0 && fresh != null && (fresh.Epoch > ctx.Epoch || fresh.Rev > ctx.Rev))
+            {
+                ctx = fresh;
+                continue;
+            }
+            return null;
+        }
+        return null;
+    }
 
     public IReadOnlyList<CapabilityEntry> GetCachedCapabilities(string? slotId = null)
     {
@@ -189,7 +287,9 @@ public sealed class CoreSdk : IAsyncDisposable
         try
         {
             var el = await PostEnvelopeAsync("context.pull", new Dictionary<string, object?>(), SessionId, null, ct);
-            return ParseProjectedContext(el);
+            var parsed = ParseProjectedContext(el);
+            lock (_gate) { _latestContext = parsed; }
+            return parsed;
         }
         catch (G2ACoreException gex) when (gex.Code == "resource_limit" && gex.RetryAfterMs.HasValue)
         {
@@ -205,8 +305,12 @@ public sealed class CoreSdk : IAsyncDisposable
     {
         lock (_gate)
         {
-            if (Closed || string.IsNullOrEmpty(SessionId) || DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() < _nextAllowedPullMs)
+            if (Closed || string.IsNullOrEmpty(SessionId)) return null;
+            if (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() < _nextAllowedPullMs)
+            {
+                _backoffShieldHits++;
                 return null;
+            }
         }
         try
         {
@@ -214,6 +318,7 @@ public sealed class CoreSdk : IAsyncDisposable
         }
         catch (G2ACoreException gex) when (gex.Code == "resource_limit")
         {
+            lock (_gate) { _backoffShieldHits++; }
             return null;
         }
     }
@@ -238,6 +343,7 @@ public sealed class CoreSdk : IAsyncDisposable
 
         try
         {
+            lock (_gate) { _queuesSubmitted++; }
             var res = await PostEnvelopeAsync("queue.submit", queue, sid, null, ct);
             return res.Deserialize<QueueReceipt>();
         }
@@ -267,8 +373,13 @@ public sealed class CoreSdk : IAsyncDisposable
                 }
                 return immediateResubmit ? await SubmitQueueInternalAsync(queue, depth, ct) : null;
             }
-            if (gex.Code == "stale_context" && gex.FreshContext != null && depth < 2)
-                return await OnContextReceivedAsync(gex.FreshContext, depth + 1, ct);
+            if (gex.Code == "stale_context" && gex.FreshContext != null)
+            {
+                lock (_gate) { _latestContext = gex.FreshContext; }
+                if (depth < 2)
+                    return await OnContextReceivedAsync(gex.FreshContext, depth + 1, ct);
+                return null;
+            }
             if (gex.Code == "outcome_unknown")
                 return await QueryQueueAsync(queue.QueueId, ct);
             throw;
@@ -510,6 +621,8 @@ public sealed class CoreSdk : IAsyncDisposable
         lock (_gate)
         {
             if (Closed || ActionsPaused || string.IsNullOrEmpty(SessionId)) return null;
+            _contextsReceived++;
+            _latestContext = ctx;
             caps = _capabilityCache.TryGetValue(ctx.CapabilityTableDigest, out var c) ? c : new();
             playerId = _frozenScope?.PlayerId ?? "";
         }
@@ -562,7 +675,9 @@ public sealed class CoreSdk : IAsyncDisposable
         {
             case "context.push":
                 lock (_gate) { _nextAllowedPullMs = 0; }
-                await OnContextReceivedAsync(ParseProjectedContext(payload), 0, ct);
+                var pushedCtx = ParseProjectedContext(payload);
+                OnContext?.Invoke(pushedCtx);
+                await OnContextReceivedAsync(pushedCtx, 0, ct);
                 break;
             case "capabilities.updated":
                 if (payload.TryGetProperty("capability_table", out var tbl) && tbl.ValueKind == JsonValueKind.Array)
@@ -589,6 +704,7 @@ public sealed class CoreSdk : IAsyncDisposable
                                 _frozenScope = _frozenScope with { CapabilityTableDigest = digest, PermittedMethods = narrowed };
                             }
                         }
+                        OnCapabilitiesUpdated?.Invoke(parsedCaps);
                     }
                 }
                 break;
@@ -609,6 +725,7 @@ public sealed class CoreSdk : IAsyncDisposable
                 break;
             case "session.closed":
                 await ShutdownAsync(false);
+                OnSessionClosed?.Invoke();
                 break;
         }
     }
@@ -990,4 +1107,11 @@ public sealed class QueueBuilder
 
     public Task<QueueReceipt?> SubmitAsync(string? queueId = null, CancellationToken ct = default) =>
         _sdk.SubmitQueueWithRecoveryAsync(Build(queueId), ct);
+
+    public async Task<QueueReceipt?> SubmitAndWaitAsync(string? queueId = null, CancellationToken ct = default)
+    {
+        var q = Build(queueId);
+        var initial = await _sdk.SubmitQueueWithRecoveryAsync(q, ct);
+        return await _sdk.WaitForQueueTerminalAsync(q.QueueId, initial, ct);
+    }
 }

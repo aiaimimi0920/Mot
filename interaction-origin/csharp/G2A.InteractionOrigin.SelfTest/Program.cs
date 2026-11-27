@@ -354,6 +354,32 @@ internal static class Program
         if (sdk.FramesSynced < 3 || sdk.ZeroChangeSkips < 2)
             throw new Exception("Expected FramesSynced and ZeroChangeSkips telemetry");
 
+        // Verify fluent SchemaBuilder DSL, 0-arg StartedExecuting, & StepExecutionToken handle
+        var builtSchema = SchemaBuilder.Object()
+            .StringEnum("mode", new[] { "careful", "fast" })
+            .IntegerField("power", minimum: 1, maximum: 100)
+            .BooleanField("silent", required: false)
+            .Build();
+        sdk.RegisterCapability(
+            new CapabilityEntry("#09", "channel_ward", "Channel ward", new List<string> { "companion" }, builtSchema, Sustained: true),
+            (_, _, _, _) => new EffectInvocationResult.StartedExecuting());
+        bool caughtBadEnum = false;
+        try
+        {
+            sdk.HandleOriginExecute(new OriginExecuteRequest("slot-csharp", 1, "invoke", "ex-cs-bad", "#09", "companion", new Dictionary<string, object?> { ["mode"] = "reckless", ["power"] = 10 }));
+        }
+        catch (G2AOriginException gex) when (gex.Code == "invalid_arguments")
+        {
+            caughtBadEnum = true;
+        }
+        if (!caughtBadEnum) throw new Exception("Expected SchemaBuilder enum rejection");
+        var okTokRep = sdk.HandleOriginExecute(new OriginExecuteRequest("slot-csharp", 1, "invoke", "ex-cs-tok", "#09", "companion", new Dictionary<string, object?> { ["mode"] = "careful", ["power"] = 50 }));
+        if (okTokRep.State != "executing") throw new Exception("Expected executing state for #09");
+        var stepTok = sdk.CreateStepToken("ex-cs-tok");
+        if (!stepTok.IsInFlight) throw new Exception("Expected StepExecutionToken.IsInFlight == true");
+        stepTok.CompleteSucceeded(new Dictionary<string, object?> { ["warded"] = true });
+        if (stepTok.IsInFlight) throw new Exception("Expected StepExecutionToken.IsInFlight == false after settlement");
+
         Console.WriteLine($"C# G2A.InteractionOrigin SelfTest PASSED | JCS={d1}");
         return 0;
     }

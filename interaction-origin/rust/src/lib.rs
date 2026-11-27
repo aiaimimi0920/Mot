@@ -191,6 +191,139 @@ pub struct SlotPublishOptions {
     pub allowlist_criteria_url: String,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct SchemaBuilder {
+    properties: JsonObject,
+    required: Vec<String>,
+    allow_additional: bool,
+}
+
+impl SchemaBuilder {
+    pub fn object() -> Self {
+        Self::default()
+    }
+
+    fn add_prop(mut self, name: &str, spec: JsonObject, required: bool) -> Self {
+        self.properties.insert(name.to_owned(), JsonValue::Object(spec));
+        if required && !self.required.iter().any(|k| k == name) {
+            self.required.push(name.to_owned());
+        }
+        self
+    }
+
+    pub fn string(self, name: &str, required: bool, min_len: Option<i64>, max_len: Option<i64>) -> Self {
+        let mut s = JsonObject::new();
+        s.insert("type".to_owned(), JsonValue::from("string"));
+        if let Some(mn) = min_len {
+            s.insert("minLength".to_owned(), JsonValue::from(mn));
+        }
+        if let Some(mx) = max_len {
+            s.insert("maxLength".to_owned(), JsonValue::from(mx));
+        }
+        self.add_prop(name, s, required)
+    }
+
+    pub fn string_enum(self, name: &str, values: &[&str], required: bool) -> Self {
+        let mut s = JsonObject::new();
+        s.insert("type".to_owned(), JsonValue::from("string"));
+        s.insert(
+            "enum".to_owned(),
+            JsonValue::Array(values.iter().map(|v| JsonValue::from(*v)).collect()),
+        );
+        self.add_prop(name, s, required)
+    }
+
+    pub fn integer(self, name: &str, required: bool, minimum: Option<i64>, maximum: Option<i64>) -> Self {
+        let mut s = JsonObject::new();
+        s.insert("type".to_owned(), JsonValue::from("integer"));
+        if let Some(mn) = minimum {
+            s.insert("minimum".to_owned(), JsonValue::from(mn));
+        }
+        if let Some(mx) = maximum {
+            s.insert("maximum".to_owned(), JsonValue::from(mx));
+        }
+        self.add_prop(name, s, required)
+    }
+
+    pub fn number(self, name: &str, required: bool, minimum: Option<f64>, maximum: Option<f64>) -> Self {
+        let mut s = JsonObject::new();
+        s.insert("type".to_owned(), JsonValue::from("number"));
+        if let Some(mn) = minimum {
+            s.insert("minimum".to_owned(), JsonValue::from(mn));
+        }
+        if let Some(mx) = maximum {
+            s.insert("maximum".to_owned(), JsonValue::from(mx));
+        }
+        self.add_prop(name, s, required)
+    }
+
+    pub fn boolean(self, name: &str, required: bool) -> Self {
+        let mut s = JsonObject::new();
+        s.insert("type".to_owned(), JsonValue::from("boolean"));
+        self.add_prop(name, s, required)
+    }
+
+    pub fn string_array(self, name: &str, required: bool, min_items: Option<i64>, max_items: Option<i64>) -> Self {
+        let mut item = JsonObject::new();
+        item.insert("type".to_owned(), JsonValue::from("string"));
+        let mut s = JsonObject::new();
+        s.insert("type".to_owned(), JsonValue::from("array"));
+        s.insert("items".to_owned(), JsonValue::Object(item));
+        if let Some(mn) = min_items {
+            s.insert("minItems".to_owned(), JsonValue::from(mn));
+        }
+        if let Some(mx) = max_items {
+            s.insert("maxItems".to_owned(), JsonValue::from(mx));
+        }
+        self.add_prop(name, s, required)
+    }
+
+    pub fn object_field(self, name: &str, child_schema: JsonObject, required: bool) -> Self {
+        self.add_prop(name, child_schema, required)
+    }
+
+    pub fn allow_additional(mut self, allow: bool) -> Self {
+        self.allow_additional = allow;
+        self
+    }
+
+    pub fn build(self) -> JsonObject {
+        let mut out = JsonObject::new();
+        out.insert("type".to_owned(), JsonValue::from("object"));
+        out.insert(
+            "required".to_owned(),
+            JsonValue::Array(self.required.into_iter().map(JsonValue::from).collect()),
+        );
+        out.insert("additionalProperties".to_owned(), JsonValue::from(self.allow_additional));
+        out.insert("properties".to_owned(), JsonValue::Object(self.properties));
+        out
+    }
+}
+
+#[derive(Clone)]
+pub struct StepExecutionToken {
+    sdk: std::sync::Arc<OriginSdk>,
+    execution_id: String,
+}
+
+impl StepExecutionToken {
+    pub fn execution_id(&self) -> &str {
+        &self.execution_id
+    }
+
+    pub fn is_in_flight(&self) -> bool {
+        self.sdk.is_step_in_flight(&self.execution_id)
+    }
+
+    pub fn complete_succeeded(&self, summary: Option<JsonObject>) {
+        self.sdk.complete_step(&self.execution_id, true, summary, None);
+    }
+
+    pub fn complete_failed(&self, reason: impl Into<String>) {
+        self.sdk.complete_step(&self.execution_id, false, None, Some(reason.into()));
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Pose3D {
     pub x: f64,
@@ -554,6 +687,25 @@ impl OriginSdk {
     pub fn get_capability_actors(&self, method_id: &str) -> Option<Vec<String>> {
         let st = self.state.lock().unwrap();
         st.capabilities.get(method_id).map(|r| r.def.permitted_actors.clone())
+    }
+
+    pub fn current_rev(&self) -> i64 {
+        self.state.lock().unwrap().current_rev
+    }
+
+    pub fn current_epoch(&self) -> i64 {
+        self.state.lock().unwrap().current_epoch
+    }
+
+    pub fn is_step_in_flight(&self, execution_id: &str) -> bool {
+        self.state.lock().unwrap().in_flight.contains_key(execution_id)
+    }
+
+    pub fn step_token(self: &std::sync::Arc<Self>, execution_id: impl Into<String>) -> StepExecutionToken {
+        StepExecutionToken {
+            sdk: std::sync::Arc::clone(self),
+            execution_id: execution_id.into(),
+        }
     }
 
     pub fn bind_actor_subject(&self, actor: &str) {
@@ -1623,5 +1775,44 @@ mod tests {
         assert!(full_wire.contains("\"mode\":\"full\""));
         assert!(full_wire.contains("\"ex-fallible-1\""));
         assert!(full_wire.contains("\"succeeded\""));
+        drop(locked);
+
+        // 3. Verify fluent SchemaBuilder & StepExecutionToken handle
+        let arc_sdk = Arc::new(sdk);
+        let built_schema = SchemaBuilder::object()
+            .string_enum("stance", &["guard", "sprint"], true)
+            .integer("level", true, Some(1), Some(10))
+            .boolean("quiet", false)
+            .build();
+        arc_sdk.register_capability(
+            CapabilityEntry {
+                method_id: "#02".to_owned(),
+                name: "set_stance".to_owned(),
+                description: "Set stance".to_owned(),
+                permitted_actors: vec!["companion".to_owned()],
+                params_schema: built_schema,
+                sustained: true,
+                risk_flags: vec![],
+                default_policy: "allow".to_owned(),
+            },
+            Box::new(|_, _, _| EffectOutcome::StartedExecuting(Box::new(|| {}))),
+        );
+        let mut ok_stance = JsonObject::new();
+        ok_stance.insert("stance".to_owned(), JsonValue::from("guard"));
+        ok_stance.insert("level".to_owned(), JsonValue::from(5i64));
+        let st_rep = arc_sdk.handle_origin_execute(&OriginExecuteRequest {
+            slot_id: "slot-rust-resync".to_owned(),
+            epoch: 1,
+            kind: "invoke".to_owned(),
+            execution_id: "ex-tok-rs".to_owned(),
+            method_id: Some("#02".to_owned()),
+            actor: Some("companion".to_owned()),
+            args: ok_stance,
+        });
+        assert_eq!(st_rep.state, "executing");
+        let tok_rs = arc_sdk.step_token("ex-tok-rs");
+        assert!(tok_rs.is_in_flight());
+        tok_rs.complete_succeeded(None);
+        assert!(!tok_rs.is_in_flight());
     }
 }

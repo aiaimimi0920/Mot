@@ -319,6 +319,41 @@ func TestLiveThreeTierGoCoreWebSocketAndExtensions(t *testing.T) {
 	if len(compiledTools) != 1 {
 		t.Fatalf("expected 1 compiled OpenAI tool, got %d", len(compiledTools))
 	}
+	anthropicTools := CompileContextTools(
+		[]CapabilityEntry{{MethodID: "#01", Name: "ping_beacon", Description: "Ping beacon", PermittedActors: []string{"companion"}}},
+		ProjectedContext{
+			SlotID: "s1", Epoch: 1, Rev: 2,
+			ActiveMethods: []ActiveMethodGrant{{
+				MethodID: "#01", Actor: "companion", Readiness: "ready",
+				Targets: []TargetCandidate{{TargetID: "b_right", Label: "Right Beacon", Readiness: "ready"}},
+			}},
+		},
+		"anthropic",
+	)
+	if len(anthropicTools) != 1 || anthropicTools[0]["input_schema"] == nil {
+		t.Fatalf("expected Anthropic tool input_schema, got %+v", anthropicTools)
+	}
+	decodedPlan := ToolCallsToPlanDecision(
+		[]map[string]any{{"name": anthropicTools[0]["name"], "input": map[string]any{"target_id": "b_right"}}},
+		[]CapabilityEntry{{MethodID: "#01", Name: "ping_beacon", Description: "Ping beacon", PermittedActors: []string{"companion"}}},
+		ProjectedContext{
+			SlotID: "s1", Epoch: 1, Rev: 2,
+			ActiveMethods: []ActiveMethodGrant{{
+				MethodID: "#01", Actor: "companion", Readiness: "ready",
+				Targets: []TargetCandidate{{TargetID: "b_right", Label: "Right Beacon", Readiness: "ready"}},
+			}},
+		},
+		"Ping right beacon",
+	)
+	if len(decodedPlan.PlannedSteps) != 1 || decodedPlan.PlannedSteps[0].MethodID != "#01" {
+		t.Fatalf("expected ToolCallsToPlanDecision to decode #01 step, got %+v", decodedPlan)
+	}
+	if neg := sdk.NegotiatedExtensions(); len(neg) != 1 || neg[0] != "org.g2a.sim.batch_blueprint.v1" {
+		t.Fatalf("unexpected NegotiatedExtensions: %+v", neg)
+	}
+	if sdk.LatestContext() == nil {
+		t.Fatal("expected LatestContext to be cached after PullContext")
+	}
 	fnSpec, _ := compiledTools[0]["function"].(map[string]any)
 	paramsSpec, _ := fnSpec["parameters"].(map[string]any)
 	propsSpec, _ := paramsSpec["properties"].(map[string]any)

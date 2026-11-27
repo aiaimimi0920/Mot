@@ -220,6 +220,90 @@ export async function discoverLocalHubOriginUrl(explicitPath) {
   return doc.origin_url.replace(/\/$/, "");
 }
 
+export function immediateSucceeded(effect_summary) {
+  return { kind: "succeeded", effect_summary };
+}
+
+export function immediateFailed(reason) {
+  return { kind: "failed", reason };
+}
+
+export function startedExecuting(cancel_fn) {
+  return { kind: "executing", cancel_fn };
+}
+
+export class SchemaBuilder {
+  constructor(allowAdditional = false) {
+    this.properties = {};
+    this.required = [];
+    this.additional = allowAdditional;
+  }
+
+  static object(allowAdditional = false) {
+    return new SchemaBuilder(allowAdditional);
+  }
+
+  _addProp(name, spec, isRequired) {
+    this.properties[name] = spec;
+    if (isRequired && !this.required.includes(name)) this.required.push(name);
+    return this;
+  }
+
+  string(name, required = true, options = {}) {
+    const spec = { type: "string" };
+    if (options.minLength !== undefined) spec.minLength = options.minLength;
+    if (options.maxLength !== undefined) spec.maxLength = options.maxLength;
+    return this._addProp(name, spec, required);
+  }
+
+  stringEnum(name, values, required = true) {
+    return this._addProp(name, { type: "string", enum: [...values] }, required);
+  }
+
+  integer(name, required = true, options = {}) {
+    const spec = { type: "integer" };
+    if (options.minimum !== undefined) spec.minimum = options.minimum;
+    if (options.maximum !== undefined) spec.maximum = options.maximum;
+    return this._addProp(name, spec, required);
+  }
+
+  number(name, required = true, options = {}) {
+    const spec = { type: "number" };
+    if (options.minimum !== undefined) spec.minimum = options.minimum;
+    if (options.maximum !== undefined) spec.maximum = options.maximum;
+    return this._addProp(name, spec, required);
+  }
+
+  boolean(name, required = false) {
+    return this._addProp(name, { type: "boolean" }, required);
+  }
+
+  stringArray(name, required = false, options = {}) {
+    const spec = { type: "array", items: { type: "string" } };
+    if (options.minItems !== undefined) spec.minItems = options.minItems;
+    if (options.maxItems !== undefined) spec.maxItems = options.maxItems;
+    return this._addProp(name, spec, required);
+  }
+
+  objectField(name, childSchema, required = false) {
+    return this._addProp(name, { ...childSchema }, required);
+  }
+
+  allowAdditional(allow = true) {
+    this.additional = allow;
+    return this;
+  }
+
+  build() {
+    return {
+      type: "object",
+      required: [...this.required],
+      additionalProperties: this.additional,
+      properties: { ...this.properties },
+    };
+  }
+}
+
 export class OriginSDK {
   constructor(
     slotId,
@@ -552,9 +636,10 @@ export class OriginSDK {
     }
     const schemaErr = validateArgsAgainstSchema(req.args ?? {}, reg.def.params_schema);
     if (schemaErr) return { execution_id: req.execution_id, state: "failed", failure_reason: schemaErr };
-    const out = reg.handler(req.actor, this.actors.get(req.actor), req.args ?? {}, req.execution_id);
+    const token = this.createStepToken(req.execution_id);
+    const out = reg.handler(req.actor, this.actors.get(req.actor), req.args ?? {}, req.execution_id, token);
     if (out.kind === "executing") {
-      this.inFlight.set(req.execution_id, out.cancel_fn);
+      this.inFlight.set(req.execution_id, out.cancel_fn ?? (() => {}));
       const rep = { execution_id: req.execution_id, state: "executing" };
       this.storeLedgerReply(rep);
       return rep;
@@ -576,6 +661,26 @@ export class OriginSDK {
         if (!this.inFlight.has(oldId)) this.ledger.delete(oldId);
       }
     }
+  }
+
+  isStepInFlight(executionId) {
+    return this.inFlight.has(executionId);
+  }
+
+  createStepToken(executionId) {
+    const sdk = this;
+    return {
+      executionId,
+      get isInFlight() {
+        return sdk.isStepInFlight(executionId);
+      },
+      completeSucceeded(summary) {
+        return sdk.completeStep(executionId, true, summary);
+      },
+      completeFailed(reason) {
+        return sdk.completeStep(executionId, false, undefined, reason);
+      },
+    };
   }
 
   async completeStep(executionId, succeeded, summary, reason) {

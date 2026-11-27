@@ -66,9 +66,9 @@ public sealed record OriginExecuteReply(
 
 public abstract record EffectInvocationResult
 {
-    public sealed record ImmediateSucceeded(Dictionary<string, object?> EffectSummary) : EffectInvocationResult;
+    public sealed record ImmediateSucceeded(Dictionary<string, object?>? EffectSummary = null) : EffectInvocationResult;
     public sealed record ImmediateFailed(string Reason) : EffectInvocationResult;
-    public sealed record StartedExecuting(Action CancelFn) : EffectInvocationResult;
+    public sealed record StartedExecuting(Action? CancelFn = null) : EffectInvocationResult;
 }
 
 public interface IEngineDispatcherPort

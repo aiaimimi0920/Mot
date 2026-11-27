@@ -136,6 +136,16 @@ class StepExecutionToken:
         if self._sdk is not None:
             self._sdk.complete_step(self.execution_id, succeeded, summary=summary, reason=reason)
 
+    @property
+    def is_in_flight(self) -> bool:
+        return self._sdk is not None and self.execution_id in self._sdk.in_flight_steps
+
+    def complete_succeeded(self, summary: Optional[Dict[str, Any]] = None) -> None:
+        self.complete(True, summary=summary)
+
+    def complete_failed(self, reason: str) -> None:
+        self.complete(False, reason=reason)
+
 
 @dataclass
 class ImmediateSucceeded:
@@ -644,6 +654,102 @@ def infer_params_schema_from_callable(
         "additionalProperties": allow_extra,
         "properties": props,
     }
+
+
+class SchemaBuilder:
+    """Fluent JSON Schema builder for G2A V0.0.1 capability `params_schema` definitions."""
+
+    def __init__(self, allow_additional: bool = False) -> None:
+        self._properties: Dict[str, Dict[str, Any]] = {}
+        self._required: List[str] = []
+        self._allow_additional: bool = allow_additional
+
+    @classmethod
+    def object(cls, allow_additional: bool = False) -> "SchemaBuilder":
+        return cls(allow_additional=allow_additional)
+
+    def _add_prop(self, name: str, spec: Dict[str, Any], required: bool) -> "SchemaBuilder":
+        self._properties[name] = spec
+        if required and name not in self._required:
+            self._required.append(name)
+        return self
+
+    def string(
+        self,
+        name: str,
+        required: bool = True,
+        min_length: Optional[int] = None,
+        max_length: Optional[int] = None,
+    ) -> "SchemaBuilder":
+        spec: Dict[str, Any] = {"type": "string"}
+        if min_length is not None:
+            spec["minLength"] = min_length
+        if max_length is not None:
+            spec["maxLength"] = max_length
+        return self._add_prop(name, spec, required)
+
+    def string_enum(self, name: str, values: Sequence[str], required: bool = True) -> "SchemaBuilder":
+        return self._add_prop(name, {"type": "string", "enum": list(values)}, required)
+
+    def integer(
+        self,
+        name: str,
+        required: bool = True,
+        minimum: Optional[int] = None,
+        maximum: Optional[int] = None,
+    ) -> "SchemaBuilder":
+        spec: Dict[str, Any] = {"type": "integer"}
+        if minimum is not None:
+            spec["minimum"] = minimum
+        if maximum is not None:
+            spec["maximum"] = maximum
+        return self._add_prop(name, spec, required)
+
+    def number(
+        self,
+        name: str,
+        required: bool = True,
+        minimum: Optional[float] = None,
+        maximum: Optional[float] = None,
+    ) -> "SchemaBuilder":
+        spec: Dict[str, Any] = {"type": "number"}
+        if minimum is not None:
+            spec["minimum"] = minimum
+        if maximum is not None:
+            spec["maximum"] = maximum
+        return self._add_prop(name, spec, required)
+
+    def boolean(self, name: str, required: bool = False) -> "SchemaBuilder":
+        return self._add_prop(name, {"type": "boolean"}, required)
+
+    def string_array(
+        self,
+        name: str,
+        required: bool = False,
+        min_items: Optional[int] = None,
+        max_items: Optional[int] = None,
+    ) -> "SchemaBuilder":
+        spec: Dict[str, Any] = {"type": "array", "items": {"type": "string"}}
+        if min_items is not None:
+            spec["minItems"] = min_items
+        if max_items is not None:
+            spec["maxItems"] = max_items
+        return self._add_prop(name, spec, required)
+
+    def object_field(self, name: str, child_schema: Dict[str, Any], required: bool = False) -> "SchemaBuilder":
+        return self._add_prop(name, dict(child_schema), required)
+
+    def allow_additional(self, allow: bool = True) -> "SchemaBuilder":
+        self._allow_additional = allow
+        return self
+
+    def build(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "required": list(self._required),
+            "additionalProperties": self._allow_additional,
+            "properties": dict(self._properties),
+        }
 
 
 # --- OriginSDK (§2.2 - §2.4) ---

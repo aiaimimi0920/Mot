@@ -191,6 +191,18 @@ if (fs.existsSync(hubPath)) {
     const tsTools = compileOpenAiTools(coreSdk.getCachedCapabilities(), pulled);
     assert.equal(tsTools.length, 1);
     assert.deepEqual(tsTools[0].function.parameters.properties.target_id.enum, ["chest_R"]);
+    const { compileContextTools, toolCallsToPlanDecision } = await import("../esm/index.mjs");
+    const mcpTools = compileContextTools(coreSdk.getCachedCapabilities(), pulled, "mcp");
+    assert.equal(mcpTools.length, 1);
+    assert.equal(typeof mcpTools[0].inputSchema, "object");
+    const decodedDec = toolCallsToPlanDecision(
+      [{ name: mcpTools[0].name, arguments: { target_id: "chest_R" } }],
+      coreSdk.getCachedCapabilities(),
+      pulled
+    );
+    assert.equal(decodedDec.planned_steps.length, 1);
+    assert.equal(coreSdk.negotiatedExtensions.includes("org.g2a.sim.batch_blueprint.v1"), true);
+    assert.equal(coreSdk.latestContext?.slot_id, "slot-ts-live");
 
     await origSdk.reportPlayerCommand("open right chest");
     const deadline = Date.now() + 3000;
@@ -199,6 +211,13 @@ if (fs.existsSync(hubPath)) {
     }
     assert.equal(chestOpened, true);
     assert.equal(chatDelivered[0], "player_only:Opening the right chest!");
+
+    // Verify one-line invokeCapability by human-readable capability name (after 400ms slot shared_cooldown_ms)!
+    await new Promise((r) => setTimeout(r, 450));
+    chestOpened = false;
+    const invRec = await coreSdk.invokeCapability("open_chest", { target_id: "chest_R" });
+    assert.equal(invRec.queue_state, "completed");
+    assert.equal(chestOpened, true);
 
     await coreSdk.closeSession(coreUrl, "ts-core-agent");
     origSdk.stopOutboundExecuteStream();

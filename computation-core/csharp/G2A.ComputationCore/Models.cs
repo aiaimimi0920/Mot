@@ -151,6 +151,29 @@ public sealed class NoOpPlanner : ICognitivePlanner
         CancellationToken ct = default) => Task.FromResult(new PlanDecision());
 }
 
+public sealed class DelegatePlanner : ICognitivePlanner
+{
+    private readonly Func<IReadOnlyList<CapabilityEntry>, ProjectedContext, IReadOnlyList<MemoryRecord>, CancellationToken, Task<PlanDecision>> _fn;
+
+    public DelegatePlanner(Func<IReadOnlyList<CapabilityEntry>, ProjectedContext, IReadOnlyList<MemoryRecord>, CancellationToken, Task<PlanDecision>> fn) =>
+        _fn = fn;
+
+    public DelegatePlanner(Func<IReadOnlyList<CapabilityEntry>, ProjectedContext, IReadOnlyList<MemoryRecord>, PlanDecision> syncFn) =>
+        _fn = (caps, ctx, mems, _) => Task.FromResult(syncFn(caps, ctx, mems));
+
+    public Task<PlanDecision> PlanAsync(
+        IReadOnlyList<CapabilityEntry> capabilities,
+        ProjectedContext context,
+        IReadOnlyList<MemoryRecord> recalledMemories,
+        CancellationToken ct = default) => _fn(capabilities, context, recalledMemories, ct);
+}
+
+public sealed record CoreMetricsSnapshot(
+    long ContextsReceived,
+    long QueuesSubmitted,
+    long BackoffShieldHits
+);
+
 public static class HubDiscovery
 {
     public static string DiscoverLocalHubCoreUrl(string? runtimeFilePath = null)

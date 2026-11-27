@@ -31,24 +31,47 @@ const (
 type ConnectOptions struct {
 	PlayerID            string
 	FactionID           string
+	ConsumptionCap      *int64
 	RequestedScope      map[string]any
 	Extensions          map[string]any
 	SkipBackgroundLoops bool
 }
 
+type CoreMetrics struct {
+	ContextsReceived  int64
+	QueuesSubmitted   int64
+	StreamReconnects  int64
+	BackoffShieldHits int64
+}
+
+type InvokeOptions struct {
+	Actor                    string
+	DeicticHint              string
+	IntentSummary            string
+	Trigger                  string
+	DisableAutoPrerequisites bool
+	NoWaitTerminal           bool
+}
+
 // CoreSDK implements the Tier 3 Computation Core state machine (G2A V0.0.1).
 type CoreSDK struct {
-	Planner       CognitivePlanner
-	Memory        *InMemoryCompanionStore
-	AllowLoopback bool
-	StreamMode    string // "websocket" (default) | "sse"
+	Planner               CognitivePlanner
+	Memory                *InMemoryCompanionStore
+	AllowLoopback         bool
+	StreamMode            string // "websocket" (default) | "sse"
+	OnContext             func(ProjectedContext)
+	OnCapabilitiesUpdated func([]CapabilityEntry)
+	OnSessionClosed       func()
 
-	mu                  sync.Mutex
-	hubEndpoint         string
-	authToken           string
-	sessionID           string
-	frozenScope         *FrozenScope
-	actionsPaused       bool
+	mu                   sync.Mutex
+	hubEndpoint          string
+	authToken            string
+	sessionID            string
+	frozenScope          *FrozenScope
+	negotiatedExtensions []string
+	latestContext        *ProjectedContext
+	metrics              CoreMetrics
+	actionsPaused        bool
 	closed              bool
 	nextAllowedPullMs   int64
 	lastEventID         string
@@ -103,6 +126,40 @@ func (c *CoreSDK) SessionID() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.sessionID
+}
+
+func (c *CoreSDK) Scope() *FrozenScope {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.frozenScope == nil {
+		return nil
+	}
+	cp := *c.frozenScope
+	return &cp
+}
+
+func (c *CoreSDK) NegotiatedExtensions() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.negotiatedExtensions))
+	copy(out, c.negotiatedExtensions)
+	return out
+}
+
+func (c *CoreSDK) LatestContext() *ProjectedContext {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.latestContext == nil {
+		return nil
+	}
+	cp := *c.latestContext
+	return &cp
+}
+
+func (c *CoreSDK) Metrics() CoreMetrics {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.metrics
 }
 
 func (c *CoreSDK) CapabilityCacheCount(digest string) int {
@@ -197,6 +254,9 @@ func (c *CoreSDK) Connect(
 	if cachedDigest != "" {
 		authPayload["cached_capability_digest"] = cachedDigest
 	}
+	if opts.ConsumptionCap != nil {
+		authPayload["consumption_cap"] = *opts.ConsumptionCap
+	}
 
 	rawRes, err := c.postEnvelope(ctx, "session.authorize", authPayload, "", opts.Extensions)
 	if err != nil {
@@ -207,6 +267,7 @@ func (c *CoreSDK) Connect(
 		CapabilityTableDigest string            `json:"capability_table_digest"`
 		CapabilityTable       []CapabilityEntry `json:"capability_table"`
 		FrozenScope           FrozenScope       `json:"frozen_scope"`
+		NegotiatedExtensions  []string          `json:"negotiated_extensions"`
 	}
 	if err := UnmarshalStrict(rawRes, &authRes); err != nil {
 		return nil, err
@@ -225,6 +286,7 @@ func (c *CoreSDK) Connect(
 	c.mu.Lock()
 	c.sessionID = authRes.SessionID
 	c.frozenScope = &authRes.FrozenScope
+	c.negotiatedExtensions = authRes.NegotiatedExtensions
 	c.slotDigests[slotID] = authRes.CapabilityTableDigest
 	c.cancelBg = cancel
 	c.mu.Unlock()
@@ -400,6 +462,167 @@ func (b *QueueBuilder) Submit(ctx context.Context, queueID string) (*QueueReceip
 	})
 }
 
+func (b *QueueBuilder) SubmitAndWait(ctx context.Context, queueID string) (*QueueReceipt, error) {
+	if queueID == "" {
+		queueID = "Q-" + randomHex(6)
+	}
+	initial, err := b.Submit(ctx, queueID)
+	if err != nil {
+		return nil, err
+	}
+	return b.sdk.WaitForQueueTerminal(ctx, queueID, initial)
+}
+
+func (c *CoreSDK) InvokeCapability(
+	ctx context.Context,
+	methodIDOrName string,
+	args map[string]any,
+	opts InvokeOptions,
+) (*QueueReceipt, error) {
+	pc, err := c.PullContextIfDue(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if pc == nil {
+		pc = c.LatestContext()
+	}
+	if pc == nil {
+		pc, err = c.PullContext(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	caps := c.GetCachedCapabilities(pc.SlotID)
+	resolvedMid := methodIDOrName
+	var matchedCap *CapabilityEntry
+	for i := range caps {
+		if caps[i].MethodID == methodIDOrName {
+			matchedCap = &caps[i]
+			break
+		}
+	}
+	if matchedCap == nil {
+		low := strings.ToLower(strings.TrimSpace(methodIDOrName))
+		for i := range caps {
+			if strings.ToLower(caps[i].Name) == low {
+				matchedCap = &caps[i]
+				resolvedMid = caps[i].MethodID
+				break
+			}
+		}
+	}
+	scope := c.Scope()
+	var allowedActors []string
+	hasScopeEntry := false
+	if scope != nil && scope.PermittedMethods != nil {
+		allowedActors, hasScopeEntry = scope.PermittedMethods[resolvedMid]
+	}
+	actorAllowed := func(a string) bool {
+		if !hasScopeEntry {
+			return true
+		}
+		for _, okA := range allowedActors {
+			if okA == a {
+				return true
+			}
+		}
+		return false
+	}
+
+	resolvedActor := opts.Actor
+	if resolvedActor == "" {
+		for _, g := range pc.ActiveMethods {
+			if g.MethodID == resolvedMid && g.Actor == "companion" && actorAllowed("companion") {
+				resolvedActor = "companion"
+				break
+			}
+		}
+		if resolvedActor == "" {
+			for _, g := range pc.ActiveMethods {
+				if g.MethodID == resolvedMid && actorAllowed(g.Actor) {
+					resolvedActor = g.Actor
+					break
+				}
+			}
+		}
+		if resolvedActor == "" {
+			resolvedActor = "companion"
+		}
+	}
+
+	stepArgs := map[string]any{}
+	for k, v := range args {
+		stepArgs[k] = v
+	}
+	if opts.DeicticHint != "" {
+		if _, hasTID := stepArgs["target_id"]; !hasTID {
+			for _, g := range pc.ActiveMethods {
+				if g.MethodID == resolvedMid && g.Actor == resolvedActor && len(g.Targets) > 0 {
+					if cand := ResolveDeicticTarget(opts.DeicticHint, g.Targets); cand != nil {
+						stepArgs["target_id"] = cand.TargetID
+					}
+					break
+				}
+			}
+		}
+	}
+
+	summary := opts.IntentSummary
+	if summary == "" {
+		if matchedCap != nil {
+			summary = "Invoke " + matchedCap.Name
+		} else {
+			summary = "Invoke " + resolvedMid
+		}
+	}
+	builder := c.NewQueueBuilder(*pc, summary)
+	if opts.Trigger != "" {
+		builder.trigger = opts.Trigger
+		builder.supersedes = opts.Trigger == "player_command"
+	}
+	if !opts.DisableAutoPrerequisites {
+		if _, err := builder.AddStepAuto(resolvedMid, resolvedActor, stepArgs, true); err != nil {
+			return nil, err
+		}
+	} else {
+		if _, err := builder.AddStep(resolvedMid, resolvedActor, stepArgs, true); err != nil {
+			return nil, err
+		}
+	}
+	if opts.NoWaitTerminal {
+		rec, err := builder.Submit(ctx, "")
+		if err != nil || rec != nil {
+			return rec, err
+		}
+	} else {
+		rec, err := builder.SubmitAndWait(ctx, "")
+		if err != nil || rec != nil {
+			return rec, err
+		}
+	}
+	if fresh := c.LatestContext(); fresh != nil && (fresh.Epoch > pc.Epoch || fresh.Rev > pc.Rev) {
+		retryBuilder := c.NewQueueBuilder(*fresh, summary)
+		if opts.Trigger != "" {
+			retryBuilder.trigger = opts.Trigger
+			retryBuilder.supersedes = opts.Trigger == "player_command"
+		}
+		if !opts.DisableAutoPrerequisites {
+			if _, err := retryBuilder.AddStepAuto(resolvedMid, resolvedActor, stepArgs, true); err != nil {
+				return nil, err
+			}
+		} else {
+			if _, err := retryBuilder.AddStep(resolvedMid, resolvedActor, stepArgs, true); err != nil {
+				return nil, err
+			}
+		}
+		if opts.NoWaitTerminal {
+			return retryBuilder.Submit(ctx, "")
+		}
+		return retryBuilder.SubmitAndWait(ctx, "")
+	}
+	return nil, nil
+}
+
 func (c *CoreSDK) PullContext(ctx context.Context) (*ProjectedContext, error) {
 	sid := c.SessionID()
 	raw, err := c.postEnvelope(ctx, "context.pull", map[string]any{}, sid, nil)
@@ -416,12 +639,18 @@ func (c *CoreSDK) PullContext(ctx context.Context) (*ProjectedContext, error) {
 	if err := UnmarshalStrict(raw, &pc); err != nil {
 		return nil, err
 	}
+	c.mu.Lock()
+	c.latestContext = &pc
+	c.mu.Unlock()
 	return &pc, nil
 }
 
 func (c *CoreSDK) PullContextIfDue(ctx context.Context) (*ProjectedContext, error) {
 	c.mu.Lock()
 	if c.closed || c.sessionID == "" || time.Now().UnixMilli() < c.nextAllowedPullMs {
+		if time.Now().UnixMilli() < c.nextAllowedPullMs {
+			c.metrics.BackoffShieldHits++
+		}
 		c.mu.Unlock()
 		return nil, nil
 	}
@@ -431,6 +660,9 @@ func (c *CoreSDK) PullContextIfDue(ctx context.Context) (*ProjectedContext, erro
 	if err != nil {
 		var gerr *G2AError
 		if errors.As(err, &gerr) && gerr.Code == "resource_limit" {
+			c.mu.Lock()
+			c.metrics.BackoffShieldHits++
+			c.mu.Unlock()
 			return nil, nil
 		}
 		return nil, err
@@ -466,6 +698,10 @@ func (c *CoreSDK) submitQueueDepth(ctx context.Context, queue MethodCallQueue, d
 			return nil, nil
 		}
 	}
+	c.mu.Unlock()
+
+	c.mu.Lock()
+	c.metrics.QueuesSubmitted++
 	c.mu.Unlock()
 
 	raw, err := c.postEnvelope(ctx, "queue.submit", queue, sid, nil)
@@ -504,8 +740,14 @@ func (c *CoreSDK) submitQueueDepth(ctx context.Context, queue MethodCallQueue, d
 		c.mu.Unlock()
 		return nil, nil
 	case "stale_context":
-		if gerr.FreshContext != nil && depth < 2 {
-			return c.onContextReceived(ctx, *gerr.FreshContext, depth+1)
+		if gerr.FreshContext != nil {
+			c.mu.Lock()
+			fc := *gerr.FreshContext
+			c.latestContext = &fc
+			c.mu.Unlock()
+			if depth < 2 {
+				return c.onContextReceived(ctx, *gerr.FreshContext, depth+1)
+			}
 		}
 		return nil, nil
 	case "outcome_unknown":
@@ -788,6 +1030,9 @@ func (c *CoreSDK) onContextReceived(ctx context.Context, pc ProjectedContext, de
 		c.mu.Unlock()
 		return nil, nil
 	}
+	c.metrics.ContextsReceived++
+	cpCtx := pc
+	c.latestContext = &cpCtx
 	caps := c.capabilityCache[pc.CapabilityTableDigest]
 	var playerID string
 	if c.frozenScope != nil {
@@ -869,6 +1114,9 @@ func (c *CoreSDK) handlePushFrame(ctx context.Context, raw []byte) {
 		c.mu.Unlock()
 		var pc ProjectedContext
 		if err := UnmarshalStrict(env.Payload, &pc); err == nil {
+			if c.OnContext != nil {
+				c.OnContext(pc)
+			}
 			_, _ = c.onContextReceived(ctx, pc, 0)
 		}
 	case "capabilities.updated":
@@ -918,6 +1166,9 @@ func (c *CoreSDK) handlePushFrame(ctx context.Context, raw []byte) {
 					}
 				}
 				c.mu.Unlock()
+				if c.OnCapabilitiesUpdated != nil {
+					c.OnCapabilitiesUpdated(capEv.CapabilityTable)
+				}
 			}
 		}
 	case "queue.confirmed":

@@ -90,6 +90,18 @@ class AsyncQueueBuilder:
     async def submit(self, queue_id: Optional[str] = None) -> Optional[QueueReceipt]:
         return await self._async_sdk.submit_queue_with_standard_recovery(self.build(queue_id=queue_id))
 
+    async def submit_and_wait(self, queue_id: Optional[str] = None, timeout_sec: float = 15.0) -> Optional[QueueReceipt]:
+        q = self.build(queue_id=queue_id)
+        initial = await self._async_sdk.submit_queue_with_standard_recovery(q)
+        return await asyncio.to_thread(
+            self._async_sdk._sync_delegate.wait_for_queue_terminal,
+            q.queue_id,
+            initial,
+            None,
+            None,
+            timeout_sec,
+        )
+
 
 class AsyncCoreSDK:
     """
@@ -247,12 +259,41 @@ class AsyncCoreSDK:
 
     def build_queue(
         self,
-        context: ProjectedContext,
+        context: Optional[ProjectedContext] = None,
         intent_summary: str = "Execute planned companion queue",
         trigger: Optional[str] = None,
         supersedes: Optional[bool] = None,
     ) -> AsyncQueueBuilder:
-        return AsyncQueueBuilder(self, context, intent_summary=intent_summary, trigger=trigger, supersedes=supersedes)
+        ctx = context or self._sync_delegate.latest_context
+        if ctx is None:
+            raise G2AError("invalid_request", 400, "No cached ProjectedContext; call await pull_context() first or pass context")
+        return AsyncQueueBuilder(self, ctx, intent_summary=intent_summary, trigger=trigger, supersedes=supersedes)
+
+    async def invoke_capability(
+        self,
+        method_id_or_name: str,
+        args: Optional[Dict[str, Any]] = None,
+        *,
+        actor: Optional[str] = None,
+        deictic_hint: Optional[str] = None,
+        intent_summary: Optional[str] = None,
+        trigger: Optional[str] = None,
+        auto_prerequisites: bool = True,
+        wait_terminal: bool = True,
+        timeout_sec: float = 15.0,
+    ) -> Optional[QueueReceipt]:
+        return await asyncio.to_thread(
+            self._sync_delegate.invoke_capability,
+            method_id_or_name,
+            args,
+            actor=actor,
+            deictic_hint=deictic_hint,
+            intent_summary=intent_summary,
+            trigger=trigger,
+            auto_prerequisites=auto_prerequisites,
+            wait_terminal=wait_terminal,
+            timeout_sec=timeout_sec,
+        )
 
     async def execute_goal(
         self,

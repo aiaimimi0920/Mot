@@ -444,6 +444,84 @@ func complete_step(execution_id: String, succeeded: bool, effect_summary: Dictio
 		"failure_reason": failure_reason,
 	}])
 
+func is_step_in_flight(execution_id: String) -> bool:
+	return _in_flight_steps.has(execution_id)
+
+func create_step_token(execution_id: String) -> G2AStepToken:
+	return G2AStepToken.new(self, execution_id)
+
+static func schema_builder(allow_additional: bool = false) -> G2ASchemaBuilder:
+	return G2ASchemaBuilder.new(allow_additional)
+
+static func immediate_succeeded(effect_summary: Dictionary = {}) -> Dictionary:
+	return {"state": "succeeded", "effect_summary": effect_summary}
+
+static func immediate_failed(reason: String) -> Dictionary:
+	return {"state": "failed", "failure_reason": reason}
+
+static func started_executing(cancel_fn: Callable = Callable()) -> Dictionary:
+	return {"state": "executing", "cancel_fn": cancel_fn}
+
+class G2AStepToken extends RefCounted:
+	var _sdk: G2AOriginSDK
+	var execution_id: String
+	func _init(sdk: G2AOriginSDK, eid: String) -> void:
+		_sdk = sdk
+		execution_id = eid
+	func is_in_flight() -> bool:
+		return _sdk != null and _sdk.is_step_in_flight(execution_id)
+	func complete_succeeded(summary: Dictionary = {}) -> void:
+		if _sdk != null:
+			_sdk.complete_step(execution_id, true, summary, "")
+	func complete_failed(reason: String) -> void:
+		if _sdk != null:
+			_sdk.complete_step(execution_id, false, {}, reason)
+
+class G2ASchemaBuilder extends RefCounted:
+	var _props: Dictionary = {}
+	var _required: Array[String] = []
+	var _allow_additional: bool = false
+	func _init(allow_additional: bool = false) -> void:
+		_allow_additional = allow_additional
+	func _add_prop(field_name: String, spec: Dictionary, required: bool) -> G2ASchemaBuilder:
+		_props[field_name] = spec
+		if required and not _required.has(field_name):
+			_required.append(field_name)
+		return self
+	func string_field(field_name: String, required: bool = true, min_length: int = -1, max_length: int = -1) -> G2ASchemaBuilder:
+		var spec := {"type": "string"}
+		if min_length >= 0:
+			spec["minLength"] = min_length
+		if max_length >= 0:
+			spec["maxLength"] = max_length
+		return _add_prop(field_name, spec, required)
+	func string_enum(field_name: String, values: Array, required: bool = true) -> G2ASchemaBuilder:
+		return _add_prop(field_name, {"type": "string", "enum": values.duplicate()}, required)
+	func integer_field(field_name: String, required: bool = true, has_bounds: bool = false, min_val: int = 0, max_val: int = 0) -> G2ASchemaBuilder:
+		var spec := {"type": "integer"}
+		if has_bounds:
+			spec["minimum"] = min_val
+			spec["maximum"] = max_val
+		return _add_prop(field_name, spec, required)
+	func number_field(field_name: String, required: bool = true) -> G2ASchemaBuilder:
+		return _add_prop(field_name, {"type": "number"}, required)
+	func boolean_field(field_name: String, required: bool = false) -> G2ASchemaBuilder:
+		return _add_prop(field_name, {"type": "boolean"}, required)
+	func string_array(field_name: String, required: bool = false) -> G2ASchemaBuilder:
+		return _add_prop(field_name, {"type": "array", "items": {"type": "string"}}, required)
+	func object_field(field_name: String, child_schema: Dictionary, required: bool = false) -> G2ASchemaBuilder:
+		return _add_prop(field_name, child_schema.duplicate(true), required)
+	func allow_additional(allow: bool = true) -> G2ASchemaBuilder:
+		_allow_additional = allow
+		return self
+	func build() -> Dictionary:
+		return {
+			"type": "object",
+			"required": _required.duplicate(),
+			"additionalProperties": _allow_additional,
+			"properties": _props.duplicate(true),
+		}
+
 ## Atomically settles multiple sustained steps and coalesces them into a single `origin.sync` delta frame.
 func complete_steps_batch(items: Array) -> int:
 	var settled_count := 0
