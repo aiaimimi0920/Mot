@@ -358,6 +358,7 @@ export class OriginSDK {
     if (options.allowlist_criteria_url) capPayload.allowlist_criteria_url = options.allowlist_criteria_url;
     if (this.roomId) capPayload.room_id = this.roomId;
     if (this.factionId) capPayload.faction_id = this.factionId;
+    this.lastCapPayload = capPayload;
     await this.postToHub("origin.capabilities", capPayload);
     await this.flushFullSync();
   }
@@ -464,25 +465,41 @@ export class OriginSDK {
       return false;
     }
     const prevRev = this.currentRev++;
+    const prevDigest = this.lastBriefDigest;
+    const prevMethods = new Map(this.lastSentMethods);
     this.framesSynced++;
     this.lastBriefDigest = briefDigest;
     this.lastSentMethods = curCanon;
-    await this.postToHub("origin.sync", {
-      slot_id: this.slotId,
-      epoch: this.currentEpoch,
-      rev: this.currentRev,
-      base_rev: prevRev,
-      mode: "delta",
-      significant_event: significantEvent,
-      state_brief: brief,
-      upserted_methods: upserted,
-      removed_methods: removed,
-      settled_executions: settledBatch,
-      ...(this.visualRef ? { visual_ref: { ...this.visualRef } } : {}),
-      ...(this.audioRef ? { audio_ref: { ...this.audioRef } } : {}),
-      ...(this.allowedTimelineTags ? { allowed_timeline_tags: [...this.allowedTimelineTags] } : {}),
-      ...(hasExt ? { extensions_data: { ...this.extensionsData } } : {}),
-    });
+    try {
+      await this.postToHub("origin.sync", {
+        slot_id: this.slotId,
+        epoch: this.currentEpoch,
+        rev: this.currentRev,
+        base_rev: prevRev,
+        mode: "delta",
+        significant_event: significantEvent,
+        state_brief: brief,
+        upserted_methods: upserted,
+        removed_methods: removed,
+        settled_executions: settledBatch,
+        ...(this.visualRef ? { visual_ref: { ...this.visualRef } } : {}),
+        ...(this.audioRef ? { audio_ref: { ...this.audioRef } } : {}),
+        ...(this.allowedTimelineTags ? { allowed_timeline_tags: [...this.allowedTimelineTags] } : {}),
+        ...(hasExt ? { extensions_data: { ...this.extensionsData } } : {}),
+      });
+    } catch (err) {
+      if (settledBatch.length > 0) this.pendingSettled.unshift(...settledBatch);
+      this.currentRev = prevRev;
+      this.lastBriefDigest = prevDigest;
+      this.lastSentMethods = prevMethods;
+      const msg = String(err?.message ?? err);
+      if (msg.includes("stale_context") || msg.includes("(409)") || msg.includes("not_found")) {
+        if (this.lastCapPayload) await this.postToHub("origin.capabilities", this.lastCapPayload);
+        await this.flushFullSync();
+        return true;
+      }
+      throw err;
+    }
     return true;
   }
 

@@ -44,10 +44,12 @@ var _ledger_order: Array[String] = []
 var _pending_settled: Array = []          # Array[Dictionary]
 var _last_sent_methods: Dictionary = {}   # "method_id|actor" -> String (canonical JSON)
 var _last_sent_brief_digest: String = ""
+var _last_cap_payload: Variant = null
 
 var _http_worker: HTTPRequest = null
 var _http_busy: bool = false
 var _outbound_queue: Array[Dictionary] = []
+var _inflight_env: Variant = null
 
 func _ready() -> void:
 	_ensure_http_worker()
@@ -74,8 +76,28 @@ func _ensure_http_worker() -> void:
 	add_child(_http_worker)
 	_http_worker.request_completed.connect(_on_worker_completed)
 
-func _on_worker_completed(_result: int, _code: int, _headers: PackedStringArray, _body: PackedByteArray) -> void:
+func _on_worker_completed(result: int, code: int, _headers: PackedStringArray, _body: PackedByteArray) -> void:
+	var finished_env = _inflight_env
+	_inflight_env = null
 	_http_busy = false
+	if (result != HTTPRequest.RESULT_SUCCESS or code < 200 or code >= 300) and typeof(finished_env) == TYPE_DICTIONARY:
+		if str(finished_env.get("operation", "")) == "origin.sync":
+			var pl: Dictionary = finished_env.get("payload", {})
+			var lost_settled: Array = pl.get("settled_executions", [])
+			if not lost_settled.is_empty():
+				_pending_settled = lost_settled + _pending_settled
+			if (code == 409 or code == 404) and str(pl.get("mode", "")) == "delta":
+				if _last_cap_payload != null:
+					_outbound_queue.push_front({
+						"g2a_version": G2A_WIRE_VERSION,
+						"request_id": "gd-recap-%d" % Time.get_ticks_usec(),
+						"timestamp_ms": int(Time.get_unix_time_from_system() * 1000.0),
+						"operation": "origin.capabilities",
+						"payload": _last_cap_payload,
+						"extensions": {},
+					})
+				flush_full_sync()
+				return
 	_pump_outbound_queue()
 
 func register_capability(def: Dictionary, effect_handler: Callable, readiness_check: Callable = Callable()) -> void:
@@ -179,6 +201,7 @@ func publish_capabilities_and_baseline(origin_execute_url: String = "") -> void:
 		cap_payload["room_id"] = room_id
 	if faction_id != "":
 		cap_payload["faction_id"] = faction_id
+	_last_cap_payload = cap_payload.duplicate(true)
 	_post_to_hub("origin.capabilities", cap_payload)
 	flush_full_sync()
 
@@ -555,6 +578,7 @@ func _pump_outbound_queue() -> void:
 	if _http_busy or _http_worker == null or _outbound_queue.is_empty():
 		return
 	var next_env: Dictionary = _outbound_queue.pop_front()
+	_inflight_env = next_env
 	var headers := PackedStringArray(["Content-Type: application/json"])
 	if origin_token != "":
 		headers.append("Authorization: Bearer " + origin_token)
@@ -566,4 +590,5 @@ func _pump_outbound_queue() -> void:
 		JSON.stringify(next_env)
 	)
 	if err != OK:
+		_inflight_env = null
 		_http_busy = false

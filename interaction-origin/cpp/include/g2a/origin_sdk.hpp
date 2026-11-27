@@ -449,6 +449,7 @@ public:
         if (!allowlist_criteria_url.empty()) cap_payload["allowlist_criteria_url"] = allowlist_criteria_url;
         if (!room_id_.empty()) cap_payload["room_id"] = room_id_;
         if (!faction_id_.empty()) cap_payload["faction_id"] = faction_id_;
+        last_cap_payload_ = cap_payload;
         transport_("origin.capabilities", cap_payload);
         flush_full_sync();
     }
@@ -483,6 +484,7 @@ public:
             }
         }
 
+        std::vector<OriginExecuteReply> settled_backup = pending_settled_;
         JsonArray settled_arr;
         for (const auto& s : pending_settled_) settled_arr.push_back(s.to_json());
         pending_settled_.clear();
@@ -493,6 +495,8 @@ public:
         }
 
         int64_t prev_rev = current_rev_++;
+        std::string prev_digest = last_brief_digest_;
+        auto prev_methods = last_sent_methods_;
         last_brief_digest_ = brief_digest;
         last_sent_methods_ = std::move(cur_canon);
         metrics_.frames_synced++;
@@ -510,7 +514,26 @@ public:
             {"settled_executions", settled_arr},
         };
         append_optional_sync_fields(frame, std::move(ext_obj));
-        transport_("origin.sync", frame);
+        try {
+            transport_("origin.sync", frame);
+        } catch (const std::exception& ex) {
+            if (!settled_backup.empty()) {
+                settled_backup.insert(settled_backup.end(), pending_settled_.begin(), pending_settled_.end());
+                pending_settled_ = std::move(settled_backup);
+            }
+            current_rev_ = prev_rev;
+            last_brief_digest_ = prev_digest;
+            last_sent_methods_ = std::move(prev_methods);
+            std::string msg(ex.what());
+            if (msg.find("stale_context") != std::string::npos || msg.find(" 409 ") != std::string::npos || msg.find("not_found") != std::string::npos) {
+                if (last_cap_payload_.has_value()) {
+                    transport_("origin.capabilities", *last_cap_payload_);
+                }
+                flush_full_sync();
+                return true;
+            }
+            throw;
+        }
         return true;
     }
 
@@ -528,6 +551,7 @@ public:
             last_sent_methods_[key] = jcs::canonicalize_utf8(g_json);
             upserted.push_back(std::move(g_json));
         }
+        std::vector<OriginExecuteReply> settled_backup = pending_settled_;
         JsonArray settled_arr;
         for (const auto& s : pending_settled_) settled_arr.push_back(s.to_json());
         pending_settled_.clear();
@@ -545,7 +569,15 @@ public:
             {"settled_executions", settled_arr},
         };
         append_optional_sync_fields(frame, std::move(ext_obj));
-        transport_("origin.sync", frame);
+        try {
+            transport_("origin.sync", frame);
+        } catch (...) {
+            if (!settled_backup.empty()) {
+                settled_backup.insert(settled_backup.end(), pending_settled_.begin(), pending_settled_.end());
+                pending_settled_ = std::move(settled_backup);
+            }
+            throw;
+        }
     }
 
     OriginExecuteReply handle_origin_execute(const OriginExecuteRequest& req) {
@@ -924,6 +956,7 @@ private:
     std::vector<OriginExecuteReply> pending_settled_;
     std::map<std::pair<std::string, std::string>, std::string> last_sent_methods_;
     std::string last_brief_digest_;
+    std::optional<JsonObject> last_cap_payload_;
 };
 
 } // namespace g2a

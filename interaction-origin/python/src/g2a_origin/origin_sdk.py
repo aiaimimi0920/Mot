@@ -722,6 +722,7 @@ class OriginSDK:
         self.latest_audio_ref: Optional[Dict[str, Any]] = None
         self.allowed_timeline_tags: Optional[List[str]] = None
         self.extensions_data: Dict[str, Dict[str, Any]] = {}
+        self._last_cap_payload: Optional[Dict[str, Any]] = None
 
         self._http_server: Optional[ThreadingHTTPServer] = None
         self._outbound_stop = threading.Event()
@@ -1161,6 +1162,7 @@ class OriginSDK:
             cap_payload["allowlisted_cores"] = list(allowlisted_cores)
         if allowlist_criteria_url:
             cap_payload["allowlist_criteria_url"] = allowlist_criteria_url
+        self._last_cap_payload = dict(cap_payload)
         self.hub_transport.post_to_hub("origin.capabilities", cap_payload)
         if not disabled:
             self.flush_full_sync()
@@ -1318,14 +1320,15 @@ class OriginSDK:
         if not self.sync_enabled and not self.pending_settled_executions:
             return False
 
-        def _snap() -> Tuple[Dict[str, Any], Dict[Tuple[str, str], Dict[str, Any]], List[Dict[str, Any]]]:
+        def _snap() -> Tuple[Dict[str, Any], Dict[Tuple[str, str], Dict[str, Any]], List[OriginExecuteReply]]:
             b, g_map = self.collect_current_view()
             serialized_grants = {k: v.to_dict() for k, v in g_map.items()}
-            settled = [s.to_dict() for s in self.pending_settled_executions]
+            settled_objs = list(self.pending_settled_executions)
             self.pending_settled_executions.clear()
-            return b, serialized_grants, settled
+            return b, serialized_grants, settled_objs
 
-        brief, current_grants, settled_batch = self.engine_dispatcher.run_on_game_thread(_snap)
+        brief, current_grants, settled_objs = self.engine_dispatcher.run_on_game_thread(_snap)
+        settled_batch = [s.to_dict() for s in settled_objs]
         brief_digest = jcs_sha256(
             "g2a.brief.v1",
             {
@@ -1357,6 +1360,8 @@ class OriginSDK:
             return False
 
         prev_rev = self.current_rev
+        prev_brief_digest = self.last_sent_brief_digest
+        prev_sent_methods = dict(self.last_sent_methods)
         self.current_rev += 1
         self.metrics.frames_synced += 1
         frame = {
@@ -1381,18 +1386,38 @@ class OriginSDK:
             frame["extensions_data"] = dict(self.extensions_data)
         self.last_sent_brief_digest = brief_digest
         self.last_sent_methods = current_grants
-        self.hub_transport.post_to_hub("origin.sync", frame)
+        try:
+            self.hub_transport.post_to_hub("origin.sync", frame)
+        except Exception as exc:
+            if settled_objs:
+                self.engine_dispatcher.run_on_game_thread(
+                    lambda: setattr(
+                        self,
+                        "pending_settled_executions",
+                        settled_objs + self.pending_settled_executions,
+                    )
+                )
+            self.current_rev = prev_rev
+            self.last_sent_brief_digest = prev_brief_digest
+            self.last_sent_methods = prev_sent_methods
+            if isinstance(exc, G2AOriginError) and exc.code in ("stale_context", "not_found"):
+                if self._last_cap_payload is not None:
+                    self.hub_transport.post_to_hub("origin.capabilities", self._last_cap_payload)
+                self.flush_full_sync()
+                return True
+            raise
         return True
 
     def flush_full_sync(self) -> None:
-        def _snap() -> Tuple[Dict[str, Any], Dict[Tuple[str, str], Dict[str, Any]], List[Dict[str, Any]]]:
+        def _snap() -> Tuple[Dict[str, Any], Dict[Tuple[str, str], Dict[str, Any]], List[OriginExecuteReply]]:
             b, g_map = self.collect_current_view()
             serialized_grants = {k: v.to_dict() for k, v in g_map.items()}
-            settled = [s.to_dict() for s in self.pending_settled_executions]
+            settled_objs = list(self.pending_settled_executions)
             self.pending_settled_executions.clear()
-            return b, serialized_grants, settled
+            return b, serialized_grants, settled_objs
 
-        brief, current_grants, settled_batch = self.engine_dispatcher.run_on_game_thread(_snap)
+        brief, current_grants, settled_objs = self.engine_dispatcher.run_on_game_thread(_snap)
+        settled_batch = [s.to_dict() for s in settled_objs]
         self.current_rev += 1
         self.metrics.frames_synced += 1
         frame = {
@@ -1425,7 +1450,18 @@ class OriginSDK:
             },
         )
         self.last_sent_methods = current_grants
-        self.hub_transport.post_to_hub("origin.sync", frame)
+        try:
+            self.hub_transport.post_to_hub("origin.sync", frame)
+        except Exception:
+            if settled_objs:
+                self.engine_dispatcher.run_on_game_thread(
+                    lambda: setattr(
+                        self,
+                        "pending_settled_executions",
+                        settled_objs + self.pending_settled_executions,
+                    )
+                )
+            raise
 
     # --- Origin Interface Execute Handler (§2.4) ---
 

@@ -1000,3 +1000,117 @@ func TestSlotGovernanceFRANDSharedCooldownAndExtensionProjection(t *testing.T) {
 		t.Fatalf("expected permission_denied when authorizing against disabled ranked-mode slot, got %v", disAuthErr)
 	}
 }
+
+type flakyUnknownOrigin struct {
+	mu          sync.Mutex
+	seenExecIDs []string
+	cancels     []string
+}
+
+func (f *flakyUnknownOrigin) Execute(_ string, req model.OriginExecuteRequest) (model.OriginExecuteReply, *model.G2AError) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if req.Kind == "cancel" {
+		f.cancels = append(f.cancels, req.ExecutionID)
+		return model.OriginExecuteReply{ExecutionID: req.ExecutionID, State: "cancelled"}, nil
+	}
+	f.seenExecIDs = append(f.seenExecIDs, req.ExecutionID)
+	if len(f.seenExecIDs) == 1 {
+		// Simulate HTTP timeout after Origin already cached execution_id in its idempotency ledger!
+		return model.OriginExecuteReply{}, model.NewError(model.ErrOutcomeUnknown, 504, "Simulated Origin gateway timeout")
+	}
+	return model.OriginExecuteReply{
+		ExecutionID:   req.ExecutionID,
+		State:         "succeeded",
+		EffectSummary: map[string]any{"reconciled_from_ledger": true},
+	}, nil
+}
+
+func TestOutcomeUnknownIdempotentReconciliationAndEpochPromptCleanup(t *testing.T) {
+	p, err := store.NewPersistencePort("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := hub.DefaultConfig()
+	cfg.AutoApproveScope = true
+	fo := &flakyUnknownOrigin{}
+	eng := hub.NewEngine(cfg, p, fo, nil, nil)
+
+	caps := []model.CapabilityEntry{
+		{
+			MethodID: "#01", Name: "toggle_valve", Description: "Toggle valve",
+			PermittedActors: []string{"companion"},
+			ParamsSchema:    map[string]any{"type": "object"},
+			DefaultPolicy:   "allow",
+		},
+		{
+			MethodID: "#02", Name: "overload_reactor", Description: "Confirm action",
+			PermittedActors: []string{"companion"},
+			ParamsSchema:    map[string]any{"type": "object"},
+			DefaultPolicy:   "confirm",
+		},
+	}
+	capDigest, _ := jcs.DigestSHA256("g2a.cap.v1", caps)
+	_ = eng.HandleOriginCapabilities(model.OriginCapabilitiesPayload{
+		SlotID: "slot-w22", RoleKind: "companion", BillingMode: "player_metered",
+		CapabilityTableDigest: capDigest, Capabilities: caps, OriginExecuteURL: "mem://w22",
+	})
+	_ = eng.HandleOriginSync(model.OriginSyncFrame{
+		SlotID: "slot-w22", Epoch: 1, Rev: 2, Mode: "full", SignificantEvent: true,
+		StateBrief: map[string]any{"valve": "closed"},
+		UpsertedMethods: []model.ActiveMethodGrant{
+			{MethodID: "#01", Actor: "companion", Readiness: "ready"},
+			{MethodID: "#02", Actor: "companion", Readiness: "ready"},
+		},
+	})
+
+	// 1. Non-monotonic delta rev <= base_rev MUST be rejected with 400 invalid_arguments
+	base2 := int64(2)
+	if badDeltaErr := eng.HandleOriginSync(model.OriginSyncFrame{
+		SlotID: "slot-w22", Epoch: 1, Rev: 2, BaseRev: &base2, Mode: "delta",
+		StateBrief: map[string]any{"valve": "closed"},
+	}); badDeltaErr == nil || badDeltaErr.Code != model.ErrInvalidArguments {
+		t.Fatalf("expected non-monotonic delta rev<=base_rev rejection, got %v", badDeltaErr)
+	}
+
+	auth, gErr := eng.HandleSessionAuthorize("0.0.1", "core-w22", model.AuthorizeRequest{SlotID: "slot-w22"})
+	if gErr != nil {
+		t.Fatal(gErr)
+	}
+
+	// 2. 504 outcome_unknown on attempt 1 MUST reconcile with the EXACT SAME execution_id on attempt 2!
+	rec, qErr := eng.HandleQueueSubmit("core-w22", auth.SessionID, model.MethodCallQueue{
+		QueueID: "Q-w22-reconcile", Epoch: 1, BasedOnRev: 2, Trigger: "player_command",
+		Steps: []model.QueueStep{{StepIndex: 0, MethodID: "#01", Actor: "companion"}},
+	})
+	if qErr != nil || rec.QueueState != "completed" {
+		t.Fatalf("expected 504 outcome_unknown idempotent reconciliation to succeed, rec=%+v err=%v", rec, qErr)
+	}
+	if len(fo.seenExecIDs) != 2 || fo.seenExecIDs[0] != fo.seenExecIDs[1] {
+		t.Fatalf("expected exact same execution_id across 504 reconciliation, got %+v", fo.seenExecIDs)
+	}
+
+	// 3. Submit confirm-gated queue at Epoch=1 -> advance to Epoch=2 -> stale prompt MUST be popped from ConsentBroker!
+	_, cErr := eng.HandleQueueSubmit("core-w22", auth.SessionID, model.MethodCallQueue{
+		QueueID: "Q-w22-ep1-hold", Epoch: 1, BasedOnRev: 2, Trigger: "player_command",
+		Steps: []model.QueueStep{{StepIndex: 0, MethodID: "#02", Actor: "companion"}},
+	})
+	if cErr == nil || cErr.Code != model.ErrConfirmationRequired {
+		t.Fatalf("expected confirmation_required, got %v", cErr)
+	}
+	if pending := eng.Consent().SnapshotPending()["queue_prompts"].([]hub.PendingQueuePrompt); len(pending) != 1 {
+		t.Fatalf("expected 1 pending prompt at epoch 1, got %d", len(pending))
+	}
+	if epErr := eng.HandleOriginSync(model.OriginSyncFrame{
+		SlotID: "slot-w22", Epoch: 2, Rev: 1, Mode: "full", SignificantEvent: true,
+		StateBrief: map[string]any{"reloaded": true},
+		UpsertedMethods: []model.ActiveMethodGrant{
+			{MethodID: "#01", Actor: "companion", Readiness: "ready"},
+		},
+	}); epErr != nil {
+		t.Fatalf("epoch advance sync failed: %v", epErr)
+	}
+	if pendingAfter := eng.Consent().SnapshotPending()["queue_prompts"].([]hub.PendingQueuePrompt); len(pendingAfter) != 0 {
+		t.Fatalf("expected stale epoch-1 confirmation prompt to be popped on epoch advance, got %d", len(pendingAfter))
+	}
+}

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
 import queue
+import socket
+import struct
 import threading
 import time
 import uuid
@@ -18,6 +21,31 @@ from .schemas import G2AError
 MAX_RELAY_BODY_BYTES = 4 << 20
 MAX_RELAY_SESSION_HISTORY = 256
 MAX_RELAY_EVENTS_PER_SESSION = 64
+_WS_MAGIC_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _ws_encode_server_frame(opcode: int, payload: bytes = b"") -> bytes:
+    hdr = bytearray([0x80 | (opcode & 0x0F)])
+    n = len(payload)
+    if n < 126:
+        hdr.append(n)
+    elif n <= 65535:
+        hdr.append(126)
+        hdr.extend(struct.pack("!H", n))
+    else:
+        hdr.append(127)
+        hdr.extend(struct.pack("!Q", n))
+    return bytes(hdr) + payload
+
+
+def _ws_recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("WebSocket closed")
+        buf.extend(chunk)
+    return bytes(buf)
 
 
 def _token_sha256(token: str) -> bytes:
@@ -297,6 +325,224 @@ class CloudRelayServer:
                     except Exception:
                         pass
                     finally:
+                        with relay_ref._lock:
+                            subs_set = relay_ref._sse_subscribers.get(session_id)
+                            if subs_set is not None:
+                                subs_set.discard(ev_q)
+                                if not subs_set:
+                                    relay_ref._sse_subscribers.pop(session_id, None)
+                    return
+
+                # 3. Computation Core Health Probe (/hubs/<hub_id>/g2a/v1/health)
+                if parsed.path.startswith("/hubs/") and parsed.path.endswith("/g2a/v1/health"):
+                    parts = parsed.path.strip("/").split("/")
+                    hub_id = parts[1] if len(parts) >= 2 else ""
+                    online = relay_ref.is_hub_connected(hub_id)
+                    self._send_json(
+                        200 if online else 503,
+                        {"status": "ok" if online else "offline", "g2a_version": "0.0.1", "interface": "core_relay", "hub_id": hub_id},
+                    )
+                    return
+
+                # 4. Computation Core RFC 6455 WebSocket Stream (/hubs/<hub_id>/g2a/v1/core/ws?session_id=...)
+                if parsed.path.startswith("/hubs/") and parsed.path.endswith("/g2a/v1/core/ws"):
+                    parts = parsed.path.strip("/").split("/")
+                    hub_id = parts[1] if len(parts) >= 2 else ""
+                    session_id = (qs.get("session_id") or [""])[0]
+                    if not session_id:
+                        self._send_json(400, {"error": "missing_session_id"})
+                        return
+                    if self.headers.get("Upgrade", "").strip().lower() != "websocket":
+                        self._send_json(400, {"error": "missing_websocket_upgrade"})
+                        return
+                    if self.headers.get("Sec-WebSocket-Version", "").strip() != "13":
+                        self.send_response(426)
+                        self.send_header("Sec-WebSocket-Version", "13")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    ws_key = self.headers.get("Sec-WebSocket-Key", "").strip()
+                    if not ws_key:
+                        self._send_json(400, {"error": "missing_sec_websocket_key"})
+                        return
+
+                    auth_hdr = self.headers.get("Authorization", "")
+                    core_bearer = auth_hdr[7:].strip() if auth_hdr.startswith("Bearer ") else ""
+                    if not core_bearer:
+                        core_bearer = (qs.get("access_token") or [""])[0].strip()
+                    if not core_bearer:
+                        self._send_json(
+                            401,
+                            {
+                                "g2a_version": "0.0.1",
+                                "request_id": "",
+                                "session_id": session_id,
+                                "timestamp_ms": int(time.time() * 1000),
+                                "acceptance": "not_accepted",
+                                "result": None,
+                                "error": {"code": "unauthenticated", "http_status": 401, "message": "Missing Core Bearer token on Relay WS stream"},
+                            },
+                        )
+                        return
+
+                    with relay_ref._lock:
+                        down_q = relay_ref._hub_downlinks.get(hub_id)
+                        cached_digest = relay_ref._session_token_digests.get((hub_id, session_id))
+                    if down_q is not None:
+                        hb_status, hb_reply, hb_retry = self._dispatch_downlink_rpc(
+                            down_q,
+                            core_bearer,
+                            {
+                                "g2a_version": "0.0.1",
+                                "request_id": f"relay-ws-auth-{uuid.uuid4().hex[:8]}",
+                                "session_id": session_id,
+                                "timestamp_ms": int(time.time() * 1000),
+                                "operation": "session.heartbeat",
+                                "payload": {},
+                                "extensions": {},
+                            },
+                            orig_req_id="",
+                        )
+                        if hb_status != 200:
+                            self._send_json(hb_status, hb_reply, retry_after=hb_retry)
+                            return
+                        relay_ref._record_verified_session(hub_id, session_id, core_bearer)
+                    else:
+                        if cached_digest is None:
+                            self._send_json(
+                                503,
+                                {
+                                    "g2a_version": "0.0.1",
+                                    "request_id": "",
+                                    "session_id": session_id,
+                                    "timestamp_ms": int(time.time() * 1000),
+                                    "acceptance": "not_accepted",
+                                    "result": None,
+                                    "error": {"code": "unavailable", "http_status": 503, "message": "Target Hub tunnel offline"},
+                                },
+                            )
+                            return
+                        if not hmac.compare_digest(cached_digest, _token_sha256(core_bearer)):
+                            self._send_json(
+                                403,
+                                {
+                                    "g2a_version": "0.0.1",
+                                    "request_id": "",
+                                    "session_id": session_id,
+                                    "timestamp_ms": int(time.time() * 1000),
+                                    "acceptance": "not_accepted",
+                                    "result": None,
+                                    "error": {"code": "permission_denied", "http_status": 403, "message": "Core token mismatch"},
+                                },
+                            )
+                            return
+
+                    replay = (qs.get("replay") or [""])[0] == "1"
+                    last_event_id = self.headers.get("Last-Event-ID", "").strip()
+                    if not last_event_id:
+                        last_event_id = (qs.get("last_event_id") or [""])[0].strip()
+
+                    ev_q = queue.Queue(maxsize=256)
+                    with relay_ref._lock:
+                        hist = list(relay_ref._event_history.get(session_id, []))
+                        if last_event_id:
+                            found_idx = -1
+                            for idx, h_ev in enumerate(hist):
+                                if h_ev.get("event_id") == last_event_id:
+                                    found_idx = idx
+                                    break
+                            to_replay = hist[found_idx + 1 :] if found_idx >= 0 else (hist if replay else [])
+                        elif replay:
+                            to_replay = hist
+                        else:
+                            to_replay = []
+                        for h_ev in to_replay:
+                            try:
+                                ev_q.put_nowait(h_ev)
+                            except queue.Full:
+                                break
+                        relay_ref._sse_subscribers.setdefault(session_id, set()).add(ev_q)
+
+                    accept_val = base64.b64encode(
+                        hashlib.sha1((ws_key + _WS_MAGIC_GUID).encode("ascii")).digest()
+                    ).decode("ascii")
+                    self.close_connection = True
+                    raw_sock = self.connection
+                    write_lock = threading.Lock()
+                    ws_closed = threading.Event()
+
+                    def _ws_send(opcode: int, payload: bytes = b"") -> bool:
+                        with write_lock:
+                            try:
+                                raw_sock.sendall(_ws_encode_server_frame(opcode, payload))
+                                return True
+                            except OSError:
+                                return False
+
+                    def _ws_reader() -> None:
+                        try:
+                            while not ws_closed.is_set():
+                                b0, b1 = _ws_recv_exact(raw_sock, 2)
+                                fin = (b0 & 0x80) != 0
+                                rsv = b0 & 0x70
+                                opcode = b0 & 0x0F
+                                masked = (b1 & 0x80) != 0
+                                length = b1 & 0x7F
+                                if rsv != 0 or not masked or (opcode >= 0x8 and (not fin or length > 125)):
+                                    _ws_send(0x8, struct.pack("!H", 1002))
+                                    break
+                                if length == 126:
+                                    length = struct.unpack("!H", _ws_recv_exact(raw_sock, 2))[0]
+                                elif length == 127:
+                                    length = struct.unpack("!Q", _ws_recv_exact(raw_sock, 8))[0]
+                                if length > (1 << 20):
+                                    _ws_send(0x8, struct.pack("!H", 1009))
+                                    break
+                                mask_key = _ws_recv_exact(raw_sock, 4)
+                                data = _ws_recv_exact(raw_sock, length) if length > 0 else b""
+                                if data:
+                                    data = bytes(b ^ mask_key[i & 3] for i, b in enumerate(data))
+                                if opcode == 0x8:
+                                    _ws_send(0x8, b"")
+                                    break
+                                if opcode == 0x9:
+                                    _ws_send(0xA, data)
+                        except (EOFError, OSError):
+                            pass
+                        finally:
+                            ws_closed.set()
+                            try:
+                                ev_q.put_nowait(None)
+                            except queue.Full:
+                                pass
+
+                    try:
+                        handshake_resp = (
+                            "HTTP/1.1 101 Switching Protocols\r\n"
+                            "Upgrade: websocket\r\n"
+                            "Connection: Upgrade\r\n"
+                            f"Sec-WebSocket-Accept: {accept_val}\r\n\r\n"
+                        ).encode("ascii")
+                        raw_sock.sendall(handshake_resp)
+                        raw_sock.settimeout(None)
+                        threading.Thread(target=_ws_reader, daemon=True).start()
+                        while not ws_closed.is_set():
+                            try:
+                                ev = ev_q.get(timeout=relay_ref.idle_keepalive_sec)
+                            except queue.Empty:
+                                if not _ws_send(0x9, b"g2a"):
+                                    break
+                                continue
+                            if ev is None:
+                                _ws_send(0x8, struct.pack("!H", 1000))
+                                break
+                            raw = json.dumps(ev, ensure_ascii=False).encode("utf-8")
+                            if not _ws_send(0x1, raw):
+                                break
+                    except OSError:
+                        pass
+                    finally:
+                        ws_closed.set()
                         with relay_ref._lock:
                             subs_set = relay_ref._sse_subscribers.get(session_id)
                             if subs_set is not None:

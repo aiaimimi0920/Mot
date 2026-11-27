@@ -674,15 +674,13 @@ impl OriginHostBuilder {
         let tx_c = Arc::clone(&tx);
         let is_npc = self.role_kind == "independent_npc";
         let slot_copy = self.slot_id.clone();
-        let sdk = Arc::new(OriginSdk::new(
+        let sdk = Arc::new(OriginSdk::new_fallible(
             self.slot_id,
             self.role_kind,
             self.billing_mode,
             self.room_id,
             self.faction_id,
-            Box::new(move |op, payload| {
-                let _ = tx_c.post_to_hub(op, payload);
-            }),
+            Box::new(move |op, payload| tx_c.post_to_hub(op, payload).map(|_| ())),
         ));
         sdk.bind_actor_subject("companion");
         if !is_npc {

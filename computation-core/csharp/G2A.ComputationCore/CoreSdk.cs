@@ -576,6 +576,18 @@ public sealed class CoreSdk : IAsyncDisposable
                         {
                             _capabilityCache[digest] = parsedCaps;
                             if (!string.IsNullOrEmpty(sId)) _slotDigests[sId] = digest;
+                            if (_frozenScope != null && (string.IsNullOrEmpty(sId) || sId == _frozenScope.SlotId))
+                            {
+                                var capActors = parsedCaps.ToDictionary(c => c.MethodId, c => new HashSet<string>(c.PermittedActors, StringComparer.Ordinal), StringComparer.Ordinal);
+                                var narrowed = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+                                foreach (var (mid, prevActors) in _frozenScope.PermittedMethods)
+                                {
+                                    if (!capActors.TryGetValue(mid, out var allowedSet)) continue;
+                                    var kept = prevActors.Where(allowedSet.Contains).ToList();
+                                    if (kept.Count > 0) narrowed[mid] = kept;
+                                }
+                                _frozenScope = _frozenScope with { CapabilityTableDigest = digest, PermittedMethods = narrowed };
+                            }
                         }
                     }
                 }
@@ -648,7 +660,7 @@ public sealed class CoreSdk : IAsyncDisposable
                 ws.Options.SetRequestHeader("Last-Event-ID", lastId);
             string wsUrl = baseEp.Replace("https://", "wss://").Replace("http://", "ws://") +
                            $"/g2a/v1/core/ws?session_id={Uri.EscapeDataString(sid)}" +
-                           (isReconnect ? "&replay=1" : "");
+                           (isReconnect ? "&replay=1" + (!string.IsNullOrEmpty(lastId) ? $"&last_event_id={Uri.EscapeDataString(lastId)}" : "") : "");
             try
             {
                 await ws.ConnectAsync(new Uri(wsUrl), ct);
@@ -701,7 +713,8 @@ public sealed class CoreSdk : IAsyncDisposable
                 }
                 catch { }
             }
-            string url = $"{baseEp}/g2a/v1/core/events?session_id={Uri.EscapeDataString(sid)}" + (isReconnect ? "&replay=1" : "");
+            string url = $"{baseEp}/g2a/v1/core/events?session_id={Uri.EscapeDataString(sid)}" +
+                         (isReconnect ? "&replay=1" + (!string.IsNullOrEmpty(lastId) ? $"&last_event_id={Uri.EscapeDataString(lastId)}" : "") : "");
             try
             {
                 using var req = new HttpRequestMessage(HttpMethod.Get, url);

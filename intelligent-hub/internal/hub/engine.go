@@ -2,11 +2,14 @@ package hub
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -116,6 +119,10 @@ func (c *HTTPOriginClient) Execute(targetURL string, req model.OriginExecuteRequ
 	}
 	resp, err := c.Client.Do(httpReq)
 	if err != nil {
+		var netErr net.Error
+		if (errors.As(err, &netErr) && netErr.Timeout()) || errors.Is(err, context.DeadlineExceeded) {
+			return zero, model.NewError(model.ErrOutcomeUnknown, 504, "Origin execute timed out: "+err.Error())
+		}
 		return zero, model.NewError(model.ErrUnavailable, 503, "Origin unreachable: "+err.Error())
 	}
 	defer resp.Body.Close()
@@ -542,11 +549,12 @@ func (e *Engine) HandleOriginCapabilities(payload model.OriginCapabilitiesPayloa
 
 	type capUpdateOutcome struct {
 		notifySessions []string
+		notifyScopes   map[string]map[string][]string
 		closedSessions []string
 		cancels        []cancelTarget
 	}
 	outcome, gErr := store.Atomic(e.persistence, func(d *store.HubStoreData) (capUpdateOutcome, *model.G2AError) {
-		var out capUpdateOutcome
+		out := capUpdateOutcome{notifyScopes: make(map[string]map[string][]string)}
 		slot, exists := d.Slots[payload.SlotID]
 		prevDigest := ""
 		if !exists {
@@ -658,6 +666,11 @@ func (e *Engine) HandleOriginCapabilities(payload model.OriginCapabilitiesPayloa
 				}
 				if sess.PlayerOnline && sess.State == "active" {
 					out.notifySessions = append(out.notifySessions, sess.SessionID)
+					permSnap := make(map[string][]string, len(narrowedPerm))
+					for mk, ma := range narrowedPerm {
+						permSnap[mk] = append([]string(nil), ma...)
+					}
+					out.notifyScopes[sess.SessionID] = permSnap
 				}
 			}
 		}
@@ -677,9 +690,10 @@ func (e *Engine) HandleOriginCapabilities(payload model.OriginCapabilitiesPayloa
 		}
 		for _, sid := range outcome.notifySessions {
 			e.pushStream.PushEvent(sid, "capabilities.updated", map[string]any{
-				"slot_id":                 payload.SlotID,
-				"capability_table_digest": verifiedDigest,
-				"capability_table":        sanitizedCaps,
+				"slot_id":                    payload.SlotID,
+				"capability_table_digest":    verifiedDigest,
+				"capability_table":           sanitizedCaps,
+				"narrowed_permitted_methods": outcome.notifyScopes[sid],
 			})
 		}
 		e.NotifyDashboard()
@@ -688,15 +702,30 @@ func (e *Engine) HandleOriginCapabilities(payload model.OriginCapabilitiesPayloa
 }
 
 func (e *Engine) HandleOriginSync(frame model.OriginSyncFrame) *model.G2AError {
+	if strings.TrimSpace(frame.SlotID) == "" {
+		return model.NewError(model.ErrInvalidArguments, 400, "slot_id is required")
+	}
+	if frame.Epoch < 1 || frame.Rev < 0 {
+		return model.NewError(model.ErrInvalidArguments, 400, "epoch >= 1 and rev >= 0 are required")
+	}
+	if frame.Mode != "full" && frame.Mode != "delta" {
+		return model.NewError(model.ErrInvalidArguments, 400, "mode must be full or delta")
+	}
 	type pendingPush struct {
 		sessionID string
 		ctx       model.ProjectedContext
 	}
-	txFn := func(d *store.HubStoreData) ([]pendingPush, *model.G2AError) {
+	type syncTxResult struct {
+		pushes  []pendingPush
+		cancels []cancelTarget
+		popped  [][2]string
+	}
+	txFn := func(d *store.HubStoreData) (syncTxResult, *model.G2AError) {
+		var zeroRes syncTxResult
 		view, ok := d.SlotViews[frame.SlotID]
 		if !ok {
 			if frame.Mode != "full" {
-				return nil, model.NewError(model.ErrStaleContext, 409, "Origin slot view uninitialized; resend full frame")
+				return zeroRes, model.NewError(model.ErrStaleContext, 409, "Origin slot view uninitialized; resend full frame")
 			}
 			view = &store.SlotView{
 				SlotID:            frame.SlotID,
@@ -711,6 +740,11 @@ func (e *Engine) HandleOriginSync(frame model.OriginSyncFrame) *model.G2AError {
 			view.SettledExecutions = make(map[string]model.OriginExecuteReply)
 		}
 
+		var cancels []cancelTarget
+		var popped [][2]string
+		if frame.Epoch < view.Epoch {
+			return zeroRes, model.NewError(model.ErrStaleContext, 409, "Origin frame epoch is older than active Hub epoch")
+		}
 		if frame.Mode == "full" || frame.Epoch > view.Epoch {
 			oldEpoch := view.Epoch
 			view.Epoch = frame.Epoch
@@ -722,7 +756,7 @@ func (e *Engine) HandleOriginSync(frame model.OriginSyncFrame) *model.G2AError {
 				view.Methods[store.MethodKey(g.MethodID, g.Actor)] = g
 			}
 			if frame.Epoch > oldEpoch {
-				e.abortObsoleteEpochQueuesInTx(d, frame.SlotID, frame.Epoch)
+				cancels, popped = e.abortObsoleteEpochQueuesInTx(d, frame.SlotID, frame.Epoch)
 			}
 			if frame.ExtensionsData != nil {
 				view.ExtensionsData = make(map[string]map[string]any, len(frame.ExtensionsData))
@@ -737,8 +771,11 @@ func (e *Engine) HandleOriginSync(frame model.OriginSyncFrame) *model.G2AError {
 				view.ExtensionsData = nil
 			}
 		} else {
-			if frame.Epoch != view.Epoch || frame.BaseRev == nil || *frame.BaseRev != view.Rev {
-				return nil, model.NewError(model.ErrStaleContext, 409, "Origin delta base_rev mismatch; resend full frame")
+			if frame.BaseRev == nil || *frame.BaseRev != view.Rev {
+				return zeroRes, model.NewError(model.ErrStaleContext, 409, "Origin delta base_rev mismatch; resend full frame")
+			}
+			if frame.Rev <= *frame.BaseRev {
+				return zeroRes, model.NewError(model.ErrInvalidArguments, 400, "Origin delta rev must strictly advance past base_rev")
 			}
 			view.Rev = frame.Rev
 			if frame.SignificantEvent {
@@ -813,24 +850,39 @@ func (e *Engine) HandleOriginSync(frame model.OriginSyncFrame) *model.G2AError {
 				sess.IdleBackoffMs = next
 			}
 		}
-		return outPushes, nil
+		return syncTxResult{pushes: outPushes, cancels: cancels, popped: popped}, nil
 	}
 
+	useDurable := frame.Mode == "full"
+	if !useDurable {
+		useDurable, _ = store.ReadOnly(e.persistence, func(d *store.HubStoreData) (bool, *model.G2AError) {
+			v, ok := d.SlotViews[frame.SlotID]
+			return !ok || frame.Epoch != v.Epoch, nil
+		})
+	}
 	var (
-		pushes []pendingPush
-		gErr   *model.G2AError
+		txRes syncTxResult
+		gErr  *model.G2AError
 	)
-	if frame.Mode == "full" {
-		pushes, gErr = store.Atomic(e.persistence, txFn)
+	if useDurable {
+		txRes, gErr = store.Atomic(e.persistence, txFn)
 	} else {
-		pushes, gErr = store.MutateVolatile(e.persistence, txFn)
+		txRes, gErr = store.MutateVolatile(e.persistence, txFn)
 	}
 	if gErr != nil {
 		return gErr
 	}
 
+	for _, pair := range txRes.popped {
+		e.consent.PopQueuePrompt(pair[0], pair[1])
+	}
 	e.broadcastWakeup()
-	for _, p := range pushes {
+	for _, c := range txRes.cancels {
+		_, _ = e.originClient.Execute(c.targetURL, model.OriginExecuteRequest{
+			SlotID: c.slotID, Epoch: c.epoch, Kind: "cancel", ExecutionID: c.execID, Args: map[string]any{},
+		})
+	}
+	for _, p := range txRes.pushes {
 		e.pushStream.PushEvent(p.sessionID, "context.push", p.ctx)
 	}
 	return nil
@@ -1853,6 +1905,31 @@ func (e *Engine) dispatchQueueSteps(sessionID, queueID string) (model.QueueRecei
 		}
 
 		execReply, gErr := e.originClient.Execute(prep.targetURL, prep.execReq)
+		if gErr != nil && gErr.Code == model.ErrOutcomeUnknown {
+			// G2A §6.3 504 outcome_unknown reconciliation:
+			// 1. Check if Interaction Origin already delivered settlement via origin.sync;
+			// 2. Otherwise issue 1 idempotent retry reusing the EXACT SAME ExecutionID (cached in Origin execution_ledger).
+			settledRep, _ := store.MutateVolatile(e.persistence, func(d *store.HubStoreData) (*model.OriginExecuteReply, *model.G2AError) {
+				sess := d.Sessions[sessionID]
+				if sess == nil {
+					return nil, nil
+				}
+				view := d.SlotViews[sess.Scope.SlotID]
+				if view != nil {
+					if rep, ok := view.SettledExecutions[prep.execReq.ExecutionID]; ok {
+						delete(view.SettledExecutions, prep.execReq.ExecutionID)
+						return &rep, nil
+					}
+				}
+				return nil, nil
+			})
+			if settledRep != nil {
+				execReply = *settledRep
+				gErr = nil
+			} else {
+				execReply, gErr = e.originClient.Execute(prep.targetURL, prep.execReq)
+			}
+		}
 		if gErr != nil {
 			reason := gErr.Message
 			execReply = model.OriginExecuteReply{
@@ -2394,23 +2471,42 @@ func (e *Engine) toReceiptInTx(d *store.HubStoreData, sess *store.SessionRecord,
 	}
 }
 
-func (e *Engine) abortObsoleteEpochQueuesInTx(d *store.HubStoreData, slotID string, newEpoch int64) {
+func (e *Engine) abortObsoleteEpochQueuesInTx(d *store.HubStoreData, slotID string, newEpoch int64) ([]cancelTarget, [][2]string) {
 	reason := "epoch_advanced"
+	var cancels []cancelTarget
+	var popped [][2]string
+	slot := d.Slots[slotID]
 	for _, rec := range d.Queues {
 		sess := d.Sessions[rec.SessionID]
 		if sess != nil && sess.Scope.SlotID == slotID && rec.Queue.Epoch < newEpoch {
+			if rec.State == "awaiting_confirmation" {
+				popped = append(popped, [2]string{rec.SessionID, rec.QueueID})
+			}
 			if rec.State == "running" || rec.State == "awaiting_confirmation" {
+				if rec.CurrentExecutionID != nil && slot != nil && slot.OriginExecuteURL != "" {
+					cancels = append(cancels, cancelTarget{
+						targetURL: slot.OriginExecuteURL,
+						slotID:    slotID,
+						epoch:     rec.Queue.Epoch,
+						execID:    *rec.CurrentExecutionID,
+					})
+				}
 				rec.State = "aborted"
 				rec.CurrentExecutionID = nil
+				if sess.ActiveQueueID != nil && *sess.ActiveQueueID == rec.QueueID {
+					sess.ActiveQueueID = nil
+				}
 				for i := range rec.StepReceipts {
 					if rec.StepReceipts[i].State == "pending" || rec.StepReceipts[i].State == "executing" {
 						rec.StepReceipts[i].State = "aborted"
-						rec.StepReceipts[i].FailureReason = &reason
+						rCopy := reason
+						rec.StepReceipts[i].FailureReason = &rCopy
 					}
 				}
 			}
 		}
 	}
+	return cancels, popped
 }
 
 func (e *Engine) clearUndispatchedQueuesInTx(d *store.HubStoreData, sess *store.SessionRecord) {

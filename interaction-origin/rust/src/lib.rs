@@ -418,6 +418,8 @@ fn check_numeric_bounds(name: &str, v: f64, spec: &JsonObject) -> Result<(), Str
 }
 
 pub type TransportFn = Box<dyn Fn(&str, &JsonValue) + Send + Sync + 'static>;
+pub type FallibleTransportFn =
+    Box<dyn Fn(&str, &JsonValue) -> Result<(), String> + Send + Sync + 'static>;
 pub type DomainEffectHandler =
     Box<dyn Fn(&str, &JsonObject, &str) -> EffectOutcome + Send + Sync + 'static>;
 
@@ -445,6 +447,7 @@ struct InnerState {
     pending_settled: Vec<OriginExecuteReply>,
     last_sent_methods: BTreeMap<(String, String), String>,
     last_brief_digest: String,
+    last_cap_payload: Option<JsonValue>,
     visual_ref: Option<JsonObject>,
     audio_ref: Option<JsonObject>,
     allowed_timeline_tags: Option<Vec<String>>,
@@ -466,7 +469,7 @@ pub struct OriginSdk {
     billing_mode: String,
     room_id: String,
     faction_id: String,
-    transport: TransportFn,
+    transport: FallibleTransportFn,
     chat_handler: Option<Box<dyn Fn(&str, &str) + Send + Sync + 'static>>,
     state: Mutex<InnerState>,
 }
@@ -479,6 +482,27 @@ impl OriginSdk {
         room_id: impl Into<String>,
         faction_id: impl Into<String>,
         transport: TransportFn,
+    ) -> Self {
+        Self::new_fallible(
+            slot_id,
+            role_kind,
+            billing_mode,
+            room_id,
+            faction_id,
+            Box::new(move |op, payload| {
+                transport(op, payload);
+                Ok(())
+            }),
+        )
+    }
+
+    pub fn new_fallible(
+        slot_id: impl Into<String>,
+        role_kind: impl Into<String>,
+        billing_mode: impl Into<String>,
+        room_id: impl Into<String>,
+        faction_id: impl Into<String>,
+        transport: FallibleTransportFn,
     ) -> Self {
         Self {
             slot_id: slot_id.into(),
@@ -502,6 +526,7 @@ impl OriginSdk {
                 pending_settled: Vec::new(),
                 last_sent_methods: BTreeMap::new(),
                 last_brief_digest: String::new(),
+                last_cap_payload: None,
                 visual_ref: None,
                 audio_ref: None,
                 allowed_timeline_tags: None,
@@ -633,14 +658,17 @@ impl OriginSdk {
             if !self.faction_id.is_empty() {
                 o.insert("faction_id".to_owned(), JsonValue::from(self.faction_id.as_str()));
             }
-            JsonValue::Object(o)
+            let payload = JsonValue::Object(o);
+            drop(st);
+            self.state.lock().unwrap().last_cap_payload = Some(payload.clone());
+            payload
         };
-        (self.transport)("origin.capabilities", &cap_payload);
+        let _ = (self.transport)("origin.capabilities", &cap_payload);
         self.flush_full_sync();
     }
 
     pub fn flush_dirty_sync(&self, significant_event: bool) -> bool {
-        let maybe_frame = {
+        let maybe_prep = {
             let mut st = self.state.lock().unwrap();
             if !st.sync_enabled && st.pending_settled.is_empty() {
                 return false;
@@ -669,7 +697,8 @@ impl OriginSdk {
                     removed.push(JsonValue::Object(rem));
                 }
             }
-            let settled: JsonArray = st.pending_settled.drain(..).map(|r| r.to_json()).collect();
+            let settled_backup: Vec<OriginExecuteReply> = st.pending_settled.drain(..).collect();
+            let settled: JsonArray = settled_backup.iter().map(|r| r.to_json()).collect();
 
             if brief_digest == st.last_brief_digest
                 && upserted.is_empty()
@@ -681,6 +710,8 @@ impl OriginSdk {
             }
 
             let prev_rev = st.current_rev;
+            let prev_digest = st.last_brief_digest.clone();
+            let prev_methods = st.last_sent_methods.clone();
             st.current_rev += 1;
             st.metrics.frames_synced += 1;
             st.last_brief_digest = brief_digest;
@@ -698,10 +729,36 @@ impl OriginSdk {
             frame.insert("removed_methods".to_owned(), JsonValue::Array(removed));
             frame.insert("settled_executions".to_owned(), JsonValue::Array(settled));
             append_optional_sync_fields(&st, &mut frame, ext_json);
-            Some(JsonValue::Object(frame))
+            Some((
+                JsonValue::Object(frame),
+                settled_backup,
+                prev_rev,
+                prev_digest,
+                prev_methods,
+                st.last_cap_payload.clone(),
+            ))
         };
-        if let Some(frame) = maybe_frame {
-            (self.transport)("origin.sync", &frame);
+        if let Some((frame, mut settled_backup, prev_rev, prev_digest, prev_methods, maybe_cap)) = maybe_prep {
+            if let Err(err) = (self.transport)("origin.sync", &frame) {
+                {
+                    let mut st = self.state.lock().unwrap();
+                    if !settled_backup.is_empty() {
+                        settled_backup.append(&mut st.pending_settled);
+                        st.pending_settled = settled_backup;
+                    }
+                    st.current_rev = prev_rev;
+                    st.last_brief_digest = prev_digest;
+                    st.last_sent_methods = prev_methods;
+                }
+                if err.contains("stale_context") || err.contains("HTTP 409") || err.contains("not_found") {
+                    if let Some(cap_pl) = maybe_cap {
+                        let _ = (self.transport)("origin.capabilities", &cap_pl);
+                    }
+                    self.flush_full_sync();
+                    return true;
+                }
+                return false;
+            }
             true
         } else {
             false
@@ -740,7 +797,7 @@ impl OriginSdk {
             append_optional_sync_fields(&st, &mut frame, ext_json);
             JsonValue::Object(frame)
         };
-        (self.transport)("origin.sync", &frame);
+        let _ = (self.transport)("origin.sync", &frame);
     }
 
     pub fn handle_origin_execute(&self, req: &OriginExecuteRequest) -> OriginExecuteReply {
@@ -953,7 +1010,7 @@ impl OriginSdk {
         o.insert("slot_id".to_owned(), JsonValue::from(self.slot_id.as_str()));
         o.insert("kind".to_owned(), JsonValue::from("player_command"));
         o.insert("text".to_owned(), JsonValue::from(text));
-        (self.transport)("origin.player_event", &JsonValue::Object(o));
+        let _ = (self.transport)("origin.player_event", &JsonValue::Object(o));
     }
 
     pub fn report_player_presence(&self, online: bool, remaining_online_humans: i64) {
@@ -966,7 +1023,7 @@ impl OriginSdk {
         o.insert("kind".to_owned(), JsonValue::from("presence_changed"));
         o.insert("online".to_owned(), JsonValue::from(online));
         o.insert("remaining_online_humans".to_owned(), JsonValue::from(remaining_online_humans));
-        (self.transport)("origin.player_event", &JsonValue::Object(o));
+        let _ = (self.transport)("origin.player_event", &JsonValue::Object(o));
     }
 
     pub fn report_emergency_stop(&self) {
@@ -981,7 +1038,7 @@ impl OriginSdk {
         let mut o = JsonObject::new();
         o.insert("slot_id".to_owned(), JsonValue::from(self.slot_id.as_str()));
         o.insert("kind".to_owned(), JsonValue::from("emergency_stop"));
-        (self.transport)("origin.player_event", &JsonValue::Object(o));
+        let _ = (self.transport)("origin.player_event", &JsonValue::Object(o));
     }
 
     pub fn report_queue_approval(
@@ -1000,7 +1057,7 @@ impl OriginSdk {
         o.insert("queue_digest".to_owned(), JsonValue::from(queue_digest));
         o.insert("fingerprint".to_owned(), JsonValue::from(fingerprint));
         o.insert("approved".to_owned(), JsonValue::from(approved));
-        (self.transport)("origin.player_event", &JsonValue::Object(o));
+        let _ = (self.transport)("origin.player_event", &JsonValue::Object(o));
     }
 
     pub fn report_npc_host_handoff(&self, new_player_id: &str) -> Result<(), String> {
@@ -1024,7 +1081,7 @@ impl OriginSdk {
         o.insert("slot_id".to_owned(), JsonValue::from(self.slot_id.as_str()));
         o.insert("kind".to_owned(), JsonValue::from("host_handoff"));
         o.insert("new_player_id".to_owned(), JsonValue::from(cleaned));
-        (self.transport)("origin.player_event", &JsonValue::Object(o));
+        let _ = (self.transport)("origin.player_event", &JsonValue::Object(o));
         Ok(())
     }
 }
@@ -1463,5 +1520,108 @@ mod tests {
         assert!(!sdk.flush_dirty_sync(false));
         let m = sdk.metrics();
         assert!(m.frames_synced >= 3 && m.zero_change_skips >= 2 && m.steps_settled_batch == 2 && m.steps_cancelled == 1);
+    }
+
+    #[test]
+    fn origin_sdk_fallible_transport_resyncs_on_stale_context_preserving_settled() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Mutex};
+
+        // 0 = OK, 1 = transient 503 unavailable, 2 = reject next delta sync with 409 stale_context
+        let mode = Arc::new(AtomicUsize::new(0));
+        let mode_cl = Arc::clone(&mode);
+        let posts: Arc<Mutex<Vec<(String, JsonValue)>>> = Arc::new(Mutex::new(Vec::new()));
+        let posts_cl = Arc::clone(&posts);
+
+        let sdk = OriginSdk::new_fallible(
+            "slot-rust-resync",
+            "companion",
+            "player_byok",
+            "room_1",
+            "fac_1",
+            Box::new(move |op, payload| {
+                let cur = mode_cl.load(Ordering::SeqCst);
+                if cur == 1 {
+                    return Err("Hub HTTP 503: unavailable".to_owned());
+                }
+                if cur == 2 && op == "origin.sync" {
+                    let is_delta = payload
+                        .as_object()
+                        .and_then(|o| o.get("mode"))
+                        .and_then(JsonValue::as_str)
+                        == Some("delta");
+                    if is_delta {
+                        mode_cl.store(0, Ordering::SeqCst);
+                        return Err("Hub HTTP 409: stale_context (base_rev mismatch)".to_owned());
+                    }
+                }
+                posts_cl.lock().unwrap().push((op.to_owned(), payload.clone()));
+                Ok(())
+            }),
+        );
+
+        sdk.bind_actor_subject("companion");
+        sdk.register_capability(
+            CapabilityEntry {
+                method_id: "#01".to_owned(),
+                name: "hold_valve".to_owned(),
+                description: "Hold pressure valve".to_owned(),
+                permitted_actors: vec!["companion".to_owned()],
+                params_schema: JsonObject::new(),
+                sustained: true,
+                risk_flags: vec![],
+                default_policy: "allow".to_owned(),
+            },
+            Box::new(|_, _, _| EffectOutcome::StartedExecuting(Box::new(|| {}))),
+        );
+        sdk.bind_state_module(
+            "boiler",
+            || {
+                let mut m = JsonObject::new();
+                m.insert("psi".to_owned(), JsonValue::from(120i64));
+                m
+            },
+            || {
+                vec![ActiveMethodGrant {
+                    method_id: "#01".to_owned(),
+                    actor: "companion".to_owned(),
+                    readiness: "ready".to_owned(),
+                    targets: Vec::new(),
+                }]
+            },
+        );
+        sdk.publish_capabilities_and_baseline(SlotPublishOptions::default());
+        assert_eq!(sdk.state.lock().unwrap().current_rev, 1);
+
+        let rep = sdk.handle_origin_execute(&OriginExecuteRequest {
+            slot_id: "slot-rust-resync".to_owned(),
+            epoch: 1,
+            kind: "invoke".to_owned(),
+            execution_id: "ex-fallible-1".to_owned(),
+            method_id: Some("#01".to_owned()),
+            actor: Some("companion".to_owned()),
+            args: JsonObject::new(),
+        });
+        assert_eq!(rep.state, "executing");
+
+        // 1. Transient 503 failure rolls back rev & preserves settled execution in pending_settled!
+        mode.store(1, Ordering::SeqCst);
+        sdk.complete_step("ex-fallible-1", true, None, None);
+        assert_eq!(sdk.state.lock().unwrap().current_rev, 1);
+
+        // 2. Subsequent delta sync encounters 409 stale_context -> auto-heals via origin.capabilities + full sync!
+        mode.store(2, Ordering::SeqCst);
+        assert!(sdk.flush_dirty_sync(true));
+
+        let locked = posts.lock().unwrap();
+        assert!(locked.len() >= 4);
+        let resub_cap = &locked[locked.len() - 2];
+        let resub_full = &locked[locked.len() - 1];
+        assert_eq!(resub_cap.0, "origin.capabilities");
+        assert_eq!(resub_full.0, "origin.sync");
+        let full_wire = jcs::canonicalize_utf8(&resub_full.1).unwrap();
+        assert!(full_wire.contains("\"mode\":\"full\""));
+        assert!(full_wire.contains("\"ex-fallible-1\""));
+        assert!(full_wire.contains("\"succeeded\""));
     }
 }

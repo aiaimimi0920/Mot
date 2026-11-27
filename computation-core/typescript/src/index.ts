@@ -1290,6 +1290,19 @@ export class CoreSDK {
         if (verified === capDigest) {
           this.capabilityCache.set(capDigest, capTable as CapabilityEntry[]);
           if (slotId) this.slotDigests.set(slotId, capDigest);
+          if (env.payload?.narrowed_permitted_methods && typeof env.payload.narrowed_permitted_methods === "object") {
+            this.permittedMethods = env.payload.narrowed_permitted_methods as Record<string, string[]>;
+          } else if (this.permittedMethods) {
+            const capActors = new Map((capTable as CapabilityEntry[]).map((c) => [c.method_id, new Set(c.permitted_actors ?? [])]));
+            const narrowed: Record<string, string[]> = {};
+            for (const [mid, prevActors] of Object.entries(this.permittedMethods)) {
+              const allowed = capActors.get(mid);
+              if (!allowed) continue;
+              const kept = prevActors.filter((a) => allowed.has(a));
+              if (kept.length > 0) narrowed[mid] = kept;
+            }
+            this.permittedMethods = narrowed;
+          }
         }
       }
     } else if (env.event === "queue.confirmed") {
@@ -1402,7 +1415,7 @@ export class CoreSDK {
       const expectedAccept = cryptoMod.createHash("sha1").update(wsKey + WS_MAGIC_GUID).digest("base64");
       const path =
         `${parsed.pathname.replace(/\/$/, "")}/g2a/v1/core/ws?session_id=${encodeURIComponent(sid)}` +
-        (isReconnect ? "&replay=1" : "");
+        (isReconnect ? "&replay=1" + (this.lastEventId ? `&last_event_id=${encodeURIComponent(this.lastEventId)}` : "") : "");
 
       sock.on("connect", () => {
         if (isTls) return;
@@ -1505,7 +1518,7 @@ export class CoreSDK {
     this.sseAbort = abort;
     const url =
       `${base}/g2a/v1/core/events?session_id=${encodeURIComponent(this.sessionId)}` +
-      (isReconnect ? "&replay=1" : "");
+      (isReconnect ? "&replay=1" + (this.lastEventId ? `&last_event_id=${encodeURIComponent(this.lastEventId)}` : "") : "");
     const headers: Record<string, string> = {
       Accept: "text/event-stream",
       Authorization: `Bearer ${authToken}`,

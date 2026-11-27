@@ -873,9 +873,10 @@ func (c *CoreSDK) handlePushFrame(ctx context.Context, raw []byte) {
 		}
 	case "capabilities.updated":
 		var capEv struct {
-			SlotID                string            `json:"slot_id"`
-			CapabilityTableDigest string            `json:"capability_table_digest"`
-			CapabilityTable       []CapabilityEntry `json:"capability_table"`
+			SlotID                   string              `json:"slot_id"`
+			CapabilityTableDigest    string              `json:"capability_table_digest"`
+			CapabilityTable          []CapabilityEntry   `json:"capability_table"`
+			NarrowedPermittedMethods map[string][]string `json:"narrowed_permitted_methods"`
 		}
 		if err := UnmarshalStrict(env.Payload, &capEv); err == nil && len(capEv.CapabilityTable) > 0 {
 			if verified, err := DigestSHA256("g2a.cap.v1", capEv.CapabilityTable); err == nil && verified == capEv.CapabilityTableDigest {
@@ -883,6 +884,38 @@ func (c *CoreSDK) handlePushFrame(ctx context.Context, raw []byte) {
 				c.capabilityCache[capEv.CapabilityTableDigest] = capEv.CapabilityTable
 				if capEv.SlotID != "" {
 					c.slotDigests[capEv.SlotID] = capEv.CapabilityTableDigest
+				}
+				if c.frozenScope != nil && (capEv.SlotID == "" || capEv.SlotID == c.frozenScope.SlotID) {
+					c.frozenScope.CapabilityTableDigest = capEv.CapabilityTableDigest
+					if capEv.NarrowedPermittedMethods != nil {
+						c.frozenScope.PermittedMethods = capEv.NarrowedPermittedMethods
+					} else if c.frozenScope.PermittedMethods != nil {
+						capActors := make(map[string]map[string]bool, len(capEv.CapabilityTable))
+						for _, ce := range capEv.CapabilityTable {
+							am := make(map[string]bool, len(ce.PermittedActors))
+							for _, a := range ce.PermittedActors {
+								am[a] = true
+							}
+							capActors[ce.MethodID] = am
+						}
+						narrowed := make(map[string][]string)
+						for mid, prevActors := range c.frozenScope.PermittedMethods {
+							allowedMap, exists := capActors[mid]
+							if !exists {
+								continue
+							}
+							var kept []string
+							for _, a := range prevActors {
+								if allowedMap[a] {
+									kept = append(kept, a)
+								}
+							}
+							if len(kept) > 0 {
+								narrowed[mid] = kept
+							}
+						}
+						c.frozenScope.PermittedMethods = narrowed
+					}
 				}
 				c.mu.Unlock()
 			}
@@ -957,6 +990,9 @@ func (c *CoreSDK) sseStreamLoop(ctx context.Context) {
 		u := fmt.Sprintf("%s/g2a/v1/core/events?session_id=%s", base, url.QueryEscape(sid))
 		if isReconnect {
 			u += "&replay=1"
+			if lastID != "" {
+				u += "&last_event_id=" + url.QueryEscape(lastID)
+			}
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
@@ -1104,6 +1140,9 @@ func dialRFC6455(ctx context.Context, base, sid, tok string, isReconnect bool, l
 	path := strings.TrimRight(u.Path, "/") + "/g2a/v1/core/ws?session_id=" + url.QueryEscape(sid)
 	if isReconnect {
 		path += "&replay=1"
+		if lastID != "" {
+			path += "&last_event_id=" + url.QueryEscape(lastID)
+		}
 	}
 	var reqBuf bytes.Buffer
 	fmt.Fprintf(&reqBuf, "GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nAuthorization: Bearer %s\r\n",

@@ -2088,6 +2088,209 @@ class TestOptimizationsAndStress(unittest.TestCase):
                 if hub_proc.stderr:
                     hub_proc.stderr.close()
 
+    def test_cloud_relay_websocket_e2e_mid_session_cap_narrowing_and_hub_restart_resync(self) -> None:
+        import urllib.request
+        from g2a_core import CloudRelayServer, CoreSDK, G2AError, PlanDecision, QueueStep
+        from g2a_origin import (
+            ActiveMethodGrant as OrigGrant,
+            CapabilityEntry as OrigCap,
+            ImmediateSucceeded,
+            LoopbackHTTPTransportClient,
+            OriginSDK,
+            StartedExecuting,
+            StepExecutionToken,
+        )
+
+        no_proxy = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        hub_bin = resolve_hub_binary(ROOT_DIR)
+        relay = CloudRelayServer(host="127.0.0.1", port=0, relay_token="w22-rel-tok")
+        relay_url = relay.start()
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                hub_proc_1 = subprocess.Popen(
+                    [
+                        hub_bin,
+                        "-origin-addr", "127.0.0.1:0",
+                        "-core-addr", "127.0.0.1:0",
+                        "-consent-addr", "127.0.0.1:0",
+                        "-ledger", os.path.join(tmp, "w22_hub1_ledger.json"),
+                        "-no-runtime-file",
+                        "-auto-approve-scope",
+                        "-outbound-relay", relay_url,
+                        "-hub-id", "hub-w22-ws",
+                        "-relay-token", "w22-rel-tok",
+                        "-print-ports-json",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                hub_proc_2 = None
+                orig = None
+                try:
+                    assert hub_proc_1.stdout is not None
+                    ports_1 = json.loads(hub_proc_1.stdout.readline().strip())
+                    origin_addr = ports_1["origin_addr"]
+
+                    deadline = time.time() + 4.0
+                    while time.time() < deadline and not relay.is_hub_connected("hub-w22-ws"):
+                        time.sleep(0.03)
+                    self.assertTrue(relay.is_hub_connected("hub-w22-ws"))
+
+                    # 1. Verify Relay /g2a/v1/health endpoint
+                    with no_proxy.open(f"{relay_url}/hubs/hub-w22-ws/g2a/v1/health", timeout=3.0) as h_resp:
+                        h_doc = json.loads(h_resp.read().decode("utf-8"))
+                        self.assertEqual(h_doc["status"], "ok")
+                        self.assertEqual(h_doc["hub_id"], "hub-w22-ws")
+
+                    gate_state: dict[str, object] = {"unlocked": False, "lever": "idle"}
+                    held_token: dict[str, StepExecutionToken] = {}
+
+                    tx = LoopbackHTTPTransportClient(f"http://{origin_addr}")
+                    orig = OriginSDK(slot_id="slot-w22-ws", slot_role_kind="companion", hub_transport=tx)
+                    orig.start_loopback_execute_listener()
+                    orig.bind_actor_subject("companion", {})
+                    orig.bind_actor_subject("player", {})
+
+                    def _unlock_gate(_a, _s, _args, _tok):
+                        gate_state["unlocked"] = True
+                        return ImmediateSucceeded({"unlocked": True})
+
+                    def _hold_lever(_a, _s, _args, tok: StepExecutionToken):
+                        held_token["tok"] = tok
+                        return StartedExecuting()
+
+                    orig.register_capability(
+                        OrigCap("#01", "unlock_gate", "Unlock gate", ["companion", "player"], {"type": "object"}),
+                        effect_handler=_unlock_gate,
+                    )
+                    orig.register_capability(
+                        OrigCap("#02", "hold_lever", "Hold gate lever", ["companion"], {"type": "object"}, sustained=True),
+                        effect_handler=_hold_lever,
+                    )
+                    orig.bind_state_module(
+                        "gate",
+                        lambda: dict(gate_state),
+                        lambda: [
+                            OrigGrant("#01", "companion", "ready", []),
+                            OrigGrant("#01", "player", "ready", []),
+                            OrigGrant("#02", "companion", "ready", []),
+                        ],
+                    )
+                    orig.publish_capabilities_and_baseline()
+
+                    def _ws_planner(_caps, ctx, _mems) -> PlanDecision:
+                        if ctx.player_command == "open gate via relay ws" and not gate_state["unlocked"]:
+                            return PlanDecision(
+                                intent_summary="Unlock gate over CloudRelay WebSocket",
+                                planned_steps=[QueueStep(0, "#01", "companion", {})],
+                            )
+                        return PlanDecision()
+
+                    # 2. Connect CoreSDK with default stream_mode="websocket" directly through NAT CloudRelayServer!
+                    core_ws = CoreSDK(planner=_ws_planner, stream_mode="websocket", allow_loopback=True)
+                    try:
+                        core_ws.connect(f"{relay_url}/hubs/hub-w22-ws", "core-w22-ws", "slot-w22-ws")
+                        assert core_ws.scope is not None
+                        self.assertIn("player", core_ws.scope.permitted_methods.get("#01", []))
+
+                        orig.report_player_command("open gate via relay ws")
+                        wait_ws = time.time() + 4.0
+                        while time.time() < wait_ws and not gate_state["unlocked"]:
+                            time.sleep(0.03)
+                        self.assertTrue(gate_state["unlocked"])
+
+                        # 3. Mid-session capability narrowing -> pushed over Relay WebSocket -> updates local FrozenScope!
+                        orig.register_capability(
+                            OrigCap("#01", "unlock_gate", "Unlock gate", ["companion"], {"type": "object"}),
+                            effect_handler=_unlock_gate,
+                        )
+                        orig.bind_state_module(
+                            "gate",
+                            lambda: dict(gate_state),
+                            lambda: [
+                                OrigGrant("#01", "companion", "ready", []),
+                                OrigGrant("#02", "companion", "ready", []),
+                            ],
+                        )
+                        orig.publish_capabilities_and_baseline()
+
+                        wait_narrow = time.time() + 4.0
+                        while time.time() < wait_narrow and "player" in core_ws.scope.permitted_methods.get("#01", []):
+                            time.sleep(0.03)
+                        self.assertEqual(core_ws.scope.permitted_methods.get("#01"), ["companion"])
+
+                        pulled_narrow = core_ws.pull_context()
+                        with self.assertRaises(G2AError) as e_narrow:
+                            core_ws.build_queue(pulled_narrow).add_step("#01", "player", {})
+                        self.assertEqual(e_narrow.exception.code, "permission_denied")
+
+                        # 4. Start sustained step #02, then simulate Hub crash & fresh restart!
+                        rec_hold = (
+                            core_ws.build_queue(pulled_narrow, trigger="player_command")
+                            .add_step("#02", "companion", {})
+                            .submit(queue_id="Q-w22-hold")
+                        )
+                        self.assertIsNotNone(rec_hold)
+                        self.assertIn("tok", held_token)
+                    finally:
+                        core_ws.shutdown_session_cleanly(notify_hub=False)
+
+                    hub_proc_1.terminate()
+                    hub_proc_1.wait(timeout=3)
+
+                    # Settle sustained step while Hub is OFFLINE -> OriginSDK rolls back rev & preserves settled_executions!
+                    gate_state["lever"] = "locked_down"
+                    with self.assertRaises(Exception):
+                        held_token["tok"].complete_succeeded({"lever": "locked_down"})
+
+                    # Restart a brand-new Hub process with an empty ledger (ephemeral SlotView lost)!
+                    hub_proc_2 = subprocess.Popen(
+                        [
+                            hub_bin,
+                            "-origin-addr", "127.0.0.1:0",
+                            "-core-addr", "127.0.0.1:0",
+                            "-consent-addr", "127.0.0.1:0",
+                            "-ledger", os.path.join(tmp, "w22_hub2_fresh_ledger.json"),
+                            "-no-runtime-file",
+                            "-auto-approve-scope",
+                            "-print-ports-json",
+                        ],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    assert hub_proc_2.stdout is not None
+                    ports_2 = json.loads(hub_proc_2.stdout.readline().strip())
+                    orig.hub_transport = LoopbackHTTPTransportClient(f"http://{ports_2['origin_addr']}")
+
+                    # Next delta sync hits 404 not_found on fresh Hub -> auto-republishes capabilities + full sync!
+                    self.assertTrue(orig.flush_dirty_sync(significant_event=True))
+
+                    core_after = CoreSDK(allow_loopback=True)
+                    try:
+                        core_after.connect(f"http://{ports_2['core_addr']}", "core-w22-recovered", "slot-w22-ws")
+                        recovered_ctx = core_after.pull_context()
+                        self.assertEqual(recovered_ctx.state_brief.get("gate", {}).get("lever"), "locked_down")
+                        self.assertEqual(len(core_after.get_cached_capabilities()), 2)
+                    finally:
+                        core_after.shutdown_session_cleanly(notify_hub=True)
+                finally:
+                    if orig is not None:
+                        orig.stop_loopback_execute_listener()
+                    for proc in (hub_proc_1, hub_proc_2):
+                        if proc is not None:
+                            if proc.poll() is None:
+                                proc.terminate()
+                                proc.wait(timeout=3)
+                            if proc.stdout:
+                                proc.stdout.close()
+                            if proc.stderr:
+                                proc.stderr.close()
+        finally:
+            relay.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

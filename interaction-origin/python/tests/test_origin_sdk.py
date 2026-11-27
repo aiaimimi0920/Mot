@@ -368,6 +368,58 @@ class TestInteractionOriginPythonSDK(unittest.TestCase):
         batch_sync = tx.posts[-1][1]
         self.assertEqual(len(batch_sync["settled_executions"]), 3)
 
+    def test_delta_stale_context_auto_resync_preserves_settled_executions(self):
+        from g2a_origin.origin_sdk import G2AOriginError
+
+        class FlakyHubTransport:
+            def __init__(self) -> None:
+                self.posts = []
+                self.fail_next_sync_code: str | None = None
+
+            def post_to_hub(self, op: str, payload: dict) -> dict:
+                if op == "origin.sync" and self.fail_next_sync_code is not None:
+                    code = self.fail_next_sync_code
+                    self.fail_next_sync_code = None
+                    status = 409 if code == "stale_context" else 503
+                    raise G2AOriginError(code, status, f"Simulated {code}")
+                self.posts.append((op, payload))
+                return {"ok": True}
+
+        tx = FlakyHubTransport()
+        sdk = OriginSDK(slot_id="slot-resync", hub_transport=tx)
+        sdk.bind_actor_subject("companion", {})
+
+        @sdk.capability("#01", sustained=True, description="Repair generator")
+        def repair(token) -> StartedExecuting:
+            return StartedExecuting()
+
+        state = {"hp": 100}
+        sdk.bind_state_module("gen", lambda: dict(state), lambda: [])
+        sdk.publish_capabilities_and_baseline()
+        self.assertEqual([op for op, _ in tx.posts], ["origin.capabilities", "origin.sync"])
+        tx.posts.clear()
+
+        # 1. Start sustained step, then inject 503 unavailable on settlement -> settled_executions & rev roll back!
+        rep = sdk.handle_origin_execute(OriginExecuteRequest("slot-resync", 1, "invoke", "ex-gen-1", "#01", "companion", {}))
+        self.assertEqual(rep.state, "executing")
+        tx.fail_next_sync_code = "unavailable"
+        with self.assertRaises(G2AOriginError):
+            sdk.complete_step("ex-gen-1", True, {"repaired": True})
+        self.assertEqual(len(sdk.pending_settled_executions), 1)
+        self.assertEqual(sdk.current_rev, 1)
+
+        # 2. Next tick encounters 409 stale_context (e.g. Hub restarted!) -> SDK auto-republishes capabilities + full sync WITH ex-gen-1!
+        state["hp"] = 120
+        tx.fail_next_sync_code = "stale_context"
+        self.assertTrue(sdk.flush_dirty_sync(significant_event=True))
+        self.assertEqual(sdk.pending_settled_executions, [])
+        self.assertEqual([op for op, _ in tx.posts], ["origin.capabilities", "origin.sync"])
+        recovered_frame = tx.posts[-1][1]
+        self.assertEqual(recovered_frame["mode"], "full")
+        self.assertEqual(recovered_frame["state_brief"], {"gen": {"hp": 120}})
+        self.assertEqual(len(recovered_frame["settled_executions"]), 1)
+        self.assertEqual(recovered_frame["settled_executions"][0]["execution_id"], "ex-gen-1")
+
 
 if __name__ == "__main__":
     unittest.main()

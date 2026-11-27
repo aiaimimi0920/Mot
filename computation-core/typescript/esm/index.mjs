@@ -984,6 +984,19 @@ export class CoreSDK {
       if (capDigest && Array.isArray(capTable) && (await jcsSha256("g2a.cap.v1", capTable)) === capDigest) {
         this.capabilityCache.set(capDigest, capTable);
         if (slotId) this.slotDigests.set(slotId, capDigest);
+        if (env.payload?.narrowed_permitted_methods && typeof env.payload.narrowed_permitted_methods === "object") {
+          this.permittedMethods = env.payload.narrowed_permitted_methods;
+        } else if (this.permittedMethods) {
+          const capActors = new Map(capTable.map((c) => [c.method_id, new Set(c.permitted_actors ?? [])]));
+          const narrowed = {};
+          for (const [mid, prevActors] of Object.entries(this.permittedMethods)) {
+            const allowed = capActors.get(mid);
+            if (!allowed) continue;
+            const kept = prevActors.filter((a) => allowed.has(a));
+            if (kept.length > 0) narrowed[mid] = kept;
+          }
+          this.permittedMethods = narrowed;
+        }
       }
     } else if (env.event === "queue.confirmed") {
       const qid = typeof env.payload?.queue_id === "string" ? env.payload.queue_id : "";
@@ -1071,7 +1084,9 @@ export class CoreSDK {
 
       const wsKey = cryptoMod.randomBytes(16).toString("base64");
       const expectedAccept = cryptoMod.createHash("sha1").update(wsKey + WS_MAGIC_GUID).digest("base64");
-      const path = `${parsed.pathname.replace(/\/$/, "")}/g2a/v1/core/ws?session_id=${encodeURIComponent(sid)}${isReconnect ? "&replay=1" : ""}`;
+      let replayQs = isReconnect ? "&replay=1" : "";
+      if (isReconnect && this.lastEventId) replayQs += `&last_event_id=${encodeURIComponent(this.lastEventId)}`;
+      const path = `${parsed.pathname.replace(/\/$/, "")}/g2a/v1/core/ws?session_id=${encodeURIComponent(sid)}${replayQs}`;
 
       const sendUpgrade = () => {
         let req = `GET ${path} HTTP/1.1\r\nHost: ${parsed.host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${wsKey}\r\nSec-WebSocket-Version: 13\r\nAuthorization: Bearer ${authToken}\r\n`;
@@ -1144,7 +1159,9 @@ export class CoreSDK {
     this.sseAbort = abort;
     const headers = { Accept: "text/event-stream", Authorization: `Bearer ${authToken}` };
     if (this.lastEventId) headers["Last-Event-ID"] = this.lastEventId;
-    const resp = await fetch(`${base}/g2a/v1/core/events?session_id=${encodeURIComponent(this.sessionId)}${isReconnect ? "&replay=1" : ""}`, {
+    let sseReplay = isReconnect ? "&replay=1" : "";
+    if (isReconnect && this.lastEventId) sseReplay += `&last_event_id=${encodeURIComponent(this.lastEventId)}`;
+    const resp = await fetch(`${base}/g2a/v1/core/events?session_id=${encodeURIComponent(this.sessionId)}${sseReplay}`, {
       headers,
       signal: abort.signal,
     });

@@ -40,6 +40,7 @@ public sealed class OriginSdk
     private Dictionary<string, object?>? _visualRef;
     private Dictionary<string, object?>? _audioRef;
     private List<string>? _allowedTimelineTags;
+    private Dictionary<string, object?>? _lastCapPayload;
     private string _lastSentBriefDigest = "";
     private bool _syncEnabled = true;
 
@@ -162,6 +163,7 @@ public sealed class OriginSdk
         if (!string.IsNullOrEmpty(allowlistCriteriaUrl)) capPayload["allowlist_criteria_url"] = allowlistCriteriaUrl;
         if (!string.IsNullOrEmpty(_roomId)) capPayload["room_id"] = _roomId;
         if (!string.IsNullOrEmpty(_factionId)) capPayload["faction_id"] = _factionId;
+        _lastCapPayload = new Dictionary<string, object?>(capPayload);
         _transport.PostToHub("origin.capabilities", capPayload);
         FlushFullSync();
     }
@@ -218,6 +220,8 @@ public sealed class OriginSdk
         }
 
         long prevRev = CurrentRev;
+        string prevDigest = _lastSentBriefDigest;
+        var prevMethods = new Dictionary<(string MethodId, string Actor), string>(_lastSentMethodJson);
         CurrentRev++;
         FramesSynced++;
         _lastSentBriefDigest = briefDigest;
@@ -240,7 +244,32 @@ public sealed class OriginSdk
         if (audSnapshot != null) frame["audio_ref"] = audSnapshot;
         if (tagsSnapshot != null) frame["allowed_timeline_tags"] = tagsSnapshot;
         if (extSnapshot.Count > 0) frame["extensions_data"] = extSnapshot;
-        _transport.PostToHub("origin.sync", frame);
+        try
+        {
+            _transport.PostToHub("origin.sync", frame);
+        }
+        catch (Exception ex)
+        {
+            if (settled.Count > 0)
+            {
+                _dispatcher.RunOnGameThread(() =>
+                {
+                    _pendingSettled.InsertRange(0, settled);
+                    return true;
+                });
+            }
+            CurrentRev = prevRev;
+            _lastSentBriefDigest = prevDigest;
+            _lastSentMethodJson = prevMethods;
+            if (ex is G2AOriginException gex && gex.Code is "stale_context" or "not_found")
+            {
+                if (_lastCapPayload != null)
+                    _transport.PostToHub("origin.capabilities", _lastCapPayload);
+                FlushFullSync();
+                return true;
+            }
+            throw;
+        }
         return true;
     }
 

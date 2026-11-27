@@ -232,7 +232,7 @@ class CoreSDK:
 
     def __init__(
         self,
-        planner: CognitivePlannerPort,
+        planner: Union[CognitivePlannerPort, Callable[..., PlanDecision], None] = None,
         memory_store: Optional[InMemoryCompanionStore] = None,
         allow_loopback: bool = False,
         request_timeout_sec: float = 8.0,
@@ -241,7 +241,12 @@ class CoreSDK:
         ssl_context: Optional[ssl.SSLContext] = None,
         custom_post_fn: Optional[Callable[[str, str, Dict[str, Any], str, Optional[str]], Dict[str, Any]]] = None,
     ) -> None:
-        self.planner = planner
+        if planner is None:
+            self.planner: CognitivePlannerPort = FunctionCognitivePlanner(lambda c, x, m: PlanDecision())
+        elif hasattr(planner, "plan"):
+            self.planner = planner  # type: ignore[assignment]
+        else:
+            self.planner = FunctionCognitivePlanner(planner)  # type: ignore[arg-type]
         self.memory_store = memory_store or InMemoryCompanionStore()
         self.allow_loopback = allow_loopback
         self.request_timeout_sec = request_timeout_sec
@@ -1077,8 +1082,26 @@ class CoreSDK:
                     self.capability_cache[cap_digest] = caps_sorted
                     if isinstance(slot_id, str) and slot_id:
                         self.slot_digest_index[slot_id] = cap_digest
-                    if self.scope is not None:
+                    if self.scope is not None and (not slot_id or slot_id == self.scope.slot_id):
                         self.scope.capability_table_digest = cap_digest
+                        narrowed_raw = payload.get("narrowed_permitted_methods")
+                        if isinstance(narrowed_raw, dict):
+                            self.scope.permitted_methods = {
+                                str(mk): [str(a) for a in mv]
+                                for mk, mv in narrowed_raw.items()
+                                if isinstance(mv, list)
+                            }
+                        elif self.scope.permitted_methods:
+                            cap_actors = {c.method_id: set(c.permitted_actors) for c in caps_sorted}
+                            narrowed: Dict[str, List[str]] = {}
+                            for mid, prev_actors in self.scope.permitted_methods.items():
+                                allowed_set = cap_actors.get(mid)
+                                if not allowed_set:
+                                    continue
+                                kept = [a for a in prev_actors if a in allowed_set]
+                                if kept:
+                                    narrowed[mid] = kept
+                            self.scope.permitted_methods = narrowed
         elif ev_name == "queue.confirmed" and isinstance(payload, dict):
             qid = payload.get("queue_id")
             if isinstance(qid, str):

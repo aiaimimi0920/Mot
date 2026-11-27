@@ -49,6 +49,7 @@ type OutboundCloudTunnel struct {
 
 	subMu              sync.Mutex
 	subscribedSessions map[string]context.CancelFunc
+	lastForwardedEvID  map[string]string
 }
 
 func NewOutboundCloudTunnel(relayBaseURL, hubID, relayToken string, coreHandler http.Handler, engine *hub.Engine) *OutboundCloudTunnel {
@@ -68,6 +69,7 @@ func NewOutboundCloudTunnel(relayBaseURL, hubID, relayToken string, coreHandler 
 		streamClient:       &http.Client{Timeout: 0, Transport: &http.Transport{Proxy: nil}},
 		sem:                make(chan struct{}, 64),
 		subscribedSessions: make(map[string]context.CancelFunc),
+		lastForwardedEvID:  make(map[string]string),
 	}
 }
 
@@ -190,7 +192,10 @@ func (t *OutboundCloudTunnel) handleDownlinkFrame(ctx context.Context, rawJSON s
 }
 
 func (t *OutboundCloudTunnel) forwardSessionEventsUplink(ctx context.Context, sessionID string) {
-	ch, unsub := t.engine.PushStream().Subscribe(sessionID, false)
+	t.subMu.Lock()
+	cursor := t.lastForwardedEvID[sessionID]
+	t.subMu.Unlock()
+	ch, unsub := t.engine.PushStream().SubscribeAfter(sessionID, cursor != "", cursor)
 	defer func() {
 		unsub()
 		t.subMu.Lock()
@@ -203,10 +208,17 @@ func (t *OutboundCloudTunnel) forwardSessionEventsUplink(ctx context.Context, se
 			return
 		case ev := <-ch:
 			evCopy := ev
-			_ = t.postUplink(ctx, UplinkFrame{
+			if err := t.postUplink(ctx, UplinkFrame{
 				Kind:  "event",
 				Event: &evCopy,
-			})
+			}); err == nil && ev.EventID != "" {
+				t.subMu.Lock()
+				t.lastForwardedEvID[sessionID] = ev.EventID
+				if ev.Event == "session.closed" {
+					delete(t.lastForwardedEvID, sessionID)
+				}
+				t.subMu.Unlock()
+			}
 			if ev.Event == "session.closed" {
 				return
 			}
